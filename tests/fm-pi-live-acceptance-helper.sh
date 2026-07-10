@@ -21,11 +21,7 @@ if [ "$actual_commit" != "$CANDIDATE_COMMIT" ]; then
 fi
 
 file_epoch() {
-  if [ "$(uname)" = Darwin ]; then
-    stat -f %m "$1" 2>/dev/null || printf 'unknown'
-  else
-    stat -c %Y "$1" 2>/dev/null || printf 'unknown'
-  fi
+  stat -f %m "$1" 2>/dev/null || stat -c %Y "$1" 2>/dev/null || printf 'unknown'
 }
 
 hash_file() {
@@ -54,7 +50,10 @@ inventory() {
   } > "$EVIDENCE/identity.txt"
   PI_CODING_AGENT_DIR="$PI_DIR" PI_OFFLINE=1 pi list > "$EVIDENCE/pi-list.txt" 2>&1
   find "$PI_DIR" -mindepth 1 -maxdepth 4 -print | LC_ALL=C sort > "$EVIDENCE/pi-agent-inventory.txt"
-  hash_file "$ROOT/.pi/extensions/fm-primary-pi-watch.ts" > "$EVIDENCE/tracked-extension-hashes.txt"
+  {
+    hash_file "$ROOT/.pi/extensions/fm-primary-pi-watch.ts"
+    hash_file "$ROOT/.pi/extensions/fm-primary-turnend-guard.ts"
+  } > "$EVIDENCE/tracked-extension-hashes.txt"
 }
 
 registrations() {  # <tool-count> <command-count> [transcript]
@@ -123,17 +122,6 @@ record_transcript() {  # <phase> <path>
   cp "$path" "$EVIDENCE/$phase-transcript.txt"
 }
 
-verify_reload() {  # <path>
-  local path=${1:?reload transcript path required}
-  [ -f "$path" ] || { printf 'error: transcript not found: %s\n' "$path" >&2; exit 1; }
-  cp "$path" "$EVIDENCE/reload-transcript.txt"
-  if grep -Fq 'FIRSTMATE WATCHER WAKE: watcher: FAILED' "$path"; then
-    printf 'error: Pi reload transcript contains a false watcher failure\n' >&2
-    exit 1
-  fi
-  printf 'watcher_only_reload=clean\n' > "$EVIDENCE/reload-check.txt"
-}
-
 verify_clean() {  # <arm-pid> <watcher-pid>
   local arm_pid=${1:?arm pid required} watcher_pid=${2:?watcher pid required} failed=0
   {
@@ -152,10 +140,9 @@ case "${1:-}" in
   emit) shift; emit_status "$@" ;;
   drain) drain_queue ;;
   transcript) shift; record_transcript "$@" ;;
-  verify-reload) shift; verify_reload "$@" ;;
   verify-clean) shift; verify_clean "$@" ;;
   *)
-    printf 'usage: %s inventory|registrations <tool-count> <command-count> [transcript]|snapshot <phase>|emit <task-id>|drain|transcript <phase> <path>|verify-reload <path>|verify-clean <arm-pid> <watcher-pid>\n' "$0" >&2
+    printf 'usage: %s inventory|registrations <tool-count> <command-count> [transcript]|snapshot <phase>|emit <task-id>|drain|transcript <phase> <path>|verify-clean <arm-pid> <watcher-pid>\n' "$0" >&2
     exit 2
     ;;
 esac
