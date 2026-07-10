@@ -124,7 +124,8 @@ function supervisingHome(): boolean {
 function coordinatorForHome(): ArmCoordinator {
   const existing = coordinators.get(fmHome);
   if (existing) {
-    existing.visibleStatus = "offline";
+    existing.visibleStatus ??= "offline";
+    if (existing.clients.size === 0) existing.visibleStatus = "offline";
     existing.shutdownPromise ??= null;
     existing.shutdownToken ??= null;
     if (!existing.shutdownPromise) {
