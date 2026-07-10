@@ -8,7 +8,7 @@ When this session owns supervision and away mode is not active:
 5. If the plugin reports a watcher failure, drain queued wakes, inspect the failure text, and use `bin/fm-watch-arm.sh` manually only as a short recovery probe.
 6. Never use shell `&` for watcher supervision.
    The arm mechanism above is plugin-owned, not a model tool call, but a manual recovery probe that backgrounds, pipes, or bundles the arm is denied automatically by the PreToolUse seatbelt (`.opencode/plugins/fm-primary-pretool-check.js`, `bin/fm-arm-pretool-check.sh`).
-7. Do not rely on this plugin in headless `opencode run`; firstmate supervision targets persistent OpenCode TUI sessions.
+7. Do not rely on this plugin in headless `opencode run`; firstmate primary supervision targets persistent OpenCode TUI sessions.
 
 OpenCode's persistent TUI plugin runtime is the wake mechanism.
-The plugin scopes itself to a plain primary checkout or a marked persistent secondmate whose `FM_HOME` is that same checkout, and stays silent in ordinary crewmate and scout worktrees.
+The plugin scopes itself to the primary firstmate checkout and stays silent in crewmate worktrees and secondmate homes.

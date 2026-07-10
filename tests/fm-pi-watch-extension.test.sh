@@ -1020,6 +1020,8 @@ test_tracked_extension_present_and_self_hashing() {
   assert_contains "$text" '.fm-secondmate-home' "tracked extension does not recognize persistent secondmate homes"
   assert_contains "$text" 'rev-parse", "--git-dir' "tracked extension does not distinguish linked task worktrees"
   assert_contains "$text" 'pi.on("tool_call"' "tracked watcher extension does not carry the PreToolUse seatbelt"
+  assert_not_contains "$text" 'fm-turnend-guard.sh' "tracked watcher extension still invokes the shared turn-end guard"
+  assert_not_contains "$text" 'TURN WOULD END BLIND' "tracked watcher extension still injects a blind-turn follow-up"
   assert_not_contains "$text" "[ -f config/x-mode.env ]" "tracked extension kept a repo-relative x-mode config path"
   pass "Pi primary watcher extension is tracked, self-hashing, and self-locating"
 }
