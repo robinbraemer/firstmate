@@ -40,9 +40,7 @@ test_tracked_extension_present_and_self_hashing() {
   assert_contains "$text" 'type LockOwnership = "owned" | "missing" | "other"' "tracked extension does not distinguish missing lock from another owner"
   assert_contains "$text" "readFileSync(\`\${state}/.lock\`" "tracked extension does not read the effective session lock"
   assert_contains "$text" 'return pidAlive(lockPid) ? "other" : "missing"' "tracked extension does not allow a pre-lock load marker"
-  assert_contains "$text" 'if (lockOwnership() === "other") return' "tracked extension overwrites another live session marker"
-  assert_contains "$text" "await recoverMissingLock()" "tracked extension does not recover a missing or stale session lock"
-  assert_contains "$text" 'if (ownership === "other") return { ok: false' "tracked extension does not refuse another live lock owner"
+  assert_contains "$text" 'if (lockOwnership() !== "owned") await claimSessionLock()' "tracked extension does not delegate every non-owned state to the home lock protocol"
   assert_contains "$text" 'if (lockOwnership() !== "owned") return { ok: false' "tracked extension does not re-check lock ownership after recovery"
   assert_contains "$text" "writeFileSync(marker, \`\${extensionVersion}\\n\${process.pid}\\n\`)" "tracked extension does not write the content version and process marker"
   assert_contains "$text" "const config = process.env.FM_CONFIG_OVERRIDE" "tracked extension missing effective config resolution"
@@ -261,6 +259,80 @@ EOF
   pass "Pi stale lock recovers through the home-scoped lock protocol"
 }
 
+test_pi_live_non_harness_lock_is_reclaimed() {
+  local repo home plugin lock_log arm_log probe out status
+  repo="$TMP_ROOT/pi-reused-lock-root"
+  home="$TMP_ROOT/pi-reused-lock-home"
+  lock_log="$TMP_ROOT/pi-reused-lock-protocol.log"
+  arm_log="$TMP_ROOT/pi-reused-lock-arm.log"
+  probe="$TMP_ROOT/pi-reused-lock-probe.mjs"
+  mkdir -p "$repo/bin" "$home/state" "$home/config"
+  install_pi_watch_extension_fixture "$repo"
+  plugin="$repo/.pi/extensions/fm-primary-pi-watch.ts"
+  cat > "$repo/bin/fm-lock.sh" <<'SH'
+#!/usr/bin/env bash
+printf 'invoked\n' >> "${FM_LOCK_LOG:?}"
+exec "${FM_REAL_LOCK:?}"
+SH
+  cat > "$repo/bin/fm-watch-arm.sh" <<'SH'
+#!/usr/bin/env bash
+printf 'arm\n' >> "${FM_ARM_LOG:?}"
+SH
+  chmod +x "$repo/bin/fm-lock.sh" "$repo/bin/fm-watch-arm.sh"
+  cat > "$probe" <<'EOF'
+import { spawn, spawnSync } from "node:child_process";
+import { existsSync, readFileSync, writeFileSync } from "node:fs";
+import { pathToFileURL } from "node:url";
+
+const unrelated = spawn("sleep", ["300"], { stdio: "ignore" });
+await new Promise((resolve, reject) => {
+  unrelated.once("spawn", resolve);
+  unrelated.once("error", reject);
+});
+let tool = null;
+try {
+  const pi = {
+    on() {},
+    registerCommand() {},
+    registerTool(candidate) {
+      if (candidate.name === "fm_watch_arm_pi") tool = candidate;
+    },
+    sendUserMessage: async () => {},
+  };
+  writeFileSync(`${process.env.FM_HOME}/state/.lock`, `${unrelated.pid}\n`);
+  const mod = await import(pathToFileURL(process.env.PLUGIN).href);
+  mod.default(pi);
+  const result = await tool.execute("reused-non-harness-lock", {}, undefined, undefined, {});
+  if (result.details?.ok !== true) throw new Error(result.content?.[0]?.text || "non-harness lock recovery failed");
+  const owner = readFileSync(`${process.env.FM_HOME}/state/.lock`, "utf8").trim();
+  let pid = String(process.pid);
+  let attached = false;
+  for (let i = 0; i < 8 && pid && pid !== "1"; i += 1) {
+    if (pid === owner) {
+      attached = true;
+      break;
+    }
+    pid = spawnSync("ps", ["-o", "ppid=", "-p", pid], { encoding: "utf8" }).stdout.trim();
+  }
+  if (!attached) throw new Error(`lock protocol retained unrelated live pid ${owner}`);
+  for (let i = 0; i < 50 && !existsSync(process.env.FM_ARM_LOG); i += 1) {
+    await new Promise((resolve) => setTimeout(resolve, 20));
+  }
+  if (!existsSync(process.env.FM_ARM_LOG)) throw new Error("watch arm did not run after non-harness lock recovery");
+} finally {
+  unrelated.kill("SIGTERM");
+  await new Promise((resolve) => unrelated.once("close", resolve));
+}
+EOF
+  out=$(PLUGIN="$plugin" FM_HOME="$home" FM_ROOT_OVERRIDE="$repo" FM_LOCK_LOG="$lock_log" \
+    FM_REAL_LOCK="$ROOT/bin/fm-lock.sh" FM_ARM_LOG="$arm_log" node "$probe" 2>&1)
+  status=$?
+  expect_code 0 "$status" "Pi watcher must reclaim a live non-harness PID through fm-lock.sh"
+  [ "$(wc -l < "$lock_log" | tr -d ' ')" -eq 1 ] || fail "Pi non-harness recovery did not invoke fm-lock.sh exactly once"
+  [ -z "$out" ] || fail "Pi non-harness lock recovery test printed output: $out"
+  pass "Pi live non-harness lock is reclaimed through the canonical protocol"
+}
+
 test_pi_live_other_lock_owner_is_refused() {
   local repo home plugin lock_log arm_log probe out status
   repo="$TMP_ROOT/pi-live-other-root"
@@ -286,7 +358,7 @@ import { spawn } from "node:child_process";
 import { existsSync, writeFileSync } from "node:fs";
 import { pathToFileURL } from "node:url";
 
-const other = spawn(process.execPath, ["-e", "setInterval(() => {}, 1000)"], { stdio: "ignore" });
+const other = spawn(process.execPath, ["-e", "setInterval(() => {}, 1000)"], { argv0: "pi", stdio: "ignore" });
 await new Promise((resolve, reject) => {
   other.once("spawn", resolve);
   other.once("error", reject);
@@ -308,7 +380,7 @@ try {
   if (result.details?.ok !== false || !result.content?.[0]?.text.includes("read-only")) {
     throw new Error(`unexpected live-other result: ${JSON.stringify(result)}`);
   }
-  if (existsSync(process.env.FM_LOCK_LOG)) throw new Error("fm-lock.sh ran against a live other owner");
+  if (!existsSync(process.env.FM_LOCK_LOG)) throw new Error("fm-lock.sh did not classify the live other owner");
   if (existsSync(process.env.FM_ARM_LOG)) throw new Error("watch arm ran against a live other owner");
 } finally {
   other.kill("SIGTERM");
@@ -318,9 +390,95 @@ EOF
   out=$(PLUGIN="$plugin" FM_HOME="$home" FM_ROOT_OVERRIDE="$repo" FM_LOCK_LOG="$lock_log" \
     FM_REAL_LOCK="$ROOT/bin/fm-lock.sh" FM_ARM_LOG="$arm_log" node "$probe" 2>&1)
   status=$?
-  expect_code 0 "$status" "Pi watcher must refuse a live other session owner without lock recovery"
+  expect_code 0 "$status" "Pi watcher must let fm-lock.sh refuse a verified live other session owner"
+  [ "$(wc -l < "$lock_log" | tr -d ' ')" -eq 1 ] || fail "Pi live-owner classification did not invoke fm-lock.sh exactly once"
   [ -z "$out" ] || fail "Pi live-other lock test printed output: $out"
-  pass "Pi live other lock owner remains read-only"
+  pass "Pi verified live other lock owner remains read-only"
+}
+
+test_session_lock_reclaim_has_one_atomic_winner() {
+  local home state fakebin barrier stale holder_a holder_b mutex_dead claim_a claim_b rc_a rc_b wins owner
+  home="$TMP_ROOT/session-lock-race-home"
+  state="$home/state"
+  fakebin="$TMP_ROOT/session-lock-race-fakebin"
+  barrier="$TMP_ROOT/session-lock-race-barrier"
+  mkdir -p "$state" "$fakebin" "$barrier"
+  sleep 300 & stale=$!
+  sleep 300 & holder_a=$!
+  sleep 300 & holder_b=$!
+  printf '%s\n' "$stale" > "$state/.lock"
+  mutex_dead=999999
+  while kill -0 "$mutex_dead" 2>/dev/null; do mutex_dead=$((mutex_dead + 1)); done
+  mkdir "$state/.lock.acquire"
+  printf '%s\n' "$mutex_dead" > "$state/.lock.acquire/pid"
+  cat > "$fakebin/ps" <<'SH'
+#!/usr/bin/env bash
+set -u
+pid=
+prev=
+for arg in "$@"; do
+  [ "$prev" = -p ] && pid=$arg
+  prev=$arg
+done
+case "$*" in
+  *"comm="*)
+    if [ "$pid" = "$FM_STALE_PID" ]; then
+      : > "$FM_BARRIER/$FM_FAKE_HOLDER"
+      i=0
+      while [ "$(find "$FM_BARRIER" -type f | wc -l | tr -d ' ')" -lt 2 ] && [ "$i" -lt 100 ]; do
+        sleep 0.01
+        i=$((i + 1))
+      done
+      printf 'sleep\n'
+    elif [ "$pid" = "$FM_HOLDER_A" ] || [ "$pid" = "$FM_HOLDER_B" ]; then
+      printf 'pi\n'
+    else
+      printf 'bash\n'
+    fi
+    ;;
+  *"args="*)
+    if [ "$pid" = "$FM_STALE_PID" ]; then
+      printf 'sleep 300\n'
+    elif [ "$pid" = "$FM_HOLDER_A" ] || [ "$pid" = "$FM_HOLDER_B" ]; then
+      printf 'pi\n'
+    else
+      printf 'bash fm-lock.sh\n'
+    fi
+    ;;
+  *"ppid="*)
+    if [ "$pid" = "$FM_HOLDER_A" ] || [ "$pid" = "$FM_HOLDER_B" ]; then printf '1\n'; else printf '%s\n' "$FM_FAKE_HOLDER"; fi
+    ;;
+  *) exit 1 ;;
+esac
+SH
+  chmod +x "$fakebin/ps"
+  claim_a="$TMP_ROOT/session-lock-claim-a"
+  claim_b="$TMP_ROOT/session-lock-claim-b"
+  PATH="$fakebin:$PATH" FM_HOME="$home" FM_STALE_PID="$stale" FM_FAKE_HOLDER="$holder_a" \
+    FM_HOLDER_A="$holder_a" FM_HOLDER_B="$holder_b" FM_BARRIER="$barrier" \
+    "$ROOT/bin/fm-lock.sh" > "$claim_a.out" 2> "$claim_a.err" & claim_a=$!
+  PATH="$fakebin:$PATH" FM_HOME="$home" FM_STALE_PID="$stale" FM_FAKE_HOLDER="$holder_b" \
+    FM_HOLDER_A="$holder_a" FM_HOLDER_B="$holder_b" FM_BARRIER="$barrier" \
+    "$ROOT/bin/fm-lock.sh" > "$claim_b.out" 2> "$claim_b.err" & claim_b=$!
+  rc_a=0
+  wait "$claim_a" || rc_a=$?
+  rc_b=0
+  wait "$claim_b" || rc_b=$?
+  kill "$stale" "$holder_a" "$holder_b" 2>/dev/null || true
+  wait "$stale" "$holder_a" "$holder_b" 2>/dev/null || true
+  wins=0
+  [ "$rc_a" -eq 0 ] && wins=$((wins + 1))
+  [ "$rc_b" -eq 0 ] && wins=$((wins + 1))
+  [ "$wins" -eq 1 ] || fail "concurrent stale session-lock claims produced $wins winners"
+  owner=$(cat "$state/.lock")
+  if [ "$rc_a" -eq 0 ]; then
+    [ "$owner" = "$holder_a" ] || fail "winning claimant A did not retain the session lock"
+  else
+    [ "$owner" = "$holder_b" ] || fail "winning claimant B did not retain the session lock"
+  fi
+  [ -z "$(find "$state" -name '.lock.acquire*' -print -quit)" ] || fail "session-lock acquisition mutex state survived cleanup"
+  [ -z "$(find "$state" -name '.lock.write.*' -print -quit)" ] || fail "session-lock temporary record survived cleanup"
+  pass "concurrent stale session-lock reclaim has one atomic winner"
 }
 
 test_pi_process_exit_cleanup_listener_lifecycle() {
@@ -479,10 +637,17 @@ trap 'exit 143' TERM
 printf '%s\n' "$$" >> "$FM_CHILD_LOG"
 while :; do sleep 1; done
 SH
+  cat > "$repo_a/bin/fm-lock.sh" <<'SH'
+#!/usr/bin/env bash
+printf 'claim\n' >> "$FM_LOCK_LOG"
+sleep 0.2
+printf '%s\n' "$PPID" > "$FM_HOME/state/.lock"
+SH
   cp "$repo_a/bin/fm-watch-arm.sh" "$repo_b/bin/fm-watch-arm.sh"
-  chmod +x "$repo_a/bin/fm-watch-arm.sh" "$repo_b/bin/fm-watch-arm.sh"
-  out=$(PLUGIN_A="$repo_a/.pi/extensions/fm-primary-pi-watch.ts" PLUGIN_B="$repo_b/.pi/extensions/fm-primary-pi-watch.ts" FM_HOME="$home" FM_ROOT_OVERRIDE="$repo_a" FM_CHILD_LOG="$log" node --input-type=module 2>&1 <<'EOF'
-import { existsSync, readFileSync, writeFileSync } from "node:fs";
+  cp "$repo_a/bin/fm-lock.sh" "$repo_b/bin/fm-lock.sh"
+  chmod +x "$repo_a/bin/fm-watch-arm.sh" "$repo_b/bin/fm-watch-arm.sh" "$repo_a/bin/fm-lock.sh" "$repo_b/bin/fm-lock.sh"
+  out=$(PLUGIN_A="$repo_a/.pi/extensions/fm-primary-pi-watch.ts" PLUGIN_B="$repo_b/.pi/extensions/fm-primary-pi-watch.ts" FM_HOME="$home" FM_ROOT_OVERRIDE="$repo_a" FM_CHILD_LOG="$log" FM_LOCK_LOG="$home/lock-claims" node --input-type=module 2>&1 <<'EOF'
+import { existsSync, readFileSync } from "node:fs";
 import { pathToFileURL } from "node:url";
 
 const handlers = [];
@@ -497,18 +662,21 @@ const makePi = () => ({
   },
   sendUserMessage: async () => {},
 });
-writeFileSync(`${process.env.FM_HOME}/state/.lock`, `${process.pid}\n`);
 const a = await import(pathToFileURL(process.env.PLUGIN_A).href);
 const b = await import(`${pathToFileURL(process.env.PLUGIN_B).href}?copy=b`);
 a.default(makePi());
 b.default(makePi());
-await tools[0].execute("factory-a", {}, undefined, undefined, {});
-await tools[1].execute("factory-b", {}, undefined, undefined, {});
+await Promise.all([
+  tools[0].execute("factory-a", {}, undefined, undefined, {}),
+  tools[1].execute("factory-b", {}, undefined, undefined, {}),
+]);
 for (let i = 0; i < 50 && !existsSync(process.env.FM_CHILD_LOG); i += 1) {
   await new Promise((resolve) => setTimeout(resolve, 20));
 }
 const children = readFileSync(process.env.FM_CHILD_LOG, "utf8").trim().split("\n").filter(Boolean);
 if (children.length !== 1) throw new Error(`duplicate factories started ${children.length} arm children`);
+const claims = readFileSync(process.env.FM_LOCK_LOG, "utf8").trim().split("\n").filter(Boolean);
+if (claims.length !== 1) throw new Error(`duplicate factories started ${claims.length} lock claims`);
 for (const shutdown of handlers) await shutdown({ type: "session_shutdown", reason: "quit" }, {});
 EOF
 )
@@ -673,8 +841,30 @@ SH
     FM_PI_ACCEPTANCE_EVIDENCE="$evidence" PI_CODING_AGENT_DIR="$pi_dir" FM_HOME="$home" \
     bash "$helper" snapshot armed >/dev/null
   assert_contains "$(cat "$evidence/armed-watcher-lock.txt")" "watcher_pid=54321" "acceptance snapshot omitted watcher ownership"
+  cat > "$fakebin/uname" <<'SH'
+#!/usr/bin/env bash
+printf 'Linux\n'
+SH
+  cat > "$fakebin/stat" <<'SH'
+#!/usr/bin/env bash
+if [ "${1:-}" = -f ]; then
+  printf 'partial-filesystem-stat\n'
+  exit 1
+fi
+if [ "${1:-}" = -c ]; then
+  printf '1700000000\n'
+  exit 0
+fi
+exit 2
+SH
+  chmod +x "$fakebin/uname" "$fakebin/stat"
+  PATH="$fakebin:$PATH" FM_PI_ACCEPTANCE_ID=accept-helper-1 FM_PI_CANDIDATE_COMMIT="$candidate" \
+    FM_PI_ACCEPTANCE_EVIDENCE="$evidence" PI_CODING_AGENT_DIR="$pi_dir" FM_HOME="$home" \
+    bash "$helper" snapshot linux-stat >/dev/null
+  assert_contains "$(cat "$evidence/linux-stat-watcher-lock.txt")" "beacon_epoch=1700000000" "Linux acceptance snapshot did not select GNU stat"
+  assert_not_contains "$(cat "$evidence/linux-stat-watcher-lock.txt")" "partial-filesystem-stat" "Linux acceptance snapshot retained failed BSD stat output"
   [ -z "$out" ] || fail "Pi acceptance helper printed unexpected output: $out"
-  pass "Pi live acceptance helper records isolated identity, inventory, emission, and watcher evidence"
+  pass "Pi live acceptance helper records portable isolated evidence"
 }
 
 test_opencode_primary_watch_plugin_static_wiring() {
@@ -1148,7 +1338,9 @@ test_spawn_template_mentions_pi_watch_placeholder
 test_pi_extension_reports_external_healthy_watcher
 test_pi_tool_returns_agent_tool_result
 test_pi_stale_lock_recovers_through_home_protocol
+test_pi_live_non_harness_lock_is_reclaimed
 test_pi_live_other_lock_owner_is_refused
+test_session_lock_reclaim_has_one_atomic_winner
 test_pi_process_exit_cleanup_listener_lifecycle
 test_pi_session_shutdown_suppresses_intentional_exit
 test_pi_unexpected_actionable_exit_notifies_once

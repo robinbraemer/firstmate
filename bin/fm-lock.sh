@@ -12,23 +12,34 @@ FM_ROOT="${FM_ROOT_OVERRIDE:-$(cd "$SCRIPT_DIR/.." && pwd)}"
 FM_HOME="${FM_HOME:-${FM_ROOT_OVERRIDE:-$FM_ROOT}}"
 STATE="${FM_STATE_OVERRIDE:-$FM_HOME/state}"
 LOCK="$STATE/.lock"
+LOCK_MUTEX="$STATE/.lock.acquire"
 mkdir -p "$STATE"
+
+# shellcheck source=bin/fm-wake-lib.sh
+. "$SCRIPT_DIR/fm-wake-lib.sh"
 
 # Known harness command names; extend when a new adapter is verified.
 HARNESS_RE='claude|codex|opencode|grok|^pi$'
 
+process_is_harness() {
+  local pid=$1 comm args
+  comm=$(ps -o comm= -p "$pid" 2>/dev/null) || return 1
+  args=$(ps -o args= -p "$pid" 2>/dev/null)
+  if printf '%s' "$(basename "$comm")" | grep -qE "$HARNESS_RE"; then
+    return 0
+  fi
+  case "$comm" in
+    *node*|*python*) printf '%s' "$args" | grep -qE "$HARNESS_RE" ;;
+    *) return 1 ;;
+  esac
+}
+
 harness_pid() {
-  local pid=$$ comm args
+  local pid=$$
   for _ in 1 2 3 4 5 6 7 8; do
-    comm=$(ps -o comm= -p "$pid" 2>/dev/null) || return 1
-    args=$(ps -o args= -p "$pid" 2>/dev/null)
-    if printf '%s' "$(basename "$comm")" | grep -qE "$HARNESS_RE"; then
+    if process_is_harness "$pid"; then
       echo "$pid"; return 0
     fi
-    # Bare interpreter (e.g. node): match the harness name in its script path.
-    case "$comm" in
-      *node*|*python*) printf '%s' "$args" | grep -qE "$HARNESS_RE" && { echo "$pid"; return 0; } ;;
-    esac
     pid=$(ps -o ppid= -p "$pid" 2>/dev/null | tr -d ' ')
     [ -n "$pid" ] && [ "$pid" -gt 1 ] || return 1
   done
@@ -36,10 +47,9 @@ harness_pid() {
 }
 
 holder_alive() {  # true if $1 is a live process that looks like a harness
-  local pid=$1 comm
+  local pid=$1
   kill -0 "$pid" 2>/dev/null || return 1
-  comm=$(ps -o comm= -p "$pid" 2>/dev/null) || return 1
-  printf '%s' "$(basename "$comm") $(ps -o args= -p "$pid" 2>/dev/null)" | grep -qE "$HARNESS_RE"
+  process_is_harness "$pid"
 }
 
 if [ "${1:-}" = "status" ]; then
@@ -50,6 +60,24 @@ if [ "${1:-}" = "status" ]; then
 fi
 
 me=$(harness_pid) || { echo "error: cannot locate harness process in ancestry" >&2; exit 1; }
+if ! fm_lock_try_acquire "$LOCK_MUTEX"; then
+  echo "error: another session lock acquisition is in progress; retry before mutating fleet state" >&2
+  exit 1
+fi
+lock_mutex_held=1
+lock_tmp=
+cleanup_lock_claim() {
+  [ -n "$lock_tmp" ] && rm -f "$lock_tmp" 2>/dev/null || true
+  if [ "$lock_mutex_held" -eq 1 ]; then
+    fm_lock_release "$LOCK_MUTEX"
+    lock_mutex_held=0
+  fi
+}
+trap cleanup_lock_claim EXIT
+trap 'exit 129' HUP
+trap 'exit 130' INT
+trap 'exit 143' TERM
+
 if [ -f "$LOCK" ]; then
   old=$(cat "$LOCK")
   if [ "$old" != "$me" ] && holder_alive "$old"; then
@@ -57,5 +85,9 @@ if [ -f "$LOCK" ]; then
     exit 1
   fi
 fi
-echo "$me" > "$LOCK"
+lock_tmp=$(mktemp "$STATE/.lock.write.XXXXXX") || { echo "error: cannot prepare session lock record" >&2; exit 1; }
+printf '%s\n' "$me" > "$lock_tmp" || { echo "error: cannot write session lock record" >&2; exit 1; }
+mv "$lock_tmp" "$LOCK" || { echo "error: cannot publish session lock record" >&2; exit 1; }
+lock_tmp=
+[ "$(cat "$LOCK" 2>/dev/null || true)" = "$me" ] || { echo "error: session lock ownership could not be confirmed" >&2; exit 1; }
 echo "lock acquired: harness pid $me"
