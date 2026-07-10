@@ -185,6 +185,80 @@ EOF
   pass "A duplicate Pi watcher arm preserves watching without another start or generation"
 }
 
+test_pi_status_duplicate_factory_preserves_active_watching() {
+  local repo plugin arm_log arm_ready out status
+  repo="$TMP_ROOT/pi-status-duplicate-factory-root"
+  arm_log="$TMP_ROOT/pi-status-duplicate-factory-arm.log"
+  arm_ready="$TMP_ROOT/pi-status-duplicate-factory-arm-ready"
+  mkdir -p "$repo/bin" "$repo/config" "$repo/state"
+  install_pi_watch_extension_fixture "$repo"
+  install_pi_status_harness "$repo"
+  plugin="$repo/.pi/extensions/fm-primary-pi-watch.ts"
+  cat > "$repo/bin/fm-watch-arm.sh" <<'SH'
+#!/usr/bin/env bash
+printf '%s\n' "$$" >> "${FM_ARM_LOG:?}"
+trap 'exit 0' TERM
+: > "${FM_ARM_READY:?}"
+while :; do sleep 0.01; done
+SH
+  chmod +x "$repo/bin/fm-watch-arm.sh"
+  out=$(PLUGIN="$plugin" FM_HOME="$repo" FM_ROOT_OVERRIDE="$repo" STATUS_HARNESS="$repo/status-harness.mjs" \
+    FM_ARM_LOG="$arm_log" FM_ARM_READY="$arm_ready" node --input-type=module 2>&1 <<'EOF'
+import assert from "node:assert/strict";
+import { existsSync, readFileSync, writeFileSync } from "node:fs";
+import { pathToFileURL } from "node:url";
+
+const { makeStatusHarness } = await import(pathToFileURL(process.env.STATUS_HARNESS).href);
+writeFileSync(`${process.env.FM_HOME}/state/.lock`, `${process.pid}\n`);
+const url = pathToFileURL(process.env.PLUGIN).href;
+
+const globalHarness = makeStatusHarness();
+const globalModule = await import(`${url}?status-factory=global`);
+globalModule.default(globalHarness.pi);
+await globalHarness.handlers.get("session_start")?.({ type: "session_start" }, globalHarness.ctx);
+await globalHarness.tool().execute("status-global-arm", {}, undefined, undefined, {});
+for (let i = 0; i < 200 && !existsSync(process.env.FM_ARM_READY); i += 1) {
+  await new Promise((resolve) => setTimeout(resolve, 10));
+}
+assert.equal(existsSync(process.env.FM_ARM_READY), true, "global-loader arm did not become ready");
+assert.deepEqual(globalHarness.writes.at(-1), ["firstmate-pi-watcher", "watching"]);
+
+const nativeHarness = makeStatusHarness();
+const nativeModule = await import(`${url}?status-factory=native`);
+nativeModule.default(nativeHarness.pi);
+await nativeHarness.handlers.get("session_start")?.({ type: "session_start" }, nativeHarness.ctx);
+assert.deepEqual(nativeHarness.writes, [["firstmate-pi-watcher", "watching"]]);
+
+const duplicate = await nativeHarness.tool().execute(
+  "status-native-duplicate-arm",
+  {},
+  undefined,
+  undefined,
+  {},
+);
+assert.equal(duplicate.details?.ok, true);
+assert.match(duplicate.content?.[0]?.text ?? "", /healthy - Pi extension already has an arm child/);
+assert.deepEqual(nativeHarness.writes.at(-1), ["firstmate-pi-watcher", "watching"]);
+assert.equal(readFileSync(process.env.FM_ARM_LOG, "utf8").trim().split("\n").length, 1);
+
+await globalHarness.handlers.get("session_shutdown")?.(
+  { type: "session_shutdown", reason: "reload" },
+  globalHarness.ctx,
+);
+assert.deepEqual(globalHarness.writes.at(-1), ["firstmate-pi-watcher", undefined]);
+assert.deepEqual(nativeHarness.writes.at(-1), ["firstmate-pi-watcher", "watching"]);
+await nativeHarness.handlers.get("session_shutdown")?.(
+  { type: "session_shutdown", reason: "quit" },
+  nativeHarness.ctx,
+);
+EOF
+  )
+  status=$?
+  expect_code 0 "$status" "A simultaneously active duplicate factory must inherit the owned watching status"
+  [ -z "$out" ] || fail "Pi duplicate-factory status test printed output: $out"
+  pass "Pi duplicate factory preserves active watching status and one owned arm"
+}
+
 test_pi_status_legacy_coordinator_reload_compatibility() {
   local repo plugin out status
   repo="$TMP_ROOT/pi-status-legacy-reload-root"
@@ -2895,6 +2969,7 @@ test_tracked_extension_present_and_self_hashing
 test_pi_status_loads_offline_before_arm
 test_pi_status_successful_arm_watching
 test_pi_status_duplicate_arm_preserves_watching
+test_pi_status_duplicate_factory_preserves_active_watching
 test_pi_status_legacy_coordinator_reload_compatibility
 test_pi_status_actionable_wake_and_rearm
 test_pi_status_attention_failures
