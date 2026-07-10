@@ -1422,6 +1422,7 @@ import { spawnSync } from "node:child_process";
 import { existsSync, readFileSync, writeFileSync } from "node:fs";
 import { pathToFileURL } from "node:url";
 
+process.title = "pi";
 let tool = null;
 const pi = {
   on() {},
@@ -1488,6 +1489,7 @@ import { spawn, spawnSync } from "node:child_process";
 import { existsSync, readFileSync, writeFileSync } from "node:fs";
 import { pathToFileURL } from "node:url";
 
+process.title = "pi";
 const unrelated = spawn("sleep", ["300"], { stdio: "ignore" });
 await new Promise((resolve, reject) => {
   unrelated.once("spawn", resolve);
@@ -1800,7 +1802,8 @@ printf '%s\n' "$$" > "$FM_CHILD_PID_FILE"
 while :; do sleep 1; done
 SH
   chmod +x "$repo/bin/fm-watch-arm.sh"
-  out=$(PLUGIN="$plugin" FM_HOME="$home" FM_ROOT_OVERRIDE="$repo" FM_CLEANUP_LOG="$cleanup_log" FM_CHILD_PID_FILE="$pid_file" node --input-type=module 2>&1 <<'EOF'
+  out=$(PLUGIN="$plugin" FM_HOME="$home" FM_ROOT_OVERRIDE="$repo" FM_PI_WATCH_STOP_GRACE_MS=3000 \
+    FM_CLEANUP_LOG="$cleanup_log" FM_CHILD_PID_FILE="$pid_file" node --input-type=module 2>&1 <<'EOF'
 import { existsSync, writeFileSync } from "node:fs";
 import { pathToFileURL } from "node:url";
 
