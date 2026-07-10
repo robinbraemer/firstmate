@@ -15,6 +15,8 @@ type ArmResult = {
 type LockOwnership = "owned" | "missing" | "other";
 type CoordinatorState = "idle" | "starting" | "running" | "stopping";
 type WakeKind = "actionable" | "failure";
+type WatcherStatus = "offline" | "watching" | "handling wake" | "attention";
+type StatusUi = { setStatus(key: string, text: string | undefined): void };
 
 type WakeDetails = {
   generation: number;
@@ -28,6 +30,13 @@ type WakeDetails = {
 };
 
 type WakeSender = (message: string, details: WakeDetails) => Promise<void>;
+
+type StatusClient = {
+  token: symbol;
+  ui: StatusUi | null;
+  active: boolean;
+  sendWake: WakeSender;
+};
 
 type CompletedCapture = {
   stdout: string;
@@ -55,9 +64,11 @@ type ArmCoordinator = {
   generation: number;
   sequence: number;
   state: CoordinatorState;
+  visibleStatus: WatcherStatus;
   startPromise: Promise<ArmResult> | null;
   startCancelled: boolean;
-  clients: Map<symbol, WakeSender>;
+  shuttingDown: boolean;
+  clients: Map<symbol, StatusClient>;
   exitListener?: () => void;
 };
 
@@ -78,6 +89,13 @@ const marker = `${state}/.pi-watch-extension-loaded`;
 const extensionVersion = `sha256:${createHash("sha256").update(readFileSync(extensionFile)).digest("hex")}`;
 const MAX_CAPTURE_BYTES = 16 * 1024;
 const MAX_PENDING_LINE_BYTES = 4 * 1024;
+const FIRSTMATE_PI_WATCHER_STATUS_KEY = "firstmate-pi-watcher" as const;
+const WATCHER_STATUS_TEXT: Record<WatcherStatus, WatcherStatus> = {
+  offline: "offline",
+  watching: "watching",
+  "handling wake": "handling wake",
+  attention: "attention",
+};
 const requestedStopGrace = Number(process.env.FM_PI_WATCH_STOP_GRACE_MS ?? "1000");
 const STOP_GRACE_MS = Number.isFinite(requestedStopGrace) && requestedStopGrace >= 0 ? requestedStopGrace : 1000;
 const STOP_KILL_GRACE_MS = 500;
@@ -109,12 +127,28 @@ function coordinatorForHome(): ArmCoordinator {
     generation: 0,
     sequence: 0,
     state: "idle",
+    visibleStatus: "offline",
     startPromise: null,
     startCancelled: false,
-    clients: new Map<symbol, WakeSender>(),
+    shuttingDown: false,
+    clients: new Map<symbol, StatusClient>(),
   };
   coordinators.set(fmHome, coordinator);
   return coordinator;
+}
+
+function writeClientStatus(client: StatusClient, status: WatcherStatus | undefined): void {
+  if (!client.active || !client.ui) return;
+  client.ui.setStatus(
+    FIRSTMATE_PI_WATCHER_STATUS_KEY,
+    status === undefined ? undefined : WATCHER_STATUS_TEXT[status],
+  );
+}
+
+function publishStatus(coordinator: ArmCoordinator, status: WatcherStatus): void {
+  if (coordinator.shuttingDown) return;
+  coordinator.visibleStatus = status;
+  for (const client of coordinator.clients.values()) writeClientStatus(client, status);
 }
 
 function parentPid(pid: string): string {
@@ -278,9 +312,9 @@ function settleArm(
     stdoutTruncated: record.stdoutTruncated,
     stderrTruncated: record.stderrTruncated,
   };
-  const sendWake = [...coordinator.clients.values()].at(-1);
-  if (!sendWake) return;
-  void sendWake(message, details).catch(() => {
+  const activeClient = [...coordinator.clients.values()].at(-1);
+  if (!activeClient || !activeClient.active) return;
+  void activeClient.sendWake(message, details).catch(() => {
     // Pi owns delivery errors; fail open so the extension never wedges the session.
   });
 }
@@ -370,7 +404,6 @@ function runPretoolCheck(command: string): Promise<{ code: number; stderr: strin
 export default function (pi: ExtensionAPI) {
   if (!supervisingHome()) return;
   const coordinator = coordinatorForHome();
-  const client = Symbol("pi-watch-extension-client");
 
   async function sendWake(message: string, details: WakeDetails): Promise<void> {
     pi.sendMessage(
@@ -384,7 +417,13 @@ export default function (pi: ExtensionAPI) {
     );
   }
 
-  coordinator.clients.set(client, sendWake);
+  const client: StatusClient = {
+    token: Symbol("pi-watch-extension-client"),
+    ui: null,
+    active: true,
+    sendWake,
+  };
+  coordinator.clients.set(client.token, client);
 
   const cleanupOnProcessExit = () => {
     stopArmOnProcessExit(coordinator);
@@ -434,6 +473,7 @@ export default function (pi: ExtensionAPI) {
     };
     coordinator.current = record;
     coordinator.state = "running";
+    publishStatus(coordinator, "watching");
     child.stdout?.on("data", (chunk: Buffer) => {
       captureOutput(record, "stdout", chunk);
     });
@@ -466,11 +506,13 @@ export default function (pi: ExtensionAPI) {
     return startPromise;
   }
 
-  pi.on?.("session_start", () => {
+  pi.on?.("session_start", (_event, ctx) => {
+    client.ui = ctx.ui;
+    writeClientStatus(client, coordinator.visibleStatus);
     markLoaded();
   });
   pi.on?.("session_shutdown", async () => {
-    coordinator.clients.delete(client);
+    coordinator.clients.delete(client.token);
     if (coordinator.clients.size > 0) return;
     coordinator.startCancelled = true;
     const pendingStart = coordinator.startPromise;

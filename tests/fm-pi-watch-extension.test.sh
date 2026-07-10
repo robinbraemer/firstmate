@@ -26,6 +26,165 @@ export const Type = {
 JS
 }
 
+install_pi_status_harness() {
+  local repo=$1
+  cat > "$repo/status-harness.mjs" <<'JS'
+export const makeStatusHarness = () => {
+  const handlers = new Map();
+  const writes = [];
+  const messages = [];
+  let tool = null;
+  const pi = {
+    on(event, handler) {
+      handlers.set(event, handler);
+    },
+    registerCommand() {},
+    registerTool(candidate) {
+      if (candidate.name === "fm_watch_arm_pi") tool = candidate;
+    },
+    sendMessage(message, options) {
+      messages.push({ message, options });
+    },
+  };
+  const ctx = {
+    ui: {
+      setStatus(key, text) {
+        writes.push([key, text]);
+      },
+      notify() {},
+    },
+  };
+  return { handlers, messages, pi, ctx, tool: () => tool, writes };
+};
+JS
+}
+
+test_pi_status_loads_offline_before_arm() {
+  local repo plugin out status
+  repo="$TMP_ROOT/pi-status-offline-root"
+  mkdir -p "$repo/bin" "$repo/config" "$repo/state"
+  install_pi_watch_extension_fixture "$repo"
+  install_pi_status_harness "$repo"
+  plugin="$repo/.pi/extensions/fm-primary-pi-watch.ts"
+  out=$(PLUGIN="$plugin" FM_HOME="$repo" FM_ROOT_OVERRIDE="$repo" STATUS_HARNESS="$repo/status-harness.mjs" \
+    node --input-type=module 2>&1 <<'EOF'
+import assert from "node:assert/strict";
+import { pathToFileURL } from "node:url";
+
+const { makeStatusHarness } = await import(
+  pathToFileURL(process.env.STATUS_HARNESS).href,
+);
+const harness = makeStatusHarness();
+const mod = await import(pathToFileURL(process.env.PLUGIN).href);
+mod.default(harness.pi);
+await harness.handlers.get("session_start")?.({ type: "session_start" }, harness.ctx);
+assert.deepEqual(harness.writes, [["firstmate-pi-watcher", "offline"]]);
+EOF
+  )
+  status=$?
+  expect_code 0 "$status" "Pi watcher status must load offline before the first arm"
+  [ -z "$out" ] || fail "Pi offline-status test printed output: $out"
+  pass "Pi watcher status loads offline before the first arm"
+}
+
+test_pi_status_successful_arm_watching() {
+  local repo plugin arm_log out status
+  repo="$TMP_ROOT/pi-status-watching-root"
+  arm_log="$TMP_ROOT/pi-status-watching-arm.log"
+  mkdir -p "$repo/bin" "$repo/config" "$repo/state"
+  install_pi_watch_extension_fixture "$repo"
+  install_pi_status_harness "$repo"
+  plugin="$repo/.pi/extensions/fm-primary-pi-watch.ts"
+  cat > "$repo/bin/fm-watch-arm.sh" <<'SH'
+#!/usr/bin/env bash
+printf 'arm\n' >> "${FM_ARM_LOG:?}"
+trap 'exit 0' TERM
+while :; do sleep 0.05; done
+SH
+  chmod +x "$repo/bin/fm-watch-arm.sh"
+  out=$(PLUGIN="$plugin" FM_HOME="$repo" FM_ROOT_OVERRIDE="$repo" STATUS_HARNESS="$repo/status-harness.mjs" \
+    FM_ARM_LOG="$arm_log" node --input-type=module 2>&1 <<'EOF'
+import assert from "node:assert/strict";
+import { existsSync, writeFileSync } from "node:fs";
+import { pathToFileURL } from "node:url";
+
+const { makeStatusHarness } = await import(
+  pathToFileURL(process.env.STATUS_HARNESS).href,
+);
+const harness = makeStatusHarness();
+writeFileSync(`${process.env.FM_HOME}/state/.lock`, `${process.pid}\n`);
+const mod = await import(pathToFileURL(process.env.PLUGIN).href);
+mod.default(harness.pi);
+await harness.handlers.get("session_start")?.({ type: "session_start" }, harness.ctx);
+await harness.tool().execute("status-first-arm", {}, undefined, undefined, {});
+assert.deepEqual(harness.writes.at(-1), ["firstmate-pi-watcher", "watching"]);
+for (let i = 0; i < 100 && !existsSync(process.env.FM_ARM_LOG); i += 1) {
+  await new Promise((resolve) => setTimeout(resolve, 10));
+}
+assert.equal(existsSync(process.env.FM_ARM_LOG), true);
+await harness.handlers.get("session_shutdown")?.({ type: "session_shutdown", reason: "quit" }, harness.ctx);
+EOF
+  )
+  status=$?
+  expect_code 0 "$status" "A successful current Pi watcher arm must publish watching"
+  [ -z "$out" ] || fail "Pi watching-status test printed output: $out"
+  pass "A successful current Pi watcher arm publishes watching"
+}
+
+test_pi_status_duplicate_arm_preserves_watching() {
+  local repo plugin arm_log out status
+  repo="$TMP_ROOT/pi-status-duplicate-root"
+  arm_log="$TMP_ROOT/pi-status-duplicate-arm.log"
+  mkdir -p "$repo/bin" "$repo/config" "$repo/state"
+  install_pi_watch_extension_fixture "$repo"
+  install_pi_status_harness "$repo"
+  plugin="$repo/.pi/extensions/fm-primary-pi-watch.ts"
+  cat > "$repo/bin/fm-watch-arm.sh" <<'SH'
+#!/usr/bin/env bash
+printf 'arm\n' >> "${FM_ARM_LOG:?}"
+trap 'exit 0' TERM
+while :; do sleep 0.05; done
+SH
+  chmod +x "$repo/bin/fm-watch-arm.sh"
+  out=$(PLUGIN="$plugin" FM_HOME="$repo" FM_ROOT_OVERRIDE="$repo" STATUS_HARNESS="$repo/status-harness.mjs" \
+    FM_ARM_LOG="$arm_log" node --input-type=module 2>&1 <<'EOF'
+import assert from "node:assert/strict";
+import { existsSync, readFileSync, writeFileSync } from "node:fs";
+import { pathToFileURL } from "node:url";
+
+const { makeStatusHarness } = await import(
+  pathToFileURL(process.env.STATUS_HARNESS).href,
+);
+const harness = makeStatusHarness();
+writeFileSync(`${process.env.FM_HOME}/state/.lock`, `${process.pid}\n`);
+const mod = await import(pathToFileURL(process.env.PLUGIN).href);
+mod.default(harness.pi);
+await harness.handlers.get("session_start")?.({ type: "session_start" }, harness.ctx);
+await harness.tool().execute("status-first-arm", {}, undefined, undefined, {});
+assert.deepEqual(harness.writes.at(-1), ["firstmate-pi-watcher", "watching"]);
+for (let i = 0; i < 100 && !existsSync(process.env.FM_ARM_LOG); i += 1) {
+  await new Promise((resolve) => setTimeout(resolve, 10));
+}
+assert.equal(existsSync(process.env.FM_ARM_LOG), true);
+const coordinator = [...globalThis.__firstmatePiWatchCoordinators.values()][0];
+const sequenceBeforeDuplicate = coordinator.sequence;
+const generationBeforeDuplicate = coordinator.generation;
+const writesBeforeDuplicate = harness.writes.length;
+await harness.tool().execute("status-duplicate-arm", {}, undefined, undefined, {});
+assert.equal(readFileSync(process.env.FM_ARM_LOG, "utf8").trim().split("\n").length, 1);
+assert.equal(harness.writes.length, writesBeforeDuplicate);
+assert.deepEqual(harness.writes.at(-1), ["firstmate-pi-watcher", "watching"]);
+assert.equal(coordinator.sequence, sequenceBeforeDuplicate);
+assert.equal(coordinator.generation, generationBeforeDuplicate);
+await harness.handlers.get("session_shutdown")?.({ type: "session_shutdown", reason: "quit" }, harness.ctx);
+EOF
+  )
+  status=$?
+  expect_code 0 "$status" "A duplicate Pi watcher arm must preserve watching without another start or generation"
+  [ -z "$out" ] || fail "Pi duplicate-arm status test printed output: $out"
+  pass "A duplicate Pi watcher arm preserves watching without another start or generation"
+}
+
 installed_pi_package_dir() {
   local candidate pi_bin pi_target
   if [ -n "${FM_PI_PACKAGE_DIR:-}" ]; then
@@ -2113,6 +2272,9 @@ EOF
 }
 
 test_tracked_extension_present_and_self_hashing
+test_pi_status_loads_offline_before_arm
+test_pi_status_successful_arm_watching
+test_pi_status_duplicate_arm_preserves_watching
 test_pi_extension_supervises_only_primary_or_secondmate_homes
 test_pi_live_lab_cleanup_is_owned
 test_pi_detached_launch_helper_preserves_exact_argv
