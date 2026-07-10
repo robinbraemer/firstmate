@@ -31,7 +31,7 @@ type WakeDetails = {
 
 type WakeSender = (message: string, details: WakeDetails) => Promise<void>;
 
-type StatusClient = {
+type StatusClient = WakeSender & {
   token: symbol;
   ui: StatusUi | null;
   active: boolean;
@@ -120,7 +120,11 @@ function supervisingHome(): boolean {
 
 function coordinatorForHome(): ArmCoordinator {
   const existing = coordinators.get(fmHome);
-  if (existing) return existing;
+  if (existing) {
+    existing.visibleStatus ??= "offline";
+    existing.shuttingDown ??= false;
+    return existing;
+  }
   const coordinator: ArmCoordinator = {
     current: null,
     lastCompleted: null,
@@ -425,12 +429,12 @@ export default function (pi: ExtensionAPI) {
     );
   }
 
-  const client: StatusClient = {
+  const client: StatusClient = Object.assign(sendWake, {
     token: Symbol("pi-watch-extension-client"),
-    ui: null,
+    ui: null as StatusUi | null,
     active: true,
     sendWake,
-  };
+  });
   coordinator.clients.set(client.token, client);
 
   const cleanupOnProcessExit = () => {
