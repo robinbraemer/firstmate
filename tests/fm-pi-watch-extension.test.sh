@@ -557,6 +557,116 @@ EOF
   pass "Pi reload and quit clear before cleanup and replacement begins offline"
 }
 
+test_pi_status_reload_overlap_preserves_replacement_ownership() {
+  local repo plugin arm_log arm_ready term_seen term_release out status
+  repo="$TMP_ROOT/pi-status-reload-overlap-root"
+  arm_log="$TMP_ROOT/pi-status-reload-overlap-arm.log"
+  arm_ready="$TMP_ROOT/pi-status-reload-overlap-arm-ready"
+  term_seen="$TMP_ROOT/pi-status-reload-overlap-term-seen"
+  term_release="$TMP_ROOT/pi-status-reload-overlap-term-release"
+  mkdir -p "$repo/bin" "$repo/config" "$repo/state"
+  install_pi_watch_extension_fixture "$repo"
+  install_pi_status_harness "$repo"
+  plugin="$repo/.pi/extensions/fm-primary-pi-watch.ts"
+  cat > "$repo/bin/fm-watch-arm.sh" <<'SH'
+#!/usr/bin/env bash
+printf '%s\n' "$$" >> "${FM_ARM_LOG:?}"
+arm_number=$(wc -l < "$FM_ARM_LOG" | tr -d ' ')
+if [ "$arm_number" -eq 1 ]; then
+  trap ': > "$FM_TERM_SEEN"; while [ ! -f "$FM_TERM_RELEASE" ]; do sleep 0.01; done; exit 0' TERM
+  : > "$FM_ARM_READY"
+else
+  trap 'exit 0' TERM
+fi
+while :; do sleep 0.01; done
+SH
+  chmod +x "$repo/bin/fm-watch-arm.sh"
+  out=$(PLUGIN="$plugin" FM_HOME="$repo" FM_ROOT_OVERRIDE="$repo" STATUS_HARNESS="$repo/status-harness.mjs" \
+    FM_ARM_LOG="$arm_log" FM_ARM_READY="$arm_ready" FM_TERM_SEEN="$term_seen" FM_TERM_RELEASE="$term_release" \
+    FM_PI_WATCH_STOP_GRACE_MS=5000 node --input-type=module 2>&1 <<'EOF'
+import assert from "node:assert/strict";
+import { existsSync, readFileSync, writeFileSync } from "node:fs";
+import { pathToFileURL } from "node:url";
+
+const { makeStatusHarness } = await import(pathToFileURL(process.env.STATUS_HARNESS).href);
+writeFileSync(`${process.env.FM_HOME}/state/.lock`, `${process.pid}\n`);
+const url = pathToFileURL(process.env.PLUGIN).href;
+const initialExitListeners = process.listenerCount("exit");
+
+const oldHarness = makeStatusHarness();
+const oldModule = await import(`${url}?status-overlap=old`);
+oldModule.default(oldHarness.pi);
+await oldHarness.handlers.get("session_start")?.({ type: "session_start" }, oldHarness.ctx);
+await oldHarness.tool().execute("status-overlap-old-arm", {}, undefined, undefined, {});
+const coordinator = [...globalThis.__firstmatePiWatchCoordinators.values()][0];
+const oldRecord = coordinator.current;
+assert.ok(oldRecord, "reload-overlap old arm record missing");
+assert.equal(process.listenerCount("exit"), initialExitListeners + 1);
+for (let i = 0; i < 200 && !existsSync(process.env.FM_ARM_READY); i += 1) {
+  await new Promise((resolve) => setTimeout(resolve, 10));
+}
+assert.equal(existsSync(process.env.FM_ARM_READY), true, "old arm did not become ready");
+
+const oldShutdown = Promise.resolve(
+  oldHarness.handlers.get("session_shutdown")?.(
+    { type: "session_shutdown", reason: "reload" },
+    oldHarness.ctx,
+  ),
+);
+assert.deepEqual(oldHarness.writes.at(-1), ["firstmate-pi-watcher", undefined]);
+for (let i = 0; i < 200 && !existsSync(process.env.FM_TERM_SEEN); i += 1) {
+  await new Promise((resolve) => setTimeout(resolve, 10));
+}
+assert.equal(existsSync(process.env.FM_TERM_SEEN), true, "old arm TERM cleanup did not pause");
+
+const newHarness = makeStatusHarness();
+const newModule = await import(`${url}?status-overlap=new`);
+newModule.default(newHarness.pi);
+await newHarness.handlers.get("session_start")?.({ type: "session_start" }, newHarness.ctx);
+assert.deepEqual(newHarness.writes, [["firstmate-pi-watcher", "offline"]]);
+assert.equal(process.listenerCount("exit"), initialExitListeners + 1);
+
+const replacementArm = newHarness.tool().execute(
+  "status-overlap-replacement-arm",
+  {},
+  undefined,
+  undefined,
+  {},
+);
+await new Promise((resolve) => setTimeout(resolve, 30));
+assert.equal(readFileSync(process.env.FM_ARM_LOG, "utf8").trim().split("\n").length, 1);
+assert.deepEqual(newHarness.writes.at(-1), ["firstmate-pi-watcher", "offline"]);
+
+writeFileSync(process.env.FM_TERM_RELEASE, "release\n");
+const [, result] = await Promise.all([oldShutdown, replacementArm]);
+assert.equal(result.details?.ok, true);
+assert.match(result.content?.[0]?.text ?? "", /started Pi extension arm child/);
+assert.ok(coordinator.current, "reload-overlap replacement arm was cleared by stale shutdown");
+assert.notEqual(coordinator.current, oldRecord);
+assert.equal(coordinator.state, "running");
+assert.deepEqual(newHarness.writes.at(-1), ["firstmate-pi-watcher", "watching"]);
+assert.deepEqual(oldHarness.writes.at(-1), ["firstmate-pi-watcher", undefined]);
+assert.equal(oldHarness.messages.length, 0);
+assert.equal(newHarness.messages.length, 0);
+assert.ok(coordinator.exitListener, "reload-overlap stale shutdown removed the active exit listener");
+assert.equal(process.listenerCount("exit"), initialExitListeners + 1);
+
+await newHarness.handlers.get("session_shutdown")?.(
+  { type: "session_shutdown", reason: "quit" },
+  newHarness.ctx,
+);
+assert.equal(coordinator.current, null);
+assert.equal(coordinator.exitListener, undefined);
+assert.equal(process.listenerCount("exit"), initialExitListeners);
+assert.deepEqual(newHarness.writes.at(-1), ["firstmate-pi-watcher", undefined]);
+EOF
+  )
+  status=$?
+  expect_code 0 "$status" "An overlapping reload must serialize cleanup before replacement arm ownership"
+  [ -z "$out" ] || fail "Pi reload-overlap status test printed output: $out"
+  pass "Pi overlapping reload preserves replacement arm, status, and exit-listener ownership"
+}
+
 test_pi_status_stale_generation_cannot_overwrite() {
   local repo plugin out status
   repo="$TMP_ROOT/pi-status-stale-generation-root"
@@ -2790,6 +2900,7 @@ test_pi_status_actionable_wake_and_rearm
 test_pi_status_attention_failures
 test_pi_status_intentional_stop_offline
 test_pi_status_reload_and_quit_clear
+test_pi_status_reload_overlap_preserves_replacement_ownership
 test_pi_status_stale_generation_cannot_overwrite
 test_pi_status_cancelled_start_stays_cleared
 test_pi_extension_supervises_only_primary_or_secondmate_homes
