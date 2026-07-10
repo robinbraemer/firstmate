@@ -20,6 +20,8 @@
 # duplicating it, so the two consumers cannot drift apart.
 # shellcheck source=bin/fm-tmux-lib.sh
 . "$FM_BACKEND_LIB_DIR/fm-tmux-lib.sh"
+# shellcheck source=bin/fm-process-lib.sh
+. "$FM_BACKEND_LIB_DIR/fm-process-lib.sh"
 
 # fm_backend_tmux_resolve_bare_selector: the live-window-listing fallback for a
 # selector that is neither an explicit target nor a task selector routed
@@ -143,7 +145,7 @@ fm_backend_tmux_current_command() {  # <target>
 # on macOS and Linux-style installs: argv0/comm both identify `pi`, or node is
 # executing @earendil-works/pi-coding-agent's dist/cli.js entrypoint.
 fm_backend_tmux_pi_process_alive() {  # <target>
-  local target=$1 pane_pid foreground_pid comm args argv0 comm_base argv_base
+  local target=$1 pane_pid foreground_pid comm args
   pane_pid=$(tmux display-message -p -t "$target" '#{pane_pid}' 2>/dev/null) || return 1
   pane_pid=$(printf '%s' "$pane_pid" | tr -d '[:space:]')
   case "$pane_pid" in ''|*[!0-9]*) return 1 ;; esac
@@ -154,18 +156,7 @@ fm_backend_tmux_pi_process_alive() {  # <target>
 
   comm=$(ps -o comm= -p "$foreground_pid" 2>/dev/null) || return 1
   args=$(ps -o args= -p "$foreground_pid" 2>/dev/null) || return 1
-  comm=${comm#-}
-  comm_base=${comm##*/}
-  args=${args#"${args%%[![:space:]]*}"}
-  argv0=${args%%[[:space:]]*}
-  argv_base=${argv0##*/}
-  if [ "$comm_base" = pi ] && [ "$argv_base" = pi ]; then
-    return 0
-  fi
-  case "$comm_base:$args" in
-    node*:*/@earendil-works/pi-coding-agent/dist/cli.js*) return 0 ;;
-  esac
-  return 1
+  fm_process_is_pi "$comm" "$args"
 }
 
 # fm_backend_tmux_agent_alive: CONFIDENT liveness of a live harness-agent
