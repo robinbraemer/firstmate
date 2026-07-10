@@ -69,6 +69,8 @@ type ArmCoordinator = {
   startPromise: Promise<ArmResult> | null;
   startCancelled: boolean;
   shuttingDown: boolean;
+  shutdownPromise: Promise<void> | null;
+  shutdownToken: symbol | null;
   clients: Map<symbol, StatusClient>;
   exitListener?: () => void;
 };
@@ -123,8 +125,12 @@ function coordinatorForHome(): ArmCoordinator {
   const existing = coordinators.get(fmHome);
   if (existing) {
     existing.visibleStatus = "offline";
-    existing.shuttingDown = false;
-    existing.startCancelled = false;
+    existing.shutdownPromise ??= null;
+    existing.shutdownToken ??= null;
+    if (!existing.shutdownPromise) {
+      existing.shuttingDown = false;
+      existing.startCancelled = false;
+    }
     return existing;
   }
   const coordinator: ArmCoordinator = {
@@ -137,6 +143,8 @@ function coordinatorForHome(): ArmCoordinator {
     startPromise: null,
     startCancelled: false,
     shuttingDown: false,
+    shutdownPromise: null,
+    shutdownToken: null,
     clients: new Map<symbol, StatusClient>(),
   };
   coordinators.set(fmHome, coordinator);
@@ -390,18 +398,12 @@ function stopsWithin(record: ArmRecord, milliseconds: number): Promise<boolean> 
   });
 }
 
-export async function stopArm(
+async function stopArmRecord(
   coordinator: ArmCoordinator,
+  record: ArmRecord,
   reason: string,
-  disposition: StopDisposition = "clear",
+  disposition: StopDisposition,
 ): Promise<void> {
-  const record = coordinator.current;
-  if (!record) {
-    if (disposition === "offline" && coordinator.clients.size > 0) {
-      publishStatus(coordinator, "offline");
-    }
-    return;
-  }
   if (!record.intentionalStopReason) record.intentionalStopReason = reason;
   if (coordinator.current === record) coordinator.state = "stopping";
   signalArm(record, "SIGTERM");
@@ -424,6 +426,19 @@ export async function stopArm(
     !coordinator.shuttingDown &&
     coordinator.clients.size > 0
   ) {
+    publishStatus(coordinator, "offline");
+  }
+}
+
+export async function stopArm(
+  coordinator: ArmCoordinator,
+  reason: string,
+  disposition: StopDisposition = "clear",
+): Promise<void> {
+  const record = coordinator.current;
+  if (record) {
+    await stopArmRecord(coordinator, record, reason, disposition);
+  } else if (disposition === "offline" && coordinator.clients.size > 0) {
     publishStatus(coordinator, "offline");
   }
 }
@@ -557,7 +572,26 @@ export default function (pi: ExtensionAPI) {
     return { ok: true, message: `watcher: started Pi extension arm child ${id}` };
   }
 
-  function startArm(): Promise<ArmResult> {
+  async function startArm(): Promise<ArmResult> {
+    const pendingShutdown = coordinator.shutdownPromise;
+    if (pendingShutdown) {
+      try {
+        await pendingShutdown;
+      } catch (error) {
+        if (client.active && coordinator.clients.get(client.token) === client) {
+          publishStatus(coordinator, "attention");
+        }
+        return {
+          ok: false,
+          message: error instanceof Error
+            ? error.message
+            : "watcher: FAILED - Pi extension reload cleanup failed",
+        };
+      }
+    }
+    if (!client.active || coordinator.clients.get(client.token) !== client) {
+      return { ok: false, message: "watcher: not started - Pi extension session shut down" };
+    }
     if (coordinator.startPromise) return coordinator.startPromise;
     if (coordinator.shuttingDown || coordinator.clients.size === 0) {
       return Promise.resolve({ ok: false, message: "watcher: not started - Pi extension session shut down" });
@@ -586,6 +620,10 @@ export default function (pi: ExtensionAPI) {
     client.active = false;
     coordinator.clients.delete(client.token);
     if (coordinator.clients.size > 0) return;
+    if (coordinator.shutdownPromise) {
+      await coordinator.shutdownPromise;
+      return;
+    }
 
     coordinator.shuttingDown = true;
     coordinator.startCancelled = true;
@@ -594,12 +632,33 @@ export default function (pi: ExtensionAPI) {
     coordinator.generation += 1;
 
     const pendingStart = coordinator.startPromise;
-    if (pendingStart) await pendingStart.catch(() => undefined);
-    await stopArm(coordinator, reason, "clear");
-    if (coordinator.exitListener) {
-      process.off("exit", coordinator.exitListener);
-      coordinator.exitListener = undefined;
-    }
+    const exitListener = coordinator.exitListener;
+    const shutdownToken = Symbol("pi-watch-extension-shutdown");
+    coordinator.shutdownToken = shutdownToken;
+    const shutdownPromise = Promise.resolve().then(async () => {
+      try {
+        if (pendingStart) await pendingStart.catch(() => undefined);
+        if (coordinator.shutdownToken !== shutdownToken) return;
+        if (record) await stopArmRecord(coordinator, record, reason, "clear");
+        if (coordinator.shutdownToken !== shutdownToken) return;
+      } finally {
+        if (coordinator.shutdownToken === shutdownToken) {
+          if (coordinator.clients.size === 0) {
+            if (exitListener && coordinator.exitListener === exitListener) {
+              process.off("exit", exitListener);
+              coordinator.exitListener = undefined;
+            }
+          } else {
+            coordinator.shuttingDown = false;
+            coordinator.startCancelled = false;
+          }
+          coordinator.shutdownToken = null;
+          coordinator.shutdownPromise = null;
+        }
+      }
+    });
+    coordinator.shutdownPromise = shutdownPromise;
+    await shutdownPromise;
   }
 
   pi.on?.("session_shutdown", async (event) => {
