@@ -1,6 +1,6 @@
-# Supervising-home turn-end guard
+# Primary turn-end supervision guard
 
-This is the authoritative contract for the "no turn ends blind" primary and persistent-secondmate guard referenced from AGENTS.md section 8.
+This is the authoritative contract for the "no turn ends blind" primary guard referenced from AGENTS.md section 8.
 The shared predicate lives in `bin/fm-turnend-guard.sh`.
 Harness-specific tracked hook files only adapt each verified harness's real turn-end mechanism to that shared predicate.
 A related but separate guard, the pre-arm PreToolUse seatbelt (`bin/fm-arm-pretool-check.sh`, `docs/arm-pretool-check.md`), denies a bad watcher-arm command shape before it runs rather than detecting a blind turn end afterward.
@@ -11,18 +11,17 @@ A related but separate guard, the pre-arm PreToolUse seatbelt (`bin/fm-arm-preto
 The primary can otherwise end a turn after handling wakes without resuming supervision, then sit blind until another fleet command happens to run.
 On 2026-07-04, that exact gap left a parked no-mistakes gate unwatched for about nine hours.
 
-`bin/fm-turnend-guard.sh` closes the gap by checking each supervising home's own turn-end path.
-When tasks are in flight and there is no live identity-matched watcher with a fresh beacon, a harness hook must either block the turn end or force a bounded follow-up turn that tells the supervising firstmate to resume the session-start supervision protocol for its harness.
+`bin/fm-turnend-guard.sh` closes the gap by checking the primary's own turn-end path.
+When tasks are in flight and there is no live identity-matched watcher with a fresh beacon, a harness hook must either block the turn end or force a bounded follow-up turn that tells the primary to resume the session-start supervision protocol for its harness.
 
 ## Shared Predicate
 
-The guard first scopes itself to a real supervising home.
-A plain primary checkout is in scope when its git-dir equals its git-common-dir.
-A persistent secondmate is explicitly in scope when `.fm-secondmate-home` exists, including a treehouse-leased linked worktree, because it is the primary supervisor of its own isolated `FM_HOME`.
-Ordinary crewmate and scout worktrees remain inert because they are linked git worktrees without that marker.
-The guard also requires `AGENTS.md`, `bin/`, and the effective state directory to exist.
+The guard first scopes itself to the real primary checkout.
+It is inert in secondmate homes because `.fm-secondmate-home` exists there.
+It is inert in crewmate and scout worktrees because firstmate provisions them as linked git worktrees, where `git rev-parse --git-dir` differs from `git rev-parse --git-common-dir`.
+It also requires `AGENTS.md`, `bin/`, and the effective state directory to exist.
 
-For an in-scope supervising home, it counts in-flight work from `state/*.meta`.
+For an in-scope primary checkout, it counts in-flight work from `state/*.meta`.
 If no task is in flight, it exits silently.
 If work is in flight, it requires `fm_watcher_healthy <state-dir> <watch-path> [grace-seconds] [home]` from `bin/fm-wake-lib.sh`.
 That is the same identity-matched live lock and fresh beacon check used by `bin/fm-watch-arm.sh`.
@@ -35,12 +34,11 @@ If `jq` is missing or hook stdin is empty, the guard fails open and exits 0 beca
 
 ## Harness Integrations
 
-All verified firstmate harnesses have a tracked integration:
+All verified primary harnesses except Pi have a tracked integration:
 
 - `claude`: `.claude/settings.json` registers a `Stop` hook command anchored through `"$CLAUDE_PROJECT_DIR"/bin/fm-turnend-guard.sh`.
 - `codex`: `.codex/hooks.json` registers a `Stop` hook that reads the hook payload once, anchors the executable to the hook command process working directory, verifies that root is firstmate-shaped and hook-bearing, and pipes the original payload to that checkout's `bin/fm-turnend-guard.sh`.
 - `opencode`: `.opencode/plugins/fm-primary-turnend-guard.js` listens for `session.idle`, lets the watcher-arm coordinator handle normal idle supervision first, runs the shared guard only when that coordinator does not act, and uses `client.session.promptAsync` to force one follow-up prompt when the guard returns 2.
-- `pi`: `.pi/extensions/fm-primary-turnend-guard.ts` listens for `agent_settled`, marks the extension version loaded for session-start checks, runs the shared guard once per logical agent run, and uses `pi.sendUserMessage(..., { deliverAs: "followUp" })` to force one follow-up prompt when the guard returns 2.
 - `grok`: `.grok/hooks/fm-primary-turnend-guard.json` registers a `Stop` hook that invokes `bin/fm-turnend-guard-grok.sh`.
   The adapter runs the shared guard and, when it returns 2, invokes `grok --resume <sessionId> -p <guard-reason>` with `GROK_TURNEND_GUARD_ACTIVE=1`.
   It does not pass `--permission-mode`, so the passive Stop hook cannot grant stronger tool permissions than Grok's resumed-session default.
@@ -49,10 +47,9 @@ Claude and Codex support a direct blocking Stop hook.
 For those harnesses, exit status 2 plus stderr from `bin/fm-turnend-guard.sh` blocks the stop and feeds the reason back into the model.
 Both payloads include `stop_hook_active`; when it is true, the shared guard exits 0 so the harness can end after one forced continuation.
 
-OpenCode, Pi, and Grok expose passive lifecycle callbacks for this purpose.
+OpenCode and Grok expose passive lifecycle callbacks for this purpose.
 Their adapters fail open at the hook boundary to avoid corrupting a user session, but they force one follow-up turn when the shared predicate blocks.
 Each adapter carries its own in-process or environment loop guard so the forced follow-up does not recursively schedule another follow-up.
-Pi keeps that latch active across every internal tool turn and clears it only when the generated guard follow-up reaches `agent_settled`, or immediately when follow-up delivery fails.
 If a passive adapter cannot call its SDK method, cannot find `grok`, or cannot recover the Grok session id, it fails open and relies on the pull-based `fm-guard.sh` warning at the next fleet command.
 That warning uses `bin/fm-supervision-instructions.sh --repair-line`, so it points back to the active harness protocol instead of hardcoding one background-arm command.
 
@@ -84,17 +81,6 @@ Command run for follow-up behavior: `OPENCODE_CONFIG_CONTENT='{"permission":{"*"
 Observed output: the plugin called `client.session.promptAsync`, the TUI ran a second turn, and the second model output contained `OPENCODEHOOK`.
 In noninteractive `opencode run`, `promptAsync` returned successfully but the process exited before displaying the follow-up, so this adapter is trusted for persistent firstmate TUI sessions and documented as passive/fail-open in headless mode.
 
-Pi 0.80.6 was re-validated on 2026-07-10 in a disposable marked-secondmate clone with isolated `PI_CODING_AGENT_DIR`, isolated `FM_HOME`, and a dedicated tmux socket.
-Hook files used: the tracked `.pi/extensions/fm-primary-turnend-guard.ts` and `.pi/extensions/fm-primary-pi-watch.ts`.
-Commands run inside separate interactive turns: `printf PI_E2E_BASH_ONE` through Pi's bash tool, `README.md:1-5` through Pi's read tool, and `printf PI_E2E_BASH_TWO` through Pi's bash tool.
-Command used to make the shared predicate unhealthy: `: > "$FM_HOME/state/pi-e2e.meta"`.
-The next no-tool prompt in that secondmate home produced exactly one `TURN WOULD END BLIND` follow-up, and that follow-up called `fm_watch_arm_pi` once with output `watcher: started Pi extension arm child 1`.
-The three earlier tool turns produced no guard follow-up because no work was in flight.
-Command used to fire the watcher: `printf 'done: pi e2e watcher fire\n' > "$FM_HOME/state/pi-e2e.status"`.
-Observed output after the wake: Pi ran `bin/fm-wake-drain.sh`, read the terminal status, called `fm_watch_arm_pi`, and rendered `watcher: started Pi extension arm child 2`.
-The complete pane contained one guard message and zero foreground `bin/fm-watch-arm.sh` bash calls.
-`/quit` printed `PI_EXIT=0`, and the second arm process plus its watcher child were both gone afterward.
-
 Grok 0.2.91 was validated with a scratch `GROK_HOME` and symlinked auth/config.
 Hook file used for tracked project-hook loading: `<scratch-project>/.grok/hooks/fm-smoke.json`, matching the tracked `.grok/hooks/fm-primary-turnend-guard.json` location.
 Command run for project-hook loading: `GROK_HOME="$scratch/grok-home" grok --trust -p 'Say hi in exactly one word.' --permission-mode bypassPermissions --output-format plain --leader-socket "$scratch/leader.sock"`.
@@ -115,6 +101,5 @@ See `docs/arm-pretool-check.md`'s "Harness wiring" section for the same Grok exp
 
 ## Tests
 
-`tests/fm-turnend-guard.test.sh` covers the shared predicate, supervising-home scoping, `FM_HOME` and `FM_STATE_OVERRIDE` precedence, Pi logical-run latch behavior for no-tool and multi-tool runs, fail-open behavior without `jq`, tracked hook registration for all five harnesses, and the Grok adapter's forced-resume loop guard and permission-mode regression.
+`tests/fm-turnend-guard.test.sh` covers the shared predicate, primary scoping, `FM_HOME` and `FM_STATE_OVERRIDE` precedence, fail-open behavior without `jq`, tracked hook registration for the four integrated harnesses, and the Grok adapter's forced-resume loop guard and permission-mode regression.
 The default behavior suite does not invoke live language-model harnesses.
-`FM_PI_LIVE_E2E=1 tests/fm-pi-primary-live-e2e.test.sh` opts into the isolated interactive Pi regression recorded above.

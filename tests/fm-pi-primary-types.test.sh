@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# Strict no-emit contract check for both tracked Pi primary extensions.
-set -u
+# Strict no-emit contract check for the tracked Pi primary watcher extension.
+set -eu
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 
@@ -75,7 +75,6 @@ trap cleanup EXIT
 
 mkdir -p "$TMP_ROOT/node_modules/@earendil-works" "$TMP_ROOT/node_modules/@types"
 cp "$ROOT/.pi/extensions/fm-primary-pi-watch.ts" "$TMP_ROOT/fm-primary-pi-watch.ts"
-cp "$ROOT/.pi/extensions/fm-primary-turnend-guard.ts" "$TMP_ROOT/fm-primary-turnend-guard.ts"
 ln -s "$PI_PACKAGE_DIR" "$TMP_ROOT/node_modules/@earendil-works/pi-coding-agent"
 ln -s "$TYPEBOX_DIR" "$TMP_ROOT/node_modules/typebox"
 ln -s "$NODE_TYPES_DIR" "$TMP_ROOT/node_modules/@types/node"
@@ -99,6 +98,8 @@ cat > "$TMP_ROOT/tsconfig.json" <<'JSON'
 }
 JSON
 
-"$TSC_BIN" -p "$TMP_ROOT/tsconfig.json"
+if ! "$TSC_BIN" -p "$TMP_ROOT/tsconfig.json"; then
+  exit 1
+fi
 version=$(jq -r '.version' "$PI_PACKAGE_DIR/package.json" 2>/dev/null || printf 'unknown')
-printf 'ok - Pi primary extensions pass strict no-emit typecheck against Pi %s\n' "$version"
+printf 'ok - Pi primary watcher extension passes strict no-emit typecheck against Pi %s\n' "$version"
