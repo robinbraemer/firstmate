@@ -81,11 +81,14 @@ function effectivePaths(root) {
   return { root: fmRoot, home: fmHome, state, config };
 }
 
-async function isPrimaryRoot(root, home) {
+async function isSupervisingRoot(root, home) {
   if (!root) return false;
   if (!existsSync(`${root}/AGENTS.md`) || !existsSync(`${root}/bin`)) return false;
-  if (existsSync(`${root}/.fm-secondmate-home`)) return false;
-  if (home && home !== root && existsSync(`${home}/.fm-secondmate-home`)) return false;
+  const resolvedRoot = resolvePath(root);
+  const resolvedHome = home ? resolvePath(home) : resolvedRoot;
+  const rootIsSecondmate = existsSync(`${resolvedRoot}/.fm-secondmate-home`);
+  const homeIsSecondmate = existsSync(`${resolvedHome}/.fm-secondmate-home`);
+  if (rootIsSecondmate || homeIsSecondmate) return rootIsSecondmate && resolvedRoot === resolvedHome;
   const gitDir = await runProcess("git", ["-C", root, "rev-parse", "--git-dir"]);
   const commonDir = await runProcess("git", ["-C", root, "rev-parse", "--git-common-dir"]);
   if (gitDir.code !== 0 || commonDir.code !== 0) return false;
@@ -214,7 +217,7 @@ function spawnArm(paths, sessionID, client) {
 
 async function ensureArm(paths, sessionID, client) {
   if (!sessionID) return "skipped";
-  if (!(await isPrimaryRoot(paths.root, paths.home))) return "not-primary";
+  if (!(await isSupervisingRoot(paths.root, paths.home))) return "not-primary";
   if (!(await sessionOwnsLock(paths))) return "read-only";
   if (child) return waitForArmReady();
   if (!shouldArm(paths)) return "not-needed";
