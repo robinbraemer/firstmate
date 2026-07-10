@@ -17,19 +17,29 @@ mkdir -p "$STATE"
 
 # shellcheck source=bin/fm-wake-lib.sh
 . "$SCRIPT_DIR/fm-wake-lib.sh"
+# shellcheck source=bin/fm-process-lib.sh
+. "$SCRIPT_DIR/fm-process-lib.sh"
 
 # Known harness command names; extend when a new adapter is verified.
 HARNESS_RE='claude|codex|opencode|grok|^pi$'
 
 process_is_harness() {
-  local pid=$1 comm args
+  local pid=$1 comm args comm_base
   comm=$(ps -o comm= -p "$pid" 2>/dev/null) || return 1
-  args=$(ps -o args= -p "$pid" 2>/dev/null)
-  if printf '%s' "$(basename "$comm")" | grep -qE "$HARNESS_RE"; then
+  args=$(ps -o args= -p "$pid" 2>/dev/null) || return 1
+  comm=${comm#-}
+  comm_base=${comm##*/}
+  if printf '%s' "$comm_base" | grep -qE "$HARNESS_RE"; then
     return 0
   fi
-  case "$comm" in
-    *node*|*python*) printf '%s' "$args" | grep -qE "$HARNESS_RE" ;;
+  if fm_process_is_pi "$comm" "$args"; then
+    return 0
+  fi
+  case "$comm_base" in
+    node*)
+      printf '%s' "$args" | grep -qE "$HARNESS_RE"
+      ;;
+    python*) printf '%s' "$args" | grep -qE "$HARNESS_RE" ;;
     *) return 1 ;;
   esac
 }
