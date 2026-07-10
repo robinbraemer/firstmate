@@ -15,6 +15,8 @@ When this session owns supervision and away mode is not active:
 8. One process-wide coordinator per effective `FM_HOME` owns the attached arm generation.
    Duplicate factories share that coordinator, stale generation callbacks cannot clear a replacement, output capture stays bounded, and every unexpected terminal outcome delivers exactly once.
    Intentional session shutdown suppresses false wakes, terminates the whole arm/watcher process group with bounded TERM-to-KILL escalation, and waits for cleanup before reload or quit completes.
+   The Pi footer status key `firstmate-pi-watcher` reads `offline` before an arm, `watching` while the current arm owns supervision, `handling wake` after an actionable custom wake is accepted, and `attention` when ownership, startup, delivery, or an unexpected arm exit fails.
+   A successful re-arm returns it to `watching`; reload and shutdown clear the old client status so a stale generation cannot overwrite the replacement.
 9. If the extension says the watcher is already healthy, do not start another cycle.
 10. If the extension reports a watcher failure, drain queued wakes, inspect the failure text, and restart Pi with the watcher extension loaded if needed.
 11. Never use shell `&` for watcher supervision.
