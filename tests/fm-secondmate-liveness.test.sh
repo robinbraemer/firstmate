@@ -151,6 +151,14 @@ test_tmux_agent_alive_classifies() {
   [ "$(PATH="$fb:$BASE_PATH" bash -c '. "$0/bin/fm-backend.sh"; fm_backend_source tmux; fm_backend_tmux_agent_alive sess:win' "$ROOT")" = unknown ] \
     || fail "a generic Node foreground process must remain unknown"
 
+  fb=$(make_probe_pi_process "$TMP_ROOT/tmux-pi-node-suffix" /usr/bin/node '/usr/bin/node /opt/pi/node_modules/@earendil-works/pi-coding-agent/dist/cli.js.evil')
+  [ "$(PATH="$fb:$BASE_PATH" bash -c '. "$0/bin/fm-backend.sh"; fm_backend_source tmux; fm_backend_tmux_agent_alive sess:win' "$ROOT")" = unknown ] \
+    || fail "a suffixed Pi entrypoint must remain unknown"
+
+  fb=$(make_probe_pi_process "$TMP_ROOT/tmux-pi-node-later-argument" /usr/bin/node '/usr/bin/node /opt/innocent.js /opt/pi/node_modules/@earendil-works/pi-coding-agent/dist/cli.js')
+  [ "$(PATH="$fb:$BASE_PATH" bash -c '. "$0/bin/fm-backend.sh"; fm_backend_source tmux; fm_backend_tmux_agent_alive sess:win' "$ROOT")" = unknown ] \
+    || fail "a later-argument Pi entrypoint spoof must remain unknown"
+
   fb=$(make_probe_pi_process "$TMP_ROOT/tmux-malformed-pgid" /Users/test/.bun/bin/pi pi not-a-pid)
   [ "$(PATH="$fb:$BASE_PATH" bash -c '. "$0/bin/fm-backend.sh"; fm_backend_source tmux; fm_backend_tmux_agent_alive sess:win' "$ROOT")" = unknown ] \
     || fail "a malformed foreground process group must remain unknown"

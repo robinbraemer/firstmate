@@ -24,6 +24,8 @@ Pi deduplicates repeated canonical paths, not logical extension identities, so a
 `bin/fm-session-start.sh` reports when the running Pi session has not loaded the required tracked file.
 
 Verification on 2026-07-10 used Pi 0.80.6, isolated `PI_CODING_AGENT_DIR` and `FM_HOME` directories, `packages: []`, only the tracked watcher extension, and dedicated tmux sockets.
+The captain-confirmed primary watcher-only record is preserved in [`docs/pi-primary-watcher-only-evidence.md`](../pi-primary-watcher-only-evidence.md).
+The captain-confirmed operational reload, actionable wake, drain, and re-arm record is preserved in [`docs/pi-watcher-only-test-report.md`](../pi-watcher-only-test-report.md).
 Command run for the complete interactive regression: `FM_PI_LIVE_E2E=1 FM_PI_LIVE_AUTH_FILE="$HOME/.pi/agent/auth.json" tests/fm-pi-primary-live-e2e.test.sh`.
 The regression launched a marked secondmate with `--approve` and the explicit same-path tracked watcher extension, accepted its charter without a trust dialog, preserved project skills, and displayed the extension once.
 Stock Pi Bash ran `bin/fm-lock.sh`, and the recorded fleet lock named the direct parent Pi process.

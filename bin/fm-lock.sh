@@ -17,27 +17,25 @@ mkdir -p "$STATE"
 
 # shellcheck source=bin/fm-wake-lib.sh
 . "$SCRIPT_DIR/fm-wake-lib.sh"
+# shellcheck source=bin/fm-process-lib.sh
+. "$SCRIPT_DIR/fm-process-lib.sh"
 
 HARNESS_RE='claude|codex|opencode|grok'
 
 process_is_harness() {
-  local pid=$1 comm args argv0 comm_base argv_base
+  local pid=$1 comm args comm_base
   comm=$(ps -o comm= -p "$pid" 2>/dev/null) || return 1
   args=$(ps -o args= -p "$pid" 2>/dev/null) || return 1
   comm=${comm#-}
   comm_base=${comm##*/}
-  args=${args#"${args%%[![:space:]]*}"}
-  argv0=${args%%[[:space:]]*}
-  argv_base=${argv0##*/}
   if printf '%s' "$comm_base" | grep -qE "$HARNESS_RE"; then
     return 0
   fi
+  if fm_process_is_pi "$comm" "$args"; then
+    return 0
+  fi
   case "$comm_base" in
-    pi) [ "$argv_base" = pi ] ;;
     node*)
-      if printf '%s\n' "$args" | grep -qE '(^|[[:space:]])[^[:space:]]*/@earendil-works/pi-coding-agent/dist/cli\.js([[:space:]]|$)'; then
-        return 0
-      fi
       printf '%s' "$args" | grep -qE "$HARNESS_RE"
       ;;
     python*) printf '%s' "$args" | grep -qE "$HARNESS_RE" ;;
