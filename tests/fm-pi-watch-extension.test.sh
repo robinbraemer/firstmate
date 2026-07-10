@@ -25,9 +25,11 @@ JS
 }
 
 test_tracked_extension_present_and_self_hashing() {
-  local text expected_config_source
+  local text expected_config_source extension_count
   expected_config_source="config_dir=\\\"\${FM_CONFIG_OVERRIDE:-\$FM_HOME/config}\\\""
   assert_present "$EXT" "tracked Pi primary watcher extension is missing"
+  extension_count=$(find "$ROOT/.pi/extensions" -maxdepth 1 -type f -name '*.ts' | wc -l | tr -d ' ')
+  [ "$extension_count" -eq 1 ] || fail "expected one tracked Pi extension, found $extension_count"
   text=$(cat "$EXT")
   assert_contains "$text" "fm_watch_arm_pi" "tracked extension missing tool name"
   assert_contains "$text" "fm-watch-arm-pi" "tracked extension missing command name"
@@ -55,20 +57,33 @@ test_tracked_extension_present_and_self_hashing() {
   assert_contains "$text" 'details: result' "tracked extension tool is missing structured result details"
   assert_contains "$text" 'ctx.ui.notify' "tracked extension command does not notify through Pi's UI"
   assert_contains "$text" 'process.once("exit", cleanupOnProcessExit)' "tracked extension lacks clean-process-exit cleanup"
+  assert_contains "$text" 'pi.on("tool_call"' "tracked watcher extension does not carry the PreToolUse seatbelt"
+  assert_not_contains "$text" 'fm-turnend-guard.sh' "tracked watcher extension still invokes the shared turn-end guard"
+  assert_not_contains "$text" 'TURN WOULD END BLIND' "tracked watcher extension still injects a blind-turn follow-up"
   assert_not_contains "$text" "[ -f config/x-mode.env ]" "tracked extension kept a repo-relative x-mode config path"
   pass "Pi primary watcher extension is tracked, self-hashing, and self-locating"
+}
+
+test_pi_live_lab_cleanup_is_owned() {
+  local script text
+  script="$ROOT/tests/fm-pi-primary-live-e2e.test.sh"
+  text=$(cat "$script")
+  assert_contains "$text" 'mktemp -d "$ROOT/.pi-live-e2e.XXXXXX"' "live Pi test does not allocate a fresh worktree-local lab"
+  assert_contains "$text" 'LAB_SENTINEL="$LAB/.fm-pi-live-e2e-owned"' "live Pi test does not mark ownership of its lab"
+  assert_contains "$text" '[ -f "$LAB_SENTINEL" ]' "live Pi cleanup does not require its ownership sentinel"
+  assert_not_contains "$text" 'FM_PI_LIVE_LAB' "live Pi test still accepts a caller-selected cleanup path"
+  pass "Pi live regression cleanup is confined to its fresh owned lab"
 }
 
 test_spawn_template_mentions_pi_watch_placeholder() {
   local text
   text=$(cat "$ROOT/bin/fm-spawn.sh")
-  assert_contains "$text" "--approve -e __PITURNEND__ -e __PIWATCH__" "Pi secondmate launch template does not approve the home while loading both tracked primary extensions"
+  assert_contains "$text" "--approve -e __PIWATCH__" "Pi secondmate launch template does not approve the home while loading the tracked watcher extension"
   assert_contains "$text" "\$PROJ_ABS/.pi/extensions/fm-primary-pi-watch.ts" "fm-spawn does not point the Pi secondmate watch placeholder at the tracked extension"
   assert_not_contains "$text" "state/fm-primary-pi-watch.ts" "fm-spawn must never launch a generated Pi watcher copy"
   assert_not_contains "$text" "fm-pi-watch-extension.sh" "fm-spawn should no longer generate the Pi watch extension before launch"
-  assert_contains "$text" "__PITURNEND__" "fm-spawn does not replace the Pi turn-end guard extension placeholder"
   assert_contains "$text" "__PIWATCH__" "fm-spawn does not replace the Pi watch extension placeholder"
-  pass "Pi secondmate launch wiring includes both tracked primary extensions"
+  pass "Pi secondmate launch wiring includes the tracked watcher extension"
 }
 
 test_pi_extension_reports_external_healthy_watcher() {
@@ -990,7 +1005,7 @@ EOF
 }
 
 test_pi_live_acceptance_helper_records_isolated_evidence() {
-  local helper home pi_dir evidence fakebin candidate out status
+  local helper home pi_dir evidence fakebin candidate out status hash_count
   helper="$ROOT/tests/fm-pi-live-acceptance-helper.sh"
   home="$TMP_ROOT/pi-acceptance-helper-home"
   pi_dir="$TMP_ROOT/pi-acceptance-helper-agent"
@@ -1016,6 +1031,8 @@ SH
   expect_code 0 "$status" "Pi live acceptance helper must record an isolated inventory"
   assert_contains "$(cat "$evidence/identity.txt")" "acceptance_id=accept-helper-1" "acceptance identity is missing the dedicated id"
   assert_contains "$(cat "$evidence/pi-list.txt")" "No packages installed." "acceptance inventory did not prove the Pi package set is empty"
+  hash_count=$(wc -l < "$evidence/tracked-extension-hashes.txt" | tr -d ' ')
+  [ "$hash_count" -eq 1 ] || fail "acceptance inventory recorded $hash_count tracked Pi extension hashes"
   PATH="$fakebin:$PATH" FM_PI_ACCEPTANCE_ID=accept-helper-1 FM_PI_CANDIDATE_COMMIT="$candidate" \
     FM_PI_ACCEPTANCE_EVIDENCE="$evidence" PI_CODING_AGENT_DIR="$pi_dir" FM_HOME="$home" \
     bash "$helper" emit acceptance-probe >/dev/null
@@ -1046,6 +1063,11 @@ SH
     bash "$helper" snapshot linux-stat >/dev/null
   assert_contains "$(cat "$evidence/linux-stat-watcher-lock.txt")" "beacon_epoch=1700000000" "Linux acceptance snapshot did not select GNU stat"
   assert_not_contains "$(cat "$evidence/linux-stat-watcher-lock.txt")" "partial-filesystem-stat" "Linux acceptance snapshot retained failed BSD stat output"
+  printf 'Reloaded extensions\nwatcher: started Pi extension arm child 3\n' > "$home/reload-transcript.txt"
+  PATH="$fakebin:$PATH" FM_PI_ACCEPTANCE_ID=accept-helper-1 FM_PI_CANDIDATE_COMMIT="$candidate" \
+    FM_PI_ACCEPTANCE_EVIDENCE="$evidence" PI_CODING_AGENT_DIR="$pi_dir" FM_HOME="$home" \
+    bash "$helper" verify-reload "$home/reload-transcript.txt" >/dev/null
+  assert_contains "$(cat "$evidence/reload-check.txt")" "watcher_only_reload=clean" "acceptance helper did not verify watcher-only reload output"
   [ -z "$out" ] || fail "Pi acceptance helper printed unexpected output: $out"
   pass "Pi live acceptance helper records portable isolated evidence"
 }
@@ -1058,7 +1080,7 @@ test_opencode_primary_watch_plugin_static_wiring() {
   assert_contains "$text" "session.idle" "OpenCode plugin does not listen for session.idle"
   assert_contains "$text" "fm-watch-arm.sh" "OpenCode plugin does not spawn the watcher arm"
   assert_contains "$text" "promptAsync" "OpenCode plugin does not wake with promptAsync"
-  assert_contains "$text" ".fm-secondmate-home" "OpenCode plugin does not recognize marked secondmate supervising homes"
+  assert_contains "$text" ".fm-secondmate-home" "OpenCode plugin does not scope out secondmate homes"
   assert_contains "$text" "rev-parse\", \"--git-dir" "OpenCode plugin does not check linked worktree scope"
   assert_contains "$text" "sessionOwnsLock" "OpenCode plugin does not gate arm attempts on the session lock"
   assert_contains "$text" 'fm-watch-arm.sh" --restart' "OpenCode plugin does not restart into its own watcher child"
@@ -1262,52 +1284,6 @@ EOF
   expect_code 0 "$status" "OpenCode watch coordinator must keep primary scope checks in the shared arm path"
   [ -z "$out" ] || fail "OpenCode coordinator-scope test printed output: $out"
   pass "OpenCode watcher coordinator respects primary scope"
-}
-
-test_opencode_watch_arm_coordinator_accepts_marked_secondmate() {
-  local plugin base repo log out status
-  plugin="$ROOT/.opencode/plugins/fm-primary-watch-arm.js"
-  base="$TMP_ROOT/opencode-secondmate-base"
-  repo="$TMP_ROOT/opencode-secondmate-wt"
-  log="$TMP_ROOT/opencode-secondmate.log"
-  fm_git_worktree "$base" "$repo" fm/opencode-secondmate
-  mkdir -p "$repo/bin" "$repo/state" "$repo/config"
-  : > "$repo/AGENTS.md"
-  printf 'sm-opencode\n' > "$repo/.fm-secondmate-home"
-  : > "$repo/state/task.meta"
-  cat > "$repo/bin/fm-watch-arm.sh" <<'SH'
-#!/usr/bin/env bash
-printf 'arm\n' >> "${FM_ARM_LOG:?}"
-printf 'watcher: started pid=1 (beacon fresh)\n'
-SH
-  chmod +x "$repo/bin/fm-watch-arm.sh"
-  out=$(PLUGIN="$plugin" WORKTREE="$repo" FM_HOME="$repo" FM_ARM_LOG="$log" node 2>&1 <<'EOF'
-import { existsSync, writeFileSync } from "node:fs";
-import { pathToFileURL } from "node:url";
-
-const mod = await import(pathToFileURL(process.env.PLUGIN).href);
-const client = { session: { promptAsync: async () => {} } };
-await mod.FmPrimaryWatchArm({
-  client,
-  directory: process.env.WORKTREE,
-  worktree: process.env.WORKTREE,
-});
-writeFileSync(`${process.env.FM_HOME}/state/.lock`, `${process.pid}\n`);
-const status = await globalThis.__firstmateOpenCodeWatchArm.ensureArmed("session-test", client);
-if (status !== "armed") {
-  console.error(`expected armed, got ${status}`);
-  process.exit(1);
-}
-if (!existsSync(process.env.FM_ARM_LOG)) {
-  console.error("coordinator did not arm from a marked secondmate home");
-  process.exit(1);
-}
-EOF
-)
-  status=$?
-  expect_code 0 "$status" "OpenCode watch coordinator must accept a marked persistent secondmate home"
-  [ -z "$out" ] || fail "OpenCode marked-secondmate test printed output: $out"
-  pass "OpenCode watcher coordinator accepts a marked secondmate supervising home"
 }
 
 test_opencode_primary_watch_plugin_rearms_after_wake() {
@@ -1517,6 +1493,7 @@ EOF
 }
 
 test_tracked_extension_present_and_self_hashing
+test_pi_live_lab_cleanup_is_owned
 test_spawn_template_mentions_pi_watch_placeholder
 test_pi_extension_reports_external_healthy_watcher
 test_pi_tool_returns_agent_tool_result
@@ -1539,7 +1516,6 @@ test_opencode_primary_watch_plugin_uses_effective_state_home
 test_opencode_primary_watch_plugin_sources_effective_config
 test_opencode_primary_watch_plugin_requires_session_lock
 test_opencode_watch_arm_coordinator_respects_primary_scope
-test_opencode_watch_arm_coordinator_accepts_marked_secondmate
 test_opencode_primary_watch_plugin_rearms_after_wake
 test_opencode_watch_arm_coordinates_with_turnend_guard
 test_opencode_healthy_arm_output_does_not_suppress_guard
