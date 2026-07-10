@@ -316,10 +316,22 @@ function settleArm(
     stdoutTruncated: record.stdoutTruncated,
     stderrTruncated: record.stderrTruncated,
   };
-  const activeClient = [...coordinator.clients.values()].at(-1);
-  if (!activeClient || !activeClient.active) return;
-  void activeClient.sendWake(message, details).catch(() => {
-    // Pi owns delivery errors; fail open so the extension never wedges the session.
+  if (kind === "failure") publishStatus(coordinator, "attention");
+  const activeClient = [...coordinator.clients.values()].reverse().find((candidate) => candidate.active);
+  if (!activeClient) return;
+  void activeClient.sendWake(message, details).then(() => {
+    if (
+      kind === "actionable" &&
+      coordinator.generation === record.generation &&
+      !coordinator.shuttingDown &&
+      activeClient.active
+    ) {
+      publishStatus(coordinator, "handling wake");
+    }
+  }).catch(() => {
+    if (coordinator.generation === record.generation && !coordinator.shuttingDown) {
+      publishStatus(coordinator, "attention");
+    }
   });
 }
 
@@ -450,7 +462,10 @@ export default function (pi: ExtensionAPI) {
     if (coordinator.startCancelled || coordinator.clients.size === 0) {
       return { ok: false, message: "watcher: not started - Pi extension session shut down" };
     }
-    if (lockOwnership() !== "owned") return { ok: false, message: "watcher: read-only - session lock is held by another firstmate session" };
+    if (lockOwnership() !== "owned") {
+      publishStatus(coordinator, "attention");
+      return { ok: false, message: "watcher: read-only - session lock is held by another firstmate session" };
+    }
     markLoaded();
     if (coordinator.current) return { ok: true, message: "watcher: healthy - Pi extension already has an arm child" };
 

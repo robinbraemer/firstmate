@@ -250,6 +250,209 @@ EOF
   pass "Pi status clients remain callable across a legacy same-process reload"
 }
 
+test_pi_status_actionable_wake_and_rearm() {
+  local reason slug repo plugin reason_file out status
+  for reason in \
+    "signal: synthetic wake" \
+    "stale: synthetic wake" \
+    "check: synthetic wake" \
+    "heartbeat: synthetic wake"; do
+    slug=${reason%%:*}
+    repo="$TMP_ROOT/pi-status-actionable-$slug-root"
+    reason_file="$TMP_ROOT/pi-status-actionable-$slug.reason"
+    mkdir -p "$repo/bin" "$repo/config" "$repo/state"
+    install_pi_watch_extension_fixture "$repo"
+    install_pi_status_harness "$repo"
+    plugin="$repo/.pi/extensions/fm-primary-pi-watch.ts"
+    cat > "$repo/bin/fm-watch-arm.sh" <<'SH'
+#!/usr/bin/env bash
+if [ -f "${FM_REASON_FILE:?}" ]; then
+  cat "$FM_REASON_FILE"
+  rm -f "$FM_REASON_FILE"
+  exit 0
+fi
+trap 'exit 0' TERM
+while :; do sleep 0.05; done
+SH
+    chmod +x "$repo/bin/fm-watch-arm.sh"
+    out=$(PLUGIN="$plugin" FM_HOME="$repo" FM_ROOT_OVERRIDE="$repo" STATUS_HARNESS="$repo/status-harness.mjs" \
+      FM_REASON_FILE="$reason_file" FM_REASON="$reason" node --input-type=module 2>&1 <<'EOF'
+import assert from "node:assert/strict";
+import { writeFileSync } from "node:fs";
+import { pathToFileURL } from "node:url";
+
+const { makeStatusHarness } = await import(
+  pathToFileURL(process.env.STATUS_HARNESS).href,
+);
+const harness = makeStatusHarness();
+harness.pi.sendUserMessage = () => {
+  throw new Error("watcher wake was delivered as a user-role message");
+};
+writeFileSync(`${process.env.FM_HOME}/state/.lock`, `${process.pid}\n`);
+const mod = await import(pathToFileURL(process.env.PLUGIN).href);
+mod.default(harness.pi);
+await harness.handlers.get("session_start")?.({ type: "session_start" }, harness.ctx);
+writeFileSync(process.env.FM_REASON_FILE, `${process.env.FM_REASON}\n`);
+await harness.tool().execute("status-actionable-arm", {}, undefined, undefined, {});
+for (let i = 0; i < 100 && harness.messages.length === 0; i += 1) {
+  await new Promise((resolve) => setTimeout(resolve, 10));
+}
+assert.equal(harness.messages.length, 1);
+assert.equal(harness.messages[0].message.customType, "firstmate-watcher-wake");
+assert.equal(harness.messages[0].message.display, true);
+assert.match(harness.messages[0].message.content, /^FIRSTMATE WATCHER WAKE:/);
+assert.deepEqual(harness.messages[0].options, {
+  deliverAs: "followUp",
+  triggerTurn: true,
+});
+assert.deepEqual(harness.writes.at(-1), ["firstmate-pi-watcher", "handling wake"]);
+await harness.tool().execute("status-rearm", {}, undefined, undefined, {});
+assert.deepEqual(harness.writes.at(-1), ["firstmate-pi-watcher", "watching"]);
+await harness.handlers.get("session_shutdown")?.({ type: "session_shutdown", reason: "quit" }, harness.ctx);
+EOF
+    )
+    status=$?
+    expect_code 0 "$status" "Pi $slug actionable wake must publish handling wake and re-arm to watching"
+    [ -z "$out" ] || fail "Pi $slug actionable-status test printed output: $out"
+  done
+  pass "Pi signal, stale, check, and heartbeat wakes publish handling wake and re-arm to watching"
+}
+
+test_pi_status_attention_failures() {
+  local case_name repo plugin arm_log node_bin empty_path out status
+  node_bin=$(command -v node)
+  for case_name in \
+    live-other-owner \
+    recovery-no-ownership \
+    spawn-enoent \
+    child-error \
+    empty-clean \
+    nonzero \
+    unexpected-signal \
+    external-healthy \
+    send-message-throw; do
+    repo="$TMP_ROOT/pi-status-attention-$case_name-root"
+    arm_log="$repo/arm.log"
+    empty_path="$repo/empty-path"
+    mkdir -p "$repo/bin" "$repo/config" "$repo/state" "$empty_path"
+    install_pi_watch_extension_fixture "$repo"
+    install_pi_status_harness "$repo"
+    plugin="$repo/.pi/extensions/fm-primary-pi-watch.ts"
+    cat > "$repo/bin/fm-lock.sh" <<'SH'
+#!/bin/sh
+exit 0
+SH
+    cat > "$repo/bin/fm-watch-arm.sh" <<'SH'
+#!/usr/bin/env bash
+printf 'arm\n' >> "${FM_ARM_LOG:?}"
+case "${FM_ATTENTION_CASE:?}" in
+  child-error|unexpected-signal)
+    trap 'exit 0' TERM
+    while :; do sleep 0.05; done
+    ;;
+  empty-clean) exit 0 ;;
+  nonzero) exit 7 ;;
+  external-healthy) printf 'watcher: healthy pid=1 (beacon 0s)\n' ;;
+  send-message-throw) printf 'signal: synthetic wake\n' ;;
+  *) exit 0 ;;
+esac
+SH
+    chmod +x "$repo/bin/fm-lock.sh" "$repo/bin/fm-watch-arm.sh"
+    if [ "$case_name" = spawn-enoent ]; then
+      out=$(PATH="$empty_path" PLUGIN="$plugin" FM_HOME="$repo" FM_ROOT_OVERRIDE="$repo" \
+        STATUS_HARNESS="$repo/status-harness.mjs" FM_ARM_LOG="$arm_log" FM_ATTENTION_CASE="$case_name" \
+        "$node_bin" --input-type=module 2>&1 <<'EOF'
+import assert from "node:assert/strict";
+import { writeFileSync } from "node:fs";
+import { pathToFileURL } from "node:url";
+
+const { makeStatusHarness } = await import(pathToFileURL(process.env.STATUS_HARNESS).href);
+const harness = makeStatusHarness();
+writeFileSync(`${process.env.FM_HOME}/state/.lock`, `${process.pid}\n`);
+const mod = await import(pathToFileURL(process.env.PLUGIN).href);
+mod.default(harness.pi);
+await harness.handlers.get("session_start")?.({ type: "session_start" }, harness.ctx);
+await harness.tool().execute("status-attention", {}, undefined, undefined, {});
+for (let i = 0; i < 100 && harness.writes.at(-1)?.[1] !== "attention"; i += 1) {
+  await new Promise((resolve) => setTimeout(resolve, 10));
+}
+assert.deepEqual(harness.writes.at(-1), ["firstmate-pi-watcher", "attention"]);
+EOF
+      )
+    else
+      out=$(PLUGIN="$plugin" FM_HOME="$repo" FM_ROOT_OVERRIDE="$repo" \
+        STATUS_HARNESS="$repo/status-harness.mjs" FM_ARM_LOG="$arm_log" FM_ATTENTION_CASE="$case_name" \
+        node --input-type=module 2>&1 <<'EOF'
+import assert from "node:assert/strict";
+import { existsSync, writeFileSync } from "node:fs";
+import { pathToFileURL } from "node:url";
+
+const { makeStatusHarness } = await import(pathToFileURL(process.env.STATUS_HARNESS).href);
+const harness = makeStatusHarness();
+let otherOwner = null;
+if (process.env.FM_ATTENTION_CASE === "live-other-owner") {
+  const { spawn } = await import("node:child_process");
+  otherOwner = spawn(process.execPath, ["-e", "setInterval(() => {}, 1000)"], { stdio: "ignore" });
+  await new Promise((resolve, reject) => {
+    otherOwner.once("spawn", resolve);
+    otherOwner.once("error", reject);
+  });
+  writeFileSync(`${process.env.FM_HOME}/state/.lock`, `${otherOwner.pid}\n`);
+} else if (process.env.FM_ATTENTION_CASE !== "recovery-no-ownership") {
+  writeFileSync(`${process.env.FM_HOME}/state/.lock`, `${process.pid}\n`);
+}
+if (process.env.FM_ATTENTION_CASE === "send-message-throw") {
+  harness.pi.sendMessage = () => {
+    throw new Error("synthetic sendMessage failure");
+  };
+}
+harness.pi.sendUserMessage = () => {
+  throw new Error("watcher wake was delivered as a user-role message");
+};
+try {
+  const mod = await import(pathToFileURL(process.env.PLUGIN).href);
+  mod.default(harness.pi);
+  await harness.handlers.get("session_start")?.({ type: "session_start" }, harness.ctx);
+  await harness.tool().execute("status-attention", {}, undefined, undefined, {});
+  if (["live-other-owner", "recovery-no-ownership"].includes(process.env.FM_ATTENTION_CASE)) {
+    assert.equal(existsSync(process.env.FM_ARM_LOG), false, "ownership refusal spawned an arm child");
+  }
+  const coordinator = [...globalThis.__firstmatePiWatchCoordinators.values()][0];
+  const record = coordinator?.current;
+  if (process.env.FM_ATTENTION_CASE === "child-error") {
+    assert.ok(record, "child-error arm record missing");
+    record.child.emit("error", new Error("synthetic child error"));
+    if (record.child.pid) process.kill(-record.child.pid, "SIGTERM");
+  } else if (process.env.FM_ATTENTION_CASE === "unexpected-signal") {
+    assert.ok(record, "unexpected-signal arm record missing");
+    if (record.child.pid) process.kill(-record.child.pid, "SIGKILL");
+  }
+  for (let i = 0; i < 100 && harness.writes.at(-1)?.[1] !== "attention"; i += 1) {
+    await new Promise((resolve) => setTimeout(resolve, 10));
+  }
+  assert.deepEqual(harness.writes.at(-1), ["firstmate-pi-watcher", "attention"]);
+  if (process.env.FM_ATTENTION_CASE === "unexpected-signal") {
+    assert.equal(harness.messages[0]?.message.details.signal, "SIGKILL");
+  }
+  if (process.env.FM_ATTENTION_CASE === "send-message-throw") {
+    assert.equal(harness.writes.some(([, value]) => value === "handling wake"), false);
+  }
+} finally {
+  if (otherOwner) {
+    otherOwner.kill("SIGTERM");
+    await new Promise((resolve) => otherOwner.once("close", resolve));
+  }
+}
+EOF
+      )
+    fi
+    status=$?
+    expect_code 0 "$status" "Pi $case_name outcome must publish attention"
+    [ -z "$out" ] || fail "Pi $case_name attention-status test printed output: $out"
+  done
+  pass "Pi ownership, startup, child, external-owner, and delivery failures publish attention"
+}
+
 installed_pi_package_dir() {
   local candidate pi_bin pi_target
   if [ -n "${FM_PI_PACKAGE_DIR:-}" ]; then
@@ -297,7 +500,7 @@ test_tracked_extension_present_and_self_hashing() {
   assert_contains "$text" "readFileSync(\`\${state}/.lock\`" "tracked extension does not read the effective session lock"
   assert_contains "$text" 'return pidAlive(lockPid) ? "other" : "missing"' "tracked extension does not allow a pre-lock load marker"
   assert_contains "$text" 'if (lockOwnership() !== "owned") await claimSessionLock()' "tracked extension does not delegate every non-owned state to the home lock protocol"
-  assert_contains "$text" 'if (lockOwnership() !== "owned") return { ok: false' "tracked extension does not re-check lock ownership after recovery"
+  assert_contains "$text" 'if (lockOwnership() !== "owned") {' "tracked extension does not re-check lock ownership after recovery"
   assert_contains "$text" 'signal: NodeJS.Signals | null' "tracked extension does not retain child close signals"
   assert_contains "$text" "writeFileSync(marker, \`\${extensionVersion}\\n\${process.pid}\\n\`)" "tracked extension does not write the content version and process marker"
   assert_contains "$text" "const config = process.env.FM_CONFIG_OVERRIDE" "tracked extension missing effective config resolution"
@@ -2341,6 +2544,8 @@ test_pi_status_loads_offline_before_arm
 test_pi_status_successful_arm_watching
 test_pi_status_duplicate_arm_preserves_watching
 test_pi_status_legacy_coordinator_reload_compatibility
+test_pi_status_actionable_wake_and_rearm
+test_pi_status_attention_failures
 test_pi_extension_supervises_only_primary_or_secondmate_homes
 test_pi_live_lab_cleanup_is_owned
 test_pi_detached_launch_helper_preserves_exact_argv
