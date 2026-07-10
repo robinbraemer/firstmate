@@ -5,7 +5,7 @@
 #   PREDICATE  - bin/fm-supervision-lib.sh, the shared beacon/status computation
 #                used by fm-guard.sh and by the hook's banner details.
 #   HOOK       - bin/fm-turnend-guard.sh, the shared primary hook predicate that
-#                scopes in-flight work to a primary or persistent secondmate supervising home and requires
+#                scopes in-flight work to the PRIMARY checkout only and requires
 #                a live, identity-matched watcher lock plus a fresh beacon.
 # All hermetic over temp dirs; no real agent session is invoked.
 set -u
@@ -312,15 +312,14 @@ test_hook_loop_guard_allows_retry() {
   pass "fm-turnend-guard: stop_hook_active=true always allows the stop (never blocks twice in one turn)"
 }
 
-test_hook_blocks_in_secondmate_supervising_home() {
+test_hook_silent_in_secondmate_home() {
   local dir out status
   dir=$(make_secondmate_dir "$TMP_ROOT/hook-secondmate")
   : > "$dir/state/task1.meta"
   out=$(run_hook "$dir" false); status=$?
-  expect_code 2 "$status" "hook must protect a secondmate supervising its own home"
-  assert_contains "$out" "TURN WOULD END BLIND" "secondmate block must carry the supervision alarm"
-  assert_contains "$out" "$REQUIRED_REASON" "secondmate block must carry the active harness repair instruction"
-  pass "fm-turnend-guard: protects a marked secondmate as primary of its own home"
+  expect_code 0 "$status" "hook must never block inside a secondmate home"
+  [ -z "$out" ] || fail "hook produced output inside a secondmate home: $out"
+  pass "fm-turnend-guard: inert in a secondmate home (.fm-secondmate-home marker present) even when unhealthy"
 }
 
 test_hook_silent_in_crewmate_worktree() {
@@ -599,7 +598,7 @@ test_hook_x_mode_reason_sources_cadence
 test_hook_ignores_repo_state_when_fm_home_set
 test_hook_uses_state_override
 test_hook_loop_guard_allows_retry
-test_hook_blocks_in_secondmate_supervising_home
+test_hook_silent_in_secondmate_home
 test_hook_silent_in_crewmate_worktree
 test_hook_silent_without_jq
 test_hook_silent_without_stdin
