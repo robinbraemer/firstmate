@@ -48,6 +48,7 @@ const fmRoot = resolve(process.env.FM_ROOT_OVERRIDE || root);
 const state = process.env.FM_STATE_OVERRIDE || `${fmHome}/state`;
 const config = process.env.FM_CONFIG_OVERRIDE || `${fmHome}/config`;
 const armScript = `${fmRoot}/bin/fm-watch-arm.sh`;
+const lockScript = `${fmRoot}/bin/fm-lock.sh`;
 const marker = `${state}/.pi-watch-extension-loaded`;
 const extensionVersion = `sha256:${createHash("sha256").update(readFileSync(extensionFile)).digest("hex")}`;
 const coordinatorHost = globalThis as CoordinatorHost;
@@ -99,8 +100,27 @@ function lockOwnership(): LockOwnership {
   return pidAlive(lockPid) ? "other" : "missing";
 }
 
-function sessionOwnsLock(): boolean {
-  return lockOwnership() === "owned";
+function recoverMissingLock(): Promise<void> {
+  return new Promise((resolvePromise) => {
+    const child = spawn(lockScript, [], {
+      cwd: fmRoot,
+      env: {
+        ...process.env,
+        FM_HOME: fmHome,
+        FM_ROOT_OVERRIDE: fmRoot,
+        FM_STATE_OVERRIDE: state,
+      },
+      stdio: "ignore",
+    });
+    let settled = false;
+    const settle = () => {
+      if (settled) return;
+      settled = true;
+      resolvePromise();
+    };
+    child.on("error", settle);
+    child.on("close", settle);
+  });
 }
 
 function markLoaded(): void {
@@ -180,8 +200,11 @@ export default function (pi: ExtensionAPI) {
     );
   }
 
-  function startArm(): ArmResult {
-    if (!sessionOwnsLock()) return { ok: false, message: "watcher: read-only - session lock is held by another firstmate session" };
+  async function startArm(): Promise<ArmResult> {
+    const ownership = lockOwnership();
+    if (ownership === "other") return { ok: false, message: "watcher: read-only - session lock is held by another firstmate session" };
+    if (ownership === "missing") await recoverMissingLock();
+    if (lockOwnership() !== "owned") return { ok: false, message: "watcher: read-only - session lock is held by another firstmate session" };
     markLoaded();
     if (coordinator.current) return { ok: true, message: "watcher: healthy - Pi extension already has an arm child" };
 
@@ -248,7 +271,7 @@ export default function (pi: ExtensionAPI) {
   pi.registerCommand?.("fm-watch-arm-pi", {
     description: "Arm firstmate watcher supervision through the Pi extension instead of foreground bash.",
     handler: async (_args, ctx) => {
-      const result = startArm();
+      const result = await startArm();
       ctx.ui.notify(result.message, result.ok ? "info" : "warning");
     },
   });
@@ -263,7 +286,7 @@ export default function (pi: ExtensionAPI) {
     ],
     parameters: Type.Object({}),
     execute: async () => {
-      const result = startArm();
+      const result = await startArm();
       return {
         content: [{ type: "text", text: result.message }],
         details: result,
