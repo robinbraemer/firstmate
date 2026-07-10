@@ -2,6 +2,19 @@
 # Tests for the tracked Pi primary watcher extension and Pi secondmate wiring.
 set -u
 
+# Pi watcher status spec coverage:
+#  1 test_pi_status_loads_offline_before_arm
+#  2 test_pi_status_successful_arm_watching
+#  3 test_pi_status_actionable_wake_and_rearm
+#  4 test_pi_status_attention_failures
+#  5 test_pi_status_intentional_stop_offline
+#  6 test_pi_status_reload_and_quit_clear
+#  7 test_pi_status_duplicate_arm_preserves_watching
+#  8 test_pi_status_stale_generation_cannot_overwrite
+#  9 test_pi_status_cancelled_start_stays_cleared
+# 10 test_pi_status_absent_in_task_worktree
+# 11 test_pi_status_static_non_goals
+
 # shellcheck source=tests/lib.sh
 . "$(dirname "${BASH_SOURCE[0]}")/lib.sh"
 
@@ -877,6 +890,69 @@ EOF
   expect_code 0 "$status" "A cancelled pending Pi watcher start must clear before release and stay cleared"
   [ -z "$out" ] || fail "Pi cancelled-start status test printed output: $out"
   pass "A cancelled pending Pi watcher start clears before release and never rewrites or spawns"
+}
+
+test_pi_status_absent_in_task_worktree() {
+  local base worktree plugin out status
+  base="$TMP_ROOT/pi-status-absent-base"
+  worktree="$TMP_ROOT/pi-status-absent-worktree"
+  fm_git_worktree "$base" "$worktree" fm/pi-status-absent
+  install_pi_watch_extension_fixture "$worktree"
+  plugin="$worktree/.pi/extensions/fm-primary-pi-watch.ts"
+
+  out=$(env -u FM_HOME -u FM_ROOT_OVERRIDE PLUGIN="$plugin" node --input-type=module 2>&1 <<'EOF'
+import assert from "node:assert/strict";
+import { pathToFileURL } from "node:url";
+
+let registrations = 0;
+const statusWrites = [];
+const pi = {
+  on() { registrations += 1; },
+  registerCommand() { registrations += 1; },
+  registerTool() { registrations += 1; },
+  sendMessage() {},
+};
+const ctx = {
+  ui: {
+    setStatus(key, text) { statusWrites.push([key, text]); },
+  },
+};
+const mod = await import(pathToFileURL(process.env.PLUGIN).href);
+mod.default(pi);
+assert.equal(registrations, 0);
+assert.deepEqual(statusWrites, []);
+void ctx;
+EOF
+  )
+  status=$?
+  expect_code 0 "$status" "ordinary task worktrees must leave Pi watcher status absent"
+  [ -z "$out" ] || fail "Pi task-worktree status-absence test printed output: $out"
+  pass "Pi watcher status stays absent in an ordinary linked task worktree"
+}
+
+test_pi_status_static_non_goals() {
+  local text timer_lines timer_block forbidden
+  text=$(cat "$EXT")
+  assert_contains "$text" '"firstmate-pi-watcher"' "Pi watcher status key drifted"
+  assert_contains "$text" 'customType: "firstmate-watcher-wake"' "Pi watcher custom wake type drifted"
+  assert_not_contains "$text" 'sendUserMessage' "Pi watcher still sends a synthetic user message"
+  for forbidden in 'setInterval(' 'setWidget(' 'setFooter(' 'gh pr' 'backlog.md' 'fm-pr-' 'tmux job' 'stall watchdog'; do
+    assert_not_contains "$text" "$forbidden" "Pi watcher status introduced forbidden surface: $forbidden"
+  done
+  timer_lines=$(grep -n 'setTimeout(' "$EXT" || true)
+  [ "$(printf '%s\n' "$timer_lines" | grep -c .)" -eq 1 ] \
+    || fail "Pi watcher must keep exactly one bounded cleanup timer source"
+  assert_contains "$timer_lines" 'setTimeout(check, Math.min(10, remaining))' \
+    "Pi watcher contains a timer outside bounded process-group cleanup"
+  timer_block=$(sed -n '/function stopsWithin/,/^}/p' "$EXT")
+  assert_contains "$timer_block" 'const deadline = Date.now() + milliseconds' \
+    "Pi watcher cleanup timer lost its absolute bound"
+  assert_contains "$timer_block" 'if (remaining <= 0)' \
+    "Pi watcher cleanup timer lost its deadline exit"
+  assert_not_contains "$timer_block" 'publishStatus' "Pi watcher cleanup timer refreshes status"
+  assert_not_contains "$timer_block" 'writeClientStatus' "Pi watcher cleanup timer writes client status"
+  assert_not_contains "$timer_block" 'visibleStatus' "Pi watcher cleanup timer reads visible status"
+  pass "Pi watcher status source stays event-driven and excludes product UI scope"
 }
 
 installed_pi_package_dir() {
@@ -2978,6 +3054,8 @@ test_pi_status_reload_and_quit_clear
 test_pi_status_reload_overlap_preserves_replacement_ownership
 test_pi_status_stale_generation_cannot_overwrite
 test_pi_status_cancelled_start_stays_cleared
+test_pi_status_absent_in_task_worktree
+test_pi_status_static_non_goals
 test_pi_extension_supervises_only_primary_or_secondmate_homes
 test_pi_live_lab_cleanup_is_owned
 test_pi_detached_launch_helper_preserves_exact_argv
