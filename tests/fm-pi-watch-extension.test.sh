@@ -718,6 +718,7 @@ for arg in "$@"; do
   prev=$arg
 done
 case "$*" in
+  *"lstart="*"command="*) printf 'Sat Jul 11 12:00:00 2026 process-%s\n' "$pid" ;;
   *"comm="*)
     if [ "$pid" = "$FM_HOLDER_PID" ]; then printf 'pi\n'; else printf 'bash\n'; fi
     ;;
@@ -776,6 +777,7 @@ for arg in "$@"; do
   prev=$arg
 done
 case "$*" in
+  *"lstart="*"command="*) printf 'Sat Jul 11 12:00:00 2026 process-%s\n' "$pid" ;;
   *"comm="*)
     if [ "$pid" = "$FM_STALE_PID" ]; then
       : > "$FM_BARRIER/$FM_FAKE_HOLDER"
