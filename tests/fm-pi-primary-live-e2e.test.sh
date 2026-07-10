@@ -54,6 +54,40 @@ capture() {
   "$TMUX" -L "$SOCKET" capture-pane -p -t "$SESSION" -S -1200 2>/dev/null || true
 }
 
+capture_current() {
+  "$TMUX" -L "$SOCKET" capture-pane -p -t "$SESSION" 2>/dev/null || true
+}
+
+current_status_lines() {
+  capture_current | sed 's/^[[:space:]]*//; s/[[:space:]]*$//'
+}
+
+wait_for_status() {
+  local expected=$1 attempts=${2:-120} i=0
+  while [ "$i" -lt "$attempts" ]; do
+    current_status_lines | grep -Fxq "$expected" && return 0
+    sleep 0.25
+    i=$((i + 1))
+  done
+  capture_current >&2
+  return 1
+}
+
+wait_for_status_absent() {
+  local attempts=${1:-120} i=0 pane_dead
+  while [ "$i" -lt "$attempts" ]; do
+    pane_dead=$("$TMUX" -L "$SOCKET" display-message -p -t "$SESSION" '#{pane_dead}' 2>/dev/null || true)
+    [ "$pane_dead" = 1 ] && return 0
+    if ! current_status_lines | grep -Eq '^(offline|watching|handling wake|attention)$'; then
+      return 0
+    fi
+    sleep 0.1
+    i=$((i + 1))
+  done
+  capture_current >&2
+  return 1
+}
+
 wait_for_text() {
   local expected=$1 attempts=${2:-120} i=0
   while [ "$i" -lt "$attempts" ]; do
@@ -219,6 +253,7 @@ wait_pid_dead "$pre_restart_pid" || fail "detached restart left the old Pi proce
 wait_for_file "$PROJECT/state/registrations.txt" 120 || fail "detached candidate did not reach session_start registration probe"
 
 wait_for_text "CHARTER-ACCEPTED" 180 || fail "detached Pi candidate charter prompt did not complete"
+wait_for_status offline || fail "fresh watcher extension did not show offline"
 initial_pane=$(capture)
 printf '%s\n' "$initial_pane" | grep -Fq 'Trust project folder?' && fail "--approve still produced a project trust dialog"
 watch_count=$(printf '%s\n' "$initial_pane" | grep -o 'fm-primary-pi-watch.ts' | wc -l | tr -d ' ')
@@ -262,13 +297,19 @@ awk -v pi="$pi_pid" '$1 ~ /^[0-9]+$/ && $2 == pi && $0 ~ /bash/ { found=1 } END 
   || fail "stock Bash was not recorded as a direct Pi child"
 
 : > "$PROJECT/state/pi-e2e.meta"
-send_prompt 'Use fm_watch_arm_pi exactly once to start supervision. Never use bash to arm supervision. Reply exactly ARMED. After any FIRSTMATE WATCHER WAKE, run bin/fm-wake-drain.sh, read the signaled status, call fm_watch_arm_pi to re-arm, and finish exactly REARMED.'
+send_prompt 'Use fm_watch_arm_pi exactly once to start supervision. Never use bash to arm supervision. Reply exactly ARMED. After any FIRSTMATE WATCHER WAKE, run bin/fm-wake-drain.sh, read the signaled status, do not re-arm, and finish exactly WAKE-HANDLED.'
 wait_for_text "watcher: started Pi extension arm child 1" 180 || fail "native Pi tool did not arm supervision"
 wait_for_text "ARMED" 120 || fail "Pi did not settle after initial native arm"
+wait_for_status watching || fail "owned arm did not show watching"
 
 printf 'done: pi live e2e watcher fire\n' > "$PROJECT/state/pi-e2e.status"
-wait_for_text "watcher: started Pi extension arm child 2" 240 || fail "watcher wake did not drain and re-arm through the Pi tool"
-wait_for_text "REARMED" 180 || fail "Pi did not settle after re-arming watcher supervision"
+wait_for_status "handling wake" 240 || fail "delivered actionable wake did not show handling wake"
+wait_for_text "WAKE-HANDLED" 180 || fail "Pi did not settle after handling the watcher wake"
+
+send_prompt 'Use fm_watch_arm_pi exactly once to resume supervision after the handled wake. Do not use bash. Reply exactly REARMED.'
+wait_for_text "watcher: started Pi extension arm child 2" 180 || fail "separate native re-arm did not start a new coordinator generation"
+wait_for_text "REARMED" 180 || fail "Pi did not settle after the separate re-arm"
+wait_for_status watching 180 || fail "successful re-arm did not restore watching"
 wait_for_settled_composer || fail "Pi composer did not settle before reload"
 
 before_reload=$(capture)
@@ -286,7 +327,9 @@ watcher_pgid=$(ps -p "$watcher_pid" -o pgid= | tr -d ' ')
 
 "$TMUX" -L "$SOCKET" send-keys -t "$SESSION" -l '/reload'
 "$TMUX" -L "$SOCKET" send-keys -t "$SESSION" Enter
+wait_for_status_absent 40 || fail "reload did not clear the old watcher status"
 wait_for_text "Reloaded keybindings" 120 || fail "Pi reload did not complete"
+wait_for_status offline 120 || fail "reloaded watcher instance did not start offline"
 wait_pid_dead "$watcher_pid" || fail "intentional reload left the old watcher alive"
 wait_pid_dead "$arm_pid" || fail "intentional reload left the old arm child alive"
 after_reload=$(capture)
@@ -297,6 +340,7 @@ printf '%s\n' "$after_reload" | grep -Fq 'fm-watch-arm.sh exited 143' && fail "i
 send_prompt 'Use fm_watch_arm_pi exactly once to resume supervision after reload. Do not use bash. Reply exactly RELOAD-REARMED.'
 wait_for_text "watcher: started Pi extension arm child 3" 180 || fail "post-reload native arm did not start a new coordinator generation"
 wait_for_text "RELOAD-REARMED" 120 || fail "Pi did not settle after post-reload re-arm"
+wait_for_status watching 180 || fail "post-reload native arm did not show watching"
 wait_for_settled_composer || fail "Pi composer did not settle before quit"
 new_pid_file=$(find "$PROJECT/state" -maxdepth 3 -type f -name pid | head -1)
 new_watcher_pid=$(sed -n '1p' "$new_pid_file")
@@ -306,6 +350,7 @@ new_arm_pid=$(ps -p "$new_watcher_pid" -o ppid= | tr -d ' ')
 capture > "$LAB/final-pane.txt"
 "$TMUX" -L "$SOCKET" send-keys -t "$SESSION" -l '/quit'
 "$TMUX" -L "$SOCKET" send-keys -t "$SESSION" Enter
+wait_for_status_absent 40 || fail "quit did not clear the watcher status"
 wait_for_pi_exit_zero || fail "Pi did not exit cleanly with status 0"
 wait_pid_dead "$new_watcher_pid" || fail "watcher child survived clean Pi exit"
 wait_pid_dead "$new_arm_pid" || fail "arm child survived clean Pi exit"
@@ -318,4 +363,4 @@ orphan_pi=$(ps -axo pid=,comm=,command= | awk -v lab="$LAB" 'index($0, lab) && (
 
 printf 'evidence - candidate_hash=%s candidate_pid=%s lock_pid=%s arm_pgid=%s watcher_pid=%s old_pi_pid=%s all_clean=true\n' \
   "$expected_version" "$candidate_pid" "$pi_pid" "$arm_pgid" "$watcher_pid" "$pre_restart_pid"
-printf 'ok - Pi %s isolated detached restart loaded the watcher once, registered its tool and command, locked, woke, reloaded, re-armed, and left no orphan descendants\n' "$PI_VERSION"
+printf 'ok - Pi %s watcher status moved offline -> watching -> handling wake -> watching, reloaded to offline, and cleared with clean process shutdown\n' "$PI_VERSION"
