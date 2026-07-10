@@ -625,6 +625,86 @@ EOF
   pass "Pi session shutdown awaits arm cleanup without a false watcher wake"
 }
 
+test_pi_session_shutdown_cancels_pending_lock_claim() {
+  local repo home plugin lock_started lock_release arm_log out status
+  repo="$TMP_ROOT/pi-pending-shutdown-root"
+  home="$TMP_ROOT/pi-pending-shutdown-home"
+  lock_started="$TMP_ROOT/pi-pending-shutdown-lock-started"
+  lock_release="$TMP_ROOT/pi-pending-shutdown-lock-release"
+  arm_log="$TMP_ROOT/pi-pending-shutdown-arm.log"
+  mkdir -p "$repo/bin" "$home/state" "$home/config"
+  install_pi_watch_extension_fixture "$repo"
+  plugin="$repo/.pi/extensions/fm-primary-pi-watch.ts"
+  cat > "$repo/bin/fm-lock.sh" <<'SH'
+#!/usr/bin/env bash
+set -u
+: > "${FM_LOCK_STARTED:?}"
+while [ ! -f "${FM_LOCK_RELEASE:?}" ]; do sleep 0.01; done
+printf '%s\n' "$PPID" > "$FM_HOME/state/.lock"
+SH
+  cat > "$repo/bin/fm-watch-arm.sh" <<'SH'
+#!/usr/bin/env bash
+printf 'arm\n' >> "${FM_ARM_LOG:?}"
+mkdir -p "$FM_HOME/state/.watch.lock"
+printf 'signal: orphaned arm\n'
+SH
+  chmod +x "$repo/bin/fm-lock.sh" "$repo/bin/fm-watch-arm.sh"
+  out=$(PLUGIN="$plugin" FM_HOME="$home" FM_ROOT_OVERRIDE="$repo" FM_LOCK_STARTED="$lock_started" \
+    FM_LOCK_RELEASE="$lock_release" FM_ARM_LOG="$arm_log" node --input-type=module 2>&1 <<'EOF'
+import { existsSync, writeFileSync } from "node:fs";
+import { pathToFileURL } from "node:url";
+
+const handlers = new Map();
+let tool = null;
+let prompts = 0;
+const pi = {
+  on(event, handler) {
+    handlers.set(event, handler);
+  },
+  registerCommand() {},
+  registerTool(candidate) {
+    if (candidate.name === "fm_watch_arm_pi") tool = candidate;
+  },
+  sendUserMessage: async () => {
+    prompts += 1;
+  },
+};
+const before = process.listenerCount("exit");
+const mod = await import(pathToFileURL(process.env.PLUGIN).href);
+mod.default(pi);
+const start = tool.execute("pending-shutdown", {}, undefined, undefined, {});
+for (let i = 0; i < 100 && !existsSync(process.env.FM_LOCK_STARTED); i += 1) {
+  await new Promise((resolve) => setTimeout(resolve, 10));
+}
+if (!existsSync(process.env.FM_LOCK_STARTED)) throw new Error("delayed lock claim did not start");
+let shutdownSettled = false;
+const shutdown = Promise.resolve(handlers.get("session_shutdown")?.({ type: "session_shutdown", reason: "quit" }, {})).then(() => {
+  shutdownSettled = true;
+});
+await new Promise((resolve) => setTimeout(resolve, 40));
+if (shutdownSettled) throw new Error("session_shutdown returned before the pending lock claim settled");
+writeFileSync(process.env.FM_LOCK_RELEASE, "release\n");
+const [result] = await Promise.all([start, shutdown]);
+if (result.details?.ok !== false || !result.content?.[0]?.text.includes("session shut down")) {
+  throw new Error(`unexpected cancelled-start result: ${JSON.stringify(result)}`);
+}
+await new Promise((resolve) => setTimeout(resolve, 80));
+if (existsSync(process.env.FM_ARM_LOG)) throw new Error("arm child started after pending shutdown");
+if (existsSync(`${process.env.FM_HOME}/state/.watch.lock`)) throw new Error("watcher state survived pending shutdown");
+if (prompts !== 0) throw new Error(`pending shutdown emitted ${prompts} watcher follow-ups`);
+const coordinator = [...globalThis.__firstmatePiWatchCoordinators.values()][0];
+if (coordinator.current || coordinator.startPromise || coordinator.state !== "idle") {
+  throw new Error(`coordinator survived pending shutdown: ${coordinator.state}`);
+}
+if (process.listenerCount("exit") !== before) throw new Error("pending shutdown retained the process-exit listener");
+EOF
+)
+  status=$?
+  expect_code 0 "$status" "Pi shutdown must cancel and await a pending session-lock claim"
+  [ -z "$out" ] || fail "Pi pending-lock shutdown test printed output: $out"
+  pass "Pi session shutdown cancels pending lock startup without an orphan or false wake"
+}
+
 test_pi_unexpected_actionable_exit_notifies_once() {
   local repo home plugin out status
   repo="$TMP_ROOT/pi-actionable-root"
@@ -1447,6 +1527,7 @@ test_session_lock_recognizes_only_verified_pi_processes
 test_session_lock_reclaim_has_one_atomic_winner
 test_pi_process_exit_cleanup_listener_lifecycle
 test_pi_session_shutdown_suppresses_intentional_exit
+test_pi_session_shutdown_cancels_pending_lock_claim
 test_pi_unexpected_actionable_exit_notifies_once
 test_pi_unexpected_signaled_exit_notifies_once
 test_pi_duplicate_factories_share_one_arm

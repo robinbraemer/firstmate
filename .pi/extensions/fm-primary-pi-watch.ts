@@ -33,6 +33,7 @@ type ArmCoordinator = {
   sequence: number;
   state: CoordinatorState;
   startPromise: Promise<ArmResult> | null;
+  startCancelled: boolean;
   clients: Set<symbol>;
   exitListener?: () => void;
 };
@@ -64,6 +65,7 @@ function coordinatorForHome(): ArmCoordinator {
     sequence: 0,
     state: "idle",
     startPromise: null,
+    startCancelled: false,
     clients: new Set<symbol>(),
   };
   coordinators.set(fmHome, coordinator);
@@ -211,6 +213,9 @@ export default function (pi: ExtensionAPI) {
 
   async function startArmOnce(): Promise<ArmResult> {
     if (lockOwnership() !== "owned") await claimSessionLock();
+    if (coordinator.startCancelled || coordinator.clients.size === 0) {
+      return { ok: false, message: "watcher: not started - Pi extension session shut down" };
+    }
     if (lockOwnership() !== "owned") return { ok: false, message: "watcher: read-only - session lock is held by another firstmate session" };
     markLoaded();
     if (coordinator.current) return { ok: true, message: "watcher: healthy - Pi extension already has an arm child" };
@@ -263,6 +268,10 @@ export default function (pi: ExtensionAPI) {
 
   function startArm(): Promise<ArmResult> {
     if (coordinator.startPromise) return coordinator.startPromise;
+    if (coordinator.clients.size === 0) {
+      return Promise.resolve({ ok: false, message: "watcher: not started - Pi extension session shut down" });
+    }
+    coordinator.startCancelled = false;
     coordinator.state = "starting";
     let startPromise: Promise<ArmResult>;
     startPromise = startArmOnce().finally(() => {
@@ -279,6 +288,10 @@ export default function (pi: ExtensionAPI) {
   });
   pi.on?.("session_shutdown", async () => {
     coordinator.clients.delete(client);
+    if (coordinator.clients.size > 0) return;
+    coordinator.startCancelled = true;
+    const pendingStart = coordinator.startPromise;
+    if (pendingStart) await pendingStart.catch(() => undefined);
     if (coordinator.clients.size > 0) return;
     await stopArm(coordinator, "session-shutdown");
     if (coordinator.clients.size === 0 && coordinator.exitListener) {
