@@ -106,6 +106,28 @@ test_pi_snippet_uses_effective_extension_path() {
   pass "pi supervision snippet renders the effective extension path"
 }
 
+test_pi_snippet_preserves_hostile_extension_path_as_one_argument() {
+  local home injected_name hostile_root watch out launch_args argv_out
+  home="$TMP_ROOT/pi-hostile-home"
+  injected_name="pi-render-injected.$$"
+  hostile_root="$TMP_ROOT/pi'; touch $injected_name; printf '"
+  watch="$hostile_root/.pi/extensions/fm-primary-pi-watch.ts"
+  mkdir -p "$home/state" "$home/config"
+  out=$(FM_HOME="$home" FM_ROOT_OVERRIDE="$hostile_root" "$RENDER" --harness pi)
+  launch_args=$(printf '%s\n' "$out" | sed -n 's/.*use `\([^`]*\)` so.*/\1/p')
+  [ -n "$launch_args" ] || fail "pi snippet did not expose the unattended launch argv"
+  argv_out=$(cd "$TMP_ROOT" && LAUNCH_ARGS="$launch_args" EXPECTED="$watch" bash -c '
+    # shellcheck disable=SC2294
+    eval "set -- $LAUNCH_ARGS"
+    [ "$#" -eq 3 ] || { printf "argc=%s\n" "$#"; exit 1; }
+    [ "$1" = --approve ] || { printf "arg1=%s\n" "$1"; exit 1; }
+    [ "$2" = -e ] || { printf "arg2=%s\n" "$2"; exit 1; }
+    [ "$3" = "$EXPECTED" ] || { printf "arg3=%s\n" "$3"; exit 1; }
+  ' 2>&1) || fail "pi snippet did not preserve the extension path as exact argv: $argv_out"
+  [ ! -e "$TMP_ROOT/$injected_name" ] || fail "pi snippet path quoting allowed command injection"
+  pass "pi supervision snippet preserves hostile extension paths as one inert argument"
+}
+
 test_selected_harness_block_only
 test_unknown_fallback
 test_conditional_stanzas
@@ -113,3 +135,4 @@ test_repair_lines
 test_grok_is_background_notify
 test_grok_command_sources_effective_config
 test_pi_snippet_uses_effective_extension_path
+test_pi_snippet_preserves_hostile_extension_path_as_one_argument
