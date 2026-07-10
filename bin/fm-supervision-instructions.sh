@@ -106,10 +106,12 @@ fi
 render_snippet() {
   local line
   while IFS= read -r line || [ -n "$line" ]; do
-    line=${line//__FM_PI_EXT_SH__/$pi_ext_sh}
-    line=${line//__FM_PI_EXT__/$pi_ext}
-    line=${line//__FM_X_MODE_ENV_SH__/$x_mode_env_sh}
-    line=${line//__FM_X_MODE_ENV__/$x_mode_env}
+    case "$line" in
+      *__FM_PI_EXT_SH__*) line=${line//__FM_PI_EXT_SH__/$pi_ext_sh} ;;
+      *__FM_PI_EXT__*) line=${line//__FM_PI_EXT__/$pi_ext} ;;
+      *__FM_X_MODE_ENV_SH__*) line=${line//__FM_X_MODE_ENV_SH__/$x_mode_env_sh} ;;
+      *__FM_X_MODE_ENV__*) line=${line//__FM_X_MODE_ENV__/$x_mode_env} ;;
+    esac
     printf '%s\n' "$line"
   done < "$SNIPPET"
 }
