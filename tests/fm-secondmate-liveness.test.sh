@@ -66,6 +66,38 @@ SH
   printf '%s\n' "$fakebin"
 }
 
+make_probe_pi_process() {
+  local dir=$1 process_comm=$2 process_args=$3 tpgid=${4:-4200} fakebin
+  fakebin=$(fm_fakebin "$dir")
+  cat > "$fakebin/tmux" <<'SH'
+#!/usr/bin/env bash
+set -u
+case "${1:-}" in
+  display-message)
+    for a in "$@"; do
+      case "$a" in
+        *pane_current_command*) printf 'node\n'; exit 0 ;;
+        *pane_pid*) printf '4100\n'; exit 0 ;;
+      esac
+    done
+    exit 0 ;;
+esac
+exit 0
+SH
+  cat > "$fakebin/ps" <<SH
+#!/usr/bin/env bash
+set -u
+case "\$*" in
+  *"tpgid="*"-p 4100"*) printf '%s\n' '$tpgid' ;;
+  *"comm="*"-p 4200"*) printf '%s\n' '$process_comm' ;;
+  *"args="*"-p 4200"*) printf '%s\n' '$process_args' ;;
+  *) exit 1 ;;
+esac
+SH
+  chmod +x "$fakebin/tmux" "$fakebin/ps"
+  printf '%s\n' "$fakebin"
+}
+
 test_tmux_agent_alive_classifies() {
   local fb
 
@@ -100,12 +132,28 @@ test_tmux_agent_alive_classifies() {
   [ "$(PATH="$fb:$BASE_PATH" bash -c '. "$0/bin/fm-backend.sh"; fm_backend_source tmux; fm_backend_tmux_agent_alive sess:win' "$ROOT")" = dead ] \
     || fail "a defensively-stripped login-shell name should still classify as dead"
 
-  # A bare interpreter name is ambiguous (pi's own launcher execs into a
-  # generic "node" process - docs/tmux-backend.md "Known gap") - must be
-  # unknown, never dead, so the sweep can never respawn on a false-dead read.
+  # A bare interpreter name is ambiguous until the deeper verified Pi process
+  # probe can attribute its exact foreground command/argv shape. With no pane
+  # pid evidence this must stay unknown, never dead.
   fb=$(make_probe_tmux "$TMP_ROOT/tmux-node" node)
   [ "$(PATH="$fb:$BASE_PATH" bash -c '. "$0/bin/fm-backend.sh"; fm_backend_source tmux; fm_backend_tmux_agent_alive sess:win' "$ROOT")" = unknown ] \
     || fail "an ambiguous bare-interpreter (node) foreground process should classify as unknown, never dead"
+
+  fb=$(make_probe_pi_process "$TMP_ROOT/tmux-pi" /Users/test/.bun/bin/pi pi)
+  [ "$(PATH="$fb:$BASE_PATH" bash -c '. "$0/bin/fm-backend.sh"; fm_backend_source tmux; fm_backend_tmux_agent_alive sess:win' "$ROOT")" = alive ] \
+    || fail "a verified Pi CLI foreground process should classify as alive"
+
+  fb=$(make_probe_pi_process "$TMP_ROOT/tmux-pi-node-entry" /usr/bin/node '/usr/bin/node /opt/pi/node_modules/@earendil-works/pi-coding-agent/dist/cli.js')
+  [ "$(PATH="$fb:$BASE_PATH" bash -c '. "$0/bin/fm-backend.sh"; fm_backend_source tmux; fm_backend_tmux_agent_alive sess:win' "$ROOT")" = alive ] \
+    || fail "a Node process running the installed Pi CLI entrypoint should classify as alive"
+
+  fb=$(make_probe_pi_process "$TMP_ROOT/tmux-generic-node" /usr/bin/node '/usr/bin/node server.js')
+  [ "$(PATH="$fb:$BASE_PATH" bash -c '. "$0/bin/fm-backend.sh"; fm_backend_source tmux; fm_backend_tmux_agent_alive sess:win' "$ROOT")" = unknown ] \
+    || fail "a generic Node foreground process must remain unknown"
+
+  fb=$(make_probe_pi_process "$TMP_ROOT/tmux-malformed-pgid" /Users/test/.bun/bin/pi pi not-a-pid)
+  [ "$(PATH="$fb:$BASE_PATH" bash -c '. "$0/bin/fm-backend.sh"; fm_backend_source tmux; fm_backend_tmux_agent_alive sess:win' "$ROOT")" = unknown ] \
+    || fail "a malformed foreground process group must remain unknown"
 
   fb=$(make_probe_tmux "$TMP_ROOT/tmux-vim" vim)
   [ "$(PATH="$fb:$BASE_PATH" bash -c '. "$0/bin/fm-backend.sh"; fm_backend_source tmux; fm_backend_tmux_agent_alive sess:win' "$ROOT")" = unknown ] \
@@ -304,8 +352,8 @@ test_sweep_never_acts_on_inconclusive_reading() {
   fb=$(make_toolchain "$w"); tmuxfb=$(make_liveness_tmux "$w")
   log="$w/calls.log"; : > "$log"
 
-  # "node" is the ambiguous bare-interpreter case (docs/tmux-backend.md
-  # "Known gap") - ANY reading less than confident-dead must never respawn.
+  # "node" without a verified foreground Pi process shape is ambiguous.
+  # ANY reading less than confident-dead must never respawn.
   out=$(run_bootstrap "$tmuxfb:$fb" "$w/home" node "$log")
 
   assert_contains "$out" "SECONDMATE_LIVENESS: secondmate sm1: skipped: liveness probe inconclusive" \

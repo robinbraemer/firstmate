@@ -99,19 +99,36 @@ Verified the same session: a persisting parent process running a child command (
 
 The classifier (`fm_backend_tmux_agent_alive`) maps the observed name to `alive`, `dead`, or `unknown`:
 
-- `alive` - the name contains `claude`, `codex`, `opencode`, or `grok`. All four were confirmed to run as their own literal process name (`ps -ef`, 2026-07-07): `claude` and `codex` and `opencode` are each a native compiled binary (`file` reports Mach-O), so their `comm` is their own binary name with no interpreter wrapper to hide behind.
+- `alive` - the name contains `claude`, `codex`, `opencode`, or `grok`, or a node-reported pane's exact foreground process matches the verified Pi CLI shape below. The four direct-name harnesses were confirmed to run as their own literal process name (`ps -ef`, 2026-07-07): `claude` and `codex` and `opencode` are each a native compiled binary (`file` reports Mach-O), so their `comm` is their own binary name with no interpreter wrapper to hide behind.
 - `dead` - the name is a bare shell (`zsh`, `bash`, `sh`, `dash`, `ash`, `ksh`, `mksh`, `tcsh`, `csh`, `fish`).
 - `unknown` - anything else, including an unreadable pane.
 
-### Known gap: `pi` cannot be confidently classified
+### Verified Pi CLI process probe
 
-`pi` is a `#!/usr/bin/env node` script (confirmed via its shebang and installed path, 2026-07-07), so a live `pi` agent's pane reports `node` as its `pane_current_command`, not `pi` - verified by running a long-lived `node -e` script in a pane and confirming its foreground process is a genuine child reachable via `pgrep -P <pane_pid>` with an inspectable `ps -o args=` (the same technique `bin/fm-harness.sh`'s own self-detection uses when walking UP its ancestry), while `pi --version` itself was observed to exit too quickly under the same pane to reliably capture its live foreground state - real `pi` invocations were not available to test.
-Since `node` is also the generic name for a plain interpreter session, any future JS-based harness, or someone's unrelated node script, there is no way to attribute a bare `node` foreground process back to `pi` specifically from outside the pane without deeper (and fragile) argument introspection.
-The classifier deliberately reports `unknown` for `node`/`python`/`python3` rather than guess - per the secondmate-liveness sweep's correctness bar, a wrong `alive` is harmless but a wrong `dead` spins up a duplicate agent, so an unresolvable case must never be treated as confidently dead.
-Practical effect: a dead `pi` secondmate is not auto-healed by the liveness sweep today; it is reported as `skipped: liveness probe inconclusive` instead, which still surfaces it for a human to act on.
-Resolving this would need either a `pi`-specific env marker inspectable from outside the process (mirroring `PI_CODING_AGENT=true`, which `bin/fm-harness.sh` already uses for self-detection but which is not readable from a different process without deeper introspection) or accepting the argument-inspection fragility - not attempted here.
+Pi is installed as a Node CLI, and tmux 3.6a reports a live Pi 0.80.6 pane as `pane_current_command=node` even though the foreground process has the command/argv identity `pi pi` on the verified Bun installation.
+A generic `node` value alone remains ambiguous and is never classified alive or dead.
+
+Verification on 2026-07-10 used a dedicated tmux socket and a real interactive Pi 0.80.6 process.
+The exact observations were:
+
+```text
+pane_current_command=node
+pane_pid=51880
+foreground_pgid=52106
+51880 51879 51880 zsh zsh
+52106 51880 52106 pi  pi
+```
+
+`fm_backend_tmux_pi_process_alive` now resolves that exact foreground process without guessing from `node`.
+It reads `#{pane_pid}`, queries `ps -o tpgid=` for the pane tty's foreground process-group leader, then reads `comm` and `args` for that PID.
+It returns success only when command basename and argv0 both identify `pi`, or when Node's arguments contain the installed `@earendil-works/pi-coding-agent/dist/cli.js` entrypoint.
+A generic `node server.js`, malformed process-group ID, missing process, or unreadable value remains `unknown`.
+A pane that has returned to a bare shell remains `dead`.
+
+Command run for the mandatory classifier regression: `tests/fm-secondmate-liveness.test.sh`.
+Observed output includes `ok - fm_backend_tmux_agent_alive: alive/dead/unknown classification` and confirms verified Pi, generic Node, malformed process data, and exited-shell cases.
 
 ## Limitations
 
 None specific to tmux for the reference path itself - it is the fully verified reference backend, while Orca and cmux are the backends without secondmate support.
-The agent-liveness probe above has one known gap (`pi`'s generic `node` process name, see above).
+Pi liveness depends on the foreground process retaining one of the verified CLI identities; any other Node process remains safely inconclusive.

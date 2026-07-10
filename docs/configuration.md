@@ -159,7 +159,9 @@ When `config/crew-dispatch.json` exists, crewmate and scout spawns require an ex
 The primary propagates `config/crew-dispatch.json`, `config/crew-harness`, and `config/backlog-backend` into secondmate homes at secondmate spawn, during the locked session-start bootstrap secondmate sweep, and during explicit `bin/fm-config-push.sh` runs, so a secondmate's own crewmates, dispatch profiles, and backlog backend use the primary values.
 `config/secondmate-harness` is not inherited because secondmates do not launch secondmates.
 For grok, `fm-spawn.sh` installs one firstmate-owned global turn-end hook under `$GROK_HOME/hooks/`, or `~/.grok/hooks/` when `GROK_HOME` is unset, and drops a per-task `.fm-grok-turnend` pointer in the worktree, with teardown removing the task token and pointer.
-For Pi secondmate launches, `fm-spawn.sh` starts Pi with `-e` pointed at the secondmate home's own tracked `.pi/extensions/fm-primary-pi-watch.ts` and `.pi/extensions/fm-primary-turnend-guard.ts`, both already present from the secondmate home's git worktree.
+For Pi secondmate launches, `fm-spawn.sh` uses one-run `--approve` plus `-e` pointed at the secondmate home's own tracked `.pi/extensions/fm-primary-pi-watch.ts` and `.pi/extensions/fm-primary-turnend-guard.ts`, both already present from the secondmate home's git worktree.
+Bare `-e` does not suppress Pi's project-trust dialog, while `--approve` keeps project skills and settings available without requiring a saved trust decision.
+Trusted auto-discovery plus explicit `-e` of those same canonical paths loads each extension once, but a globally installed or otherwise copied extension at a distinct path conflicts and must not be used.
 
 ## Crew dispatch profiles (config/crew-dispatch.json)
 

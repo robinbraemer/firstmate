@@ -62,8 +62,9 @@ test_tracked_extension_present_and_self_hashing() {
 test_spawn_template_mentions_pi_watch_placeholder() {
   local text
   text=$(cat "$ROOT/bin/fm-spawn.sh")
-  assert_contains "$text" "-e __PITURNEND__ -e __PIWATCH__" "Pi secondmate launch template does not include both primary extensions"
+  assert_contains "$text" "--approve -e __PITURNEND__ -e __PIWATCH__" "Pi secondmate launch template does not approve the home while loading both tracked primary extensions"
   assert_contains "$text" "\$PROJ_ABS/.pi/extensions/fm-primary-pi-watch.ts" "fm-spawn does not point the Pi secondmate watch placeholder at the tracked extension"
+  assert_not_contains "$text" "state/fm-primary-pi-watch.ts" "fm-spawn must never launch a generated Pi watcher copy"
   assert_not_contains "$text" "fm-pi-watch-extension.sh" "fm-spawn should no longer generate the Pi watch extension before launch"
   assert_contains "$text" "__PITURNEND__" "fm-spawn does not replace the Pi turn-end guard extension placeholder"
   assert_contains "$text" "__PIWATCH__" "fm-spawn does not replace the Pi watch extension placeholder"
@@ -232,6 +233,225 @@ EOF
   pass "Pi process-exit cleanup listener has a bounded lifecycle"
 }
 
+test_pi_session_shutdown_suppresses_intentional_exit() {
+  local repo home plugin cleanup_log pid_file out status
+  repo="$TMP_ROOT/pi-shutdown-root"
+  home="$TMP_ROOT/pi-shutdown-home"
+  cleanup_log="$TMP_ROOT/pi-shutdown-cleaned"
+  pid_file="$TMP_ROOT/pi-shutdown-child.pid"
+  mkdir -p "$repo/bin" "$home/state" "$home/config"
+  install_pi_watch_extension_fixture "$repo"
+  plugin="$repo/.pi/extensions/fm-primary-pi-watch.ts"
+  cat > "$repo/bin/fm-watch-arm.sh" <<'SH'
+#!/usr/bin/env bash
+trap 'printf "cleaned\n" > "$FM_CLEANUP_LOG"; exit 143' TERM
+printf '%s\n' "$$" > "$FM_CHILD_PID_FILE"
+while :; do sleep 1; done
+SH
+  chmod +x "$repo/bin/fm-watch-arm.sh"
+  out=$(PLUGIN="$plugin" FM_HOME="$home" FM_ROOT_OVERRIDE="$repo" FM_CLEANUP_LOG="$cleanup_log" FM_CHILD_PID_FILE="$pid_file" node --input-type=module 2>&1 <<'EOF'
+import { existsSync, writeFileSync } from "node:fs";
+import { pathToFileURL } from "node:url";
+
+const handlers = new Map();
+let tool = null;
+let prompts = 0;
+const pi = {
+  on(event, handler) {
+    handlers.set(event, handler);
+  },
+  registerCommand() {},
+  registerTool(candidate) {
+    if (candidate.name === "fm_watch_arm_pi") tool = candidate;
+  },
+  sendUserMessage: async () => {
+    prompts += 1;
+  },
+};
+writeFileSync(`${process.env.FM_HOME}/state/.lock`, `${process.pid}\n`);
+const mod = await import(pathToFileURL(process.env.PLUGIN).href);
+mod.default(pi);
+await tool.execute("tool-call-shutdown", {}, undefined, undefined, {});
+for (let i = 0; i < 50 && !existsSync(process.env.FM_CHILD_PID_FILE); i += 1) {
+  await new Promise((resolve) => setTimeout(resolve, 20));
+}
+if (!existsSync(process.env.FM_CHILD_PID_FILE)) throw new Error("arm child did not start");
+await handlers.get("session_shutdown")?.({ type: "session_shutdown", reason: "reload" }, {});
+if (!existsSync(process.env.FM_CLEANUP_LOG)) throw new Error("session_shutdown returned before child cleanup settled");
+await new Promise((resolve) => setTimeout(resolve, 80));
+if (prompts !== 0) throw new Error(`intentional shutdown emitted ${prompts} watcher follow-ups`);
+EOF
+)
+  status=$?
+  expect_code 0 "$status" "Pi reload shutdown must await cleanup and suppress the intentional exit-143 wake"
+  [ -z "$out" ] || fail "Pi intentional-shutdown test printed output: $out"
+  pass "Pi session shutdown awaits arm cleanup without a false watcher wake"
+}
+
+test_pi_unexpected_actionable_exit_notifies_once() {
+  local repo home plugin out status
+  repo="$TMP_ROOT/pi-actionable-root"
+  home="$TMP_ROOT/pi-actionable-home"
+  mkdir -p "$repo/bin" "$home/state" "$home/config"
+  install_pi_watch_extension_fixture "$repo"
+  plugin="$repo/.pi/extensions/fm-primary-pi-watch.ts"
+  cat > "$repo/bin/fm-watch-arm.sh" <<'SH'
+#!/usr/bin/env bash
+printf 'signal: synthetic actionable wake\n'
+SH
+  chmod +x "$repo/bin/fm-watch-arm.sh"
+  out=$(PLUGIN="$plugin" FM_HOME="$home" FM_ROOT_OVERRIDE="$repo" node --input-type=module 2>&1 <<'EOF'
+import { writeFileSync } from "node:fs";
+import { pathToFileURL } from "node:url";
+
+let tool = null;
+const prompts = [];
+const pi = {
+  on() {},
+  registerCommand() {},
+  registerTool(candidate) {
+    if (candidate.name === "fm_watch_arm_pi") tool = candidate;
+  },
+  sendUserMessage: async (message) => {
+    prompts.push(message);
+  },
+};
+writeFileSync(`${process.env.FM_HOME}/state/.lock`, `${process.pid}\n`);
+const mod = await import(pathToFileURL(process.env.PLUGIN).href);
+mod.default(pi);
+await tool.execute("tool-call-actionable", {}, undefined, undefined, {});
+for (let i = 0; i < 50 && prompts.length === 0; i += 1) {
+  await new Promise((resolve) => setTimeout(resolve, 20));
+}
+if (prompts.length !== 1) throw new Error(`expected one actionable follow-up, saw ${prompts.length}`);
+if (!prompts[0].includes("signal: synthetic actionable wake")) throw new Error(prompts[0]);
+await new Promise((resolve) => setTimeout(resolve, 80));
+if (prompts.length !== 1) throw new Error(`actionable close notified ${prompts.length} times`);
+EOF
+)
+  status=$?
+  expect_code 0 "$status" "Pi actionable arm completion must notify exactly once"
+  [ -z "$out" ] || fail "Pi actionable-exit test printed output: $out"
+  pass "Pi unexpected actionable arm completion notifies once"
+}
+
+test_pi_duplicate_factories_share_one_arm() {
+  local repo_a repo_b home log out status
+  repo_a="$TMP_ROOT/pi-factory-a"
+  repo_b="$TMP_ROOT/pi-factory-b"
+  home="$TMP_ROOT/pi-factory-home"
+  log="$TMP_ROOT/pi-factory-children.log"
+  mkdir -p "$repo_a/bin" "$repo_b/bin" "$home/state" "$home/config"
+  install_pi_watch_extension_fixture "$repo_a"
+  install_pi_watch_extension_fixture "$repo_b"
+  cat > "$repo_a/bin/fm-watch-arm.sh" <<'SH'
+#!/usr/bin/env bash
+trap 'exit 143' TERM
+printf '%s\n' "$$" >> "$FM_CHILD_LOG"
+while :; do sleep 1; done
+SH
+  cp "$repo_a/bin/fm-watch-arm.sh" "$repo_b/bin/fm-watch-arm.sh"
+  chmod +x "$repo_a/bin/fm-watch-arm.sh" "$repo_b/bin/fm-watch-arm.sh"
+  out=$(PLUGIN_A="$repo_a/.pi/extensions/fm-primary-pi-watch.ts" PLUGIN_B="$repo_b/.pi/extensions/fm-primary-pi-watch.ts" FM_HOME="$home" FM_ROOT_OVERRIDE="$repo_a" FM_CHILD_LOG="$log" node --input-type=module 2>&1 <<'EOF'
+import { existsSync, readFileSync, writeFileSync } from "node:fs";
+import { pathToFileURL } from "node:url";
+
+const handlers = [];
+const tools = [];
+const makePi = () => ({
+  on(event, handler) {
+    if (event === "session_shutdown") handlers.push(handler);
+  },
+  registerCommand() {},
+  registerTool(candidate) {
+    if (candidate.name === "fm_watch_arm_pi") tools.push(candidate);
+  },
+  sendUserMessage: async () => {},
+});
+writeFileSync(`${process.env.FM_HOME}/state/.lock`, `${process.pid}\n`);
+const a = await import(pathToFileURL(process.env.PLUGIN_A).href);
+const b = await import(`${pathToFileURL(process.env.PLUGIN_B).href}?copy=b`);
+a.default(makePi());
+b.default(makePi());
+await tools[0].execute("factory-a", {}, undefined, undefined, {});
+await tools[1].execute("factory-b", {}, undefined, undefined, {});
+for (let i = 0; i < 50 && !existsSync(process.env.FM_CHILD_LOG); i += 1) {
+  await new Promise((resolve) => setTimeout(resolve, 20));
+}
+const children = readFileSync(process.env.FM_CHILD_LOG, "utf8").trim().split("\n").filter(Boolean);
+if (children.length !== 1) throw new Error(`duplicate factories started ${children.length} arm children`);
+for (const shutdown of handlers) await shutdown({ type: "session_shutdown", reason: "quit" }, {});
+EOF
+)
+  status=$?
+  expect_code 0 "$status" "Pi extension factories in one process/home must share one arm coordinator"
+  [ -z "$out" ] || fail "Pi duplicate-factory test printed output: $out"
+  pass "Pi duplicate extension factories share one attached arm child"
+}
+
+test_pi_stale_callback_cannot_clear_replacement() {
+  local repo home plugin log out status
+  repo="$TMP_ROOT/pi-stale-callback-root"
+  home="$TMP_ROOT/pi-stale-callback-home"
+  log="$TMP_ROOT/pi-stale-callback-children.log"
+  mkdir -p "$repo/bin" "$home/state" "$home/config"
+  install_pi_watch_extension_fixture "$repo"
+  plugin="$repo/.pi/extensions/fm-primary-pi-watch.ts"
+  cat > "$repo/bin/fm-watch-arm.sh" <<'SH'
+#!/usr/bin/env bash
+trap 'exit 143' TERM
+printf '%s\n' "$$" >> "$FM_CHILD_LOG"
+while :; do sleep 1; done
+SH
+  chmod +x "$repo/bin/fm-watch-arm.sh"
+  out=$(PLUGIN="$plugin" FM_HOME="$home" FM_ROOT_OVERRIDE="$repo" FM_CHILD_LOG="$log" node --input-type=module 2>&1 <<'EOF'
+import { writeFileSync } from "node:fs";
+import { pathToFileURL } from "node:url";
+
+const handlers = new Map();
+let tool = null;
+let prompts = 0;
+const pi = {
+  on(event, handler) {
+    handlers.set(event, handler);
+  },
+  registerCommand() {},
+  registerTool(candidate) {
+    if (candidate.name === "fm_watch_arm_pi") tool = candidate;
+  },
+  sendUserMessage: async () => {
+    prompts += 1;
+  },
+};
+writeFileSync(`${process.env.FM_HOME}/state/.lock`, `${process.pid}\n`);
+const mod = await import(pathToFileURL(process.env.PLUGIN).href);
+mod.default(pi);
+await tool.execute("old-generation", {}, undefined, undefined, {});
+const registry = globalThis.__firstmatePiWatchCoordinators;
+if (!(registry instanceof Map)) throw new Error("process-wide Pi watch coordinator registry missing");
+const coordinator = [...registry.values()][0];
+if (!coordinator?.current) throw new Error("old arm generation missing");
+const old = coordinator.current;
+old.intentionalStopReason = "ownership-transfer";
+old.child.emit("error", new Error("synthetic old-generation completion"));
+await new Promise((resolve) => setTimeout(resolve, 20));
+await tool.execute("new-generation", {}, undefined, undefined, {});
+const replacement = coordinator.current;
+if (!replacement || replacement === old) throw new Error("replacement generation did not start");
+old.child.emit("close", 143);
+await new Promise((resolve) => setTimeout(resolve, 80));
+if (coordinator.current !== replacement) throw new Error("stale callback cleared the replacement generation");
+if (prompts !== 0) throw new Error(`stale intentional generation emitted ${prompts} follow-ups`);
+old.child.kill("SIGTERM");
+await handlers.get("session_shutdown")?.({ type: "session_shutdown", reason: "quit" }, {});
+EOF
+)
+  status=$?
+  expect_code 0 "$status" "A stale Pi arm callback must not clear or notify over a replacement generation"
+  [ -z "$out" ] || fail "Pi stale-callback test printed output: $out"
+  pass "Pi stale arm callback cannot clear or notify over its replacement"
+}
+
 test_pi_process_exit_cleanup_stops_arm_child() {
   local repo home plugin cleanup_log pid_file out status pid i
   repo="$TMP_ROOT/pi-process-exit-root"
@@ -287,6 +507,45 @@ EOF
     fail "Pi arm child $pid survived process-exit cleanup"
   fi
   pass "Pi process-exit cleanup stops the attached arm child"
+}
+
+test_pi_live_acceptance_helper_records_isolated_evidence() {
+  local helper home pi_dir evidence fakebin candidate out status
+  helper="$ROOT/tests/fm-pi-live-acceptance-helper.sh"
+  home="$TMP_ROOT/pi-acceptance-helper-home"
+  pi_dir="$TMP_ROOT/pi-acceptance-helper-agent"
+  evidence="$TMP_ROOT/pi-acceptance-helper-evidence"
+  fakebin=$(fm_fakebin "$TMP_ROOT/pi-acceptance-helper-fakebin")
+  candidate=$(git -C "$ROOT" rev-parse HEAD)
+  mkdir -p "$home/state/.watch.lock" "$pi_dir"
+  printf '12345\n' > "$home/state/.lock"
+  printf '54321\n' > "$home/state/.watch.lock/pid"
+  printf '%s\n' "$home" > "$home/state/.watch.lock/fm-home"
+  printf '%s\n' "$ROOT/bin/fm-watch.sh" > "$home/state/.watch.lock/watcher-path"
+  printf 'synthetic identity\n' > "$home/state/.watch.lock/pid-identity"
+  touch "$home/state/.last-watcher-beat"
+  cat > "$fakebin/pi" <<'SH'
+#!/usr/bin/env bash
+if [ "${1:-}" = --version ]; then printf '0.80.6\n'; else printf 'No packages installed.\n'; fi
+SH
+  chmod +x "$fakebin/pi"
+  out=$(PATH="$fakebin:$PATH" FM_PI_ACCEPTANCE_ID=accept-helper-1 FM_PI_CANDIDATE_COMMIT="$candidate" \
+    FM_PI_ACCEPTANCE_EVIDENCE="$evidence" PI_CODING_AGENT_DIR="$pi_dir" FM_HOME="$home" \
+    bash "$helper" inventory 2>&1)
+  status=$?
+  expect_code 0 "$status" "Pi live acceptance helper must record an isolated inventory"
+  assert_contains "$(cat "$evidence/identity.txt")" "acceptance_id=accept-helper-1" "acceptance identity is missing the dedicated id"
+  assert_contains "$(cat "$evidence/pi-list.txt")" "No packages installed." "acceptance inventory did not prove the Pi package set is empty"
+  PATH="$fakebin:$PATH" FM_PI_ACCEPTANCE_ID=accept-helper-1 FM_PI_CANDIDATE_COMMIT="$candidate" \
+    FM_PI_ACCEPTANCE_EVIDENCE="$evidence" PI_CODING_AGENT_DIR="$pi_dir" FM_HOME="$home" \
+    bash "$helper" emit acceptance-probe >/dev/null
+  assert_contains "$(cat "$home/state/acceptance-probe.status")" "done: Pi live acceptance" "acceptance helper did not emit the known actionable status"
+  PATH="$fakebin:$PATH" FM_PI_ACCEPTANCE_ID=accept-helper-1 FM_PI_CANDIDATE_COMMIT="$candidate" \
+    FM_PI_ACCEPTANCE_EVIDENCE="$evidence" PI_CODING_AGENT_DIR="$pi_dir" FM_HOME="$home" \
+    bash "$helper" snapshot armed >/dev/null
+  assert_contains "$(cat "$evidence/armed-watcher-lock.txt")" "watcher_pid=54321" "acceptance snapshot omitted watcher ownership"
+  [ -z "$out" ] || fail "Pi acceptance helper printed unexpected output: $out"
+  pass "Pi live acceptance helper records isolated identity, inventory, emission, and watcher evidence"
 }
 
 test_opencode_primary_watch_plugin_static_wiring() {
@@ -714,7 +973,12 @@ test_spawn_template_mentions_pi_watch_placeholder
 test_pi_extension_reports_external_healthy_watcher
 test_pi_tool_returns_agent_tool_result
 test_pi_process_exit_cleanup_listener_lifecycle
+test_pi_session_shutdown_suppresses_intentional_exit
+test_pi_unexpected_actionable_exit_notifies_once
+test_pi_duplicate_factories_share_one_arm
+test_pi_stale_callback_cannot_clear_replacement
 test_pi_process_exit_cleanup_stops_arm_child
+test_pi_live_acceptance_helper_records_isolated_evidence
 test_opencode_primary_watch_plugin_static_wiring
 test_opencode_primary_watch_plugin_uses_effective_state_home
 test_opencode_primary_watch_plugin_sources_effective_config

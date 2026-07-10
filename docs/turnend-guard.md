@@ -1,6 +1,6 @@
-# Primary turn-end supervision guard
+# Supervising-home turn-end guard
 
-This is the authoritative contract for the "no turn ends blind" primary guard referenced from AGENTS.md section 8.
+This is the authoritative contract for the "no turn ends blind" primary and persistent-secondmate guard referenced from AGENTS.md section 8.
 The shared predicate lives in `bin/fm-turnend-guard.sh`.
 Harness-specific tracked hook files only adapt each verified harness's real turn-end mechanism to that shared predicate.
 A related but separate guard, the pre-arm PreToolUse seatbelt (`bin/fm-arm-pretool-check.sh`, `docs/arm-pretool-check.md`), denies a bad watcher-arm command shape before it runs rather than detecting a blind turn end afterward.
@@ -16,12 +16,13 @@ When tasks are in flight and there is no live identity-matched watcher with a fr
 
 ## Shared Predicate
 
-The guard first scopes itself to the real primary checkout.
-It is inert in secondmate homes because `.fm-secondmate-home` exists there.
-It is inert in crewmate and scout worktrees because firstmate provisions them as linked git worktrees, where `git rev-parse --git-dir` differs from `git rev-parse --git-common-dir`.
-It also requires `AGENTS.md`, `bin/`, and the effective state directory to exist.
+The guard first scopes itself to a real supervising home.
+A plain primary checkout is in scope when its git-dir equals its git-common-dir.
+A persistent secondmate is explicitly in scope when `.fm-secondmate-home` exists, including a treehouse-leased linked worktree, because it is the primary supervisor of its own isolated `FM_HOME`.
+Ordinary crewmate and scout worktrees remain inert because they are linked git worktrees without that marker.
+The guard also requires `AGENTS.md`, `bin/`, and the effective state directory to exist.
 
-For an in-scope primary checkout, it counts in-flight work from `state/*.meta`.
+For an in-scope supervising home, it counts in-flight work from `state/*.meta`.
 If no task is in flight, it exits silently.
 If work is in flight, it requires `fm_watcher_healthy <state-dir> <watch-path> [grace-seconds] [home]` from `bin/fm-wake-lib.sh`.
 That is the same identity-matched live lock and fresh beacon check used by `bin/fm-watch-arm.sh`.
@@ -83,11 +84,11 @@ Command run for follow-up behavior: `OPENCODE_CONFIG_CONTENT='{"permission":{"*"
 Observed output: the plugin called `client.session.promptAsync`, the TUI ran a second turn, and the second model output contained `OPENCODEHOOK`.
 In noninteractive `opencode run`, `promptAsync` returned successfully but the process exited before displaying the follow-up, so this adapter is trusted for primary TUI sessions and documented as passive/fail-open in headless mode.
 
-Pi 0.80.5 was re-validated on 2026-07-09 in a disposable primary-shaped clone with isolated `PI_CODING_AGENT_DIR`, isolated `FM_HOME`, and tmux socket `fm-pi-q6-lab`.
+Pi 0.80.6 was re-validated on 2026-07-10 in a disposable marked-secondmate clone with isolated `PI_CODING_AGENT_DIR`, isolated `FM_HOME`, and a dedicated tmux socket.
 Hook files used: the tracked `.pi/extensions/fm-primary-turnend-guard.ts` and `.pi/extensions/fm-primary-pi-watch.ts`.
 Commands run inside separate interactive turns: `printf PI_E2E_BASH_ONE` through Pi's bash tool, `README.md:1-5` through Pi's read tool, and `printf PI_E2E_BASH_TWO` through Pi's bash tool.
 Command used to make the shared predicate unhealthy: `: > "$FM_HOME/state/pi-e2e.meta"`.
-The next no-tool prompt produced exactly one `TURN WOULD END BLIND` follow-up, and that follow-up called `fm_watch_arm_pi` once with output `watcher: started Pi extension arm child 1`.
+The next no-tool prompt in that secondmate home produced exactly one `TURN WOULD END BLIND` follow-up, and that follow-up called `fm_watch_arm_pi` once with output `watcher: started Pi extension arm child 1`.
 The three earlier tool turns produced no guard follow-up because no work was in flight.
 Command used to fire the watcher: `printf 'done: pi e2e watcher fire\n' > "$FM_HOME/state/pi-e2e.status"`.
 Observed output after the wake: Pi ran `bin/fm-wake-drain.sh`, read the terminal status, called `fm_watch_arm_pi`, and rendered `watcher: started Pi extension arm child 2`.
