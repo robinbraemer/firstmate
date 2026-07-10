@@ -77,6 +77,7 @@ if ! fm_lock_try_acquire "$LOCK_MUTEX" "$LOCK_MUTEX_STALE_AFTER"; then
   exit 1
 fi
 lock_mutex_held=1
+lock_mutex_owner=${FM_LOCK_OWNER_DIR:-}
 lock_tmp=
 cleanup_lock_claim() {
   [ -n "$lock_tmp" ] && rm -f "$lock_tmp" 2>/dev/null || true
@@ -99,6 +100,8 @@ if [ -f "$LOCK" ]; then
 fi
 lock_tmp=$(mktemp "$STATE/.lock.write.XXXXXX") || { echo "error: cannot prepare session lock record" >&2; exit 1; }
 printf '%s\n' "$me" > "$lock_tmp" || { echo "error: cannot write session lock record" >&2; exit 1; }
+fm_lock_owned_by_current_process "$LOCK_MUTEX" "$lock_mutex_owner" \
+  || { echo "error: session lock acquisition ownership was lost before publication" >&2; exit 1; }
 mv "$lock_tmp" "$LOCK" || { echo "error: cannot publish session lock record" >&2; exit 1; }
 lock_tmp=
 [ "$(cat "$LOCK" 2>/dev/null || true)" = "$me" ] || { echo "error: session lock ownership could not be confirmed" >&2; exit 1; }

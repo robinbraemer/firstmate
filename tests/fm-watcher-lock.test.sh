@@ -274,6 +274,163 @@ test_lock_live_steal_mutex_is_not_reclaimed() {
   pass "live steal mutex is not reclaimed"
 }
 
+test_lock_aged_live_owner_keeps_ownership_after_resume() {
+  local dir state lockdir ready holder original_owner out
+  dir=$(make_case lock-aged-live-owner)
+  state="$dir/state"
+  lockdir="$state/.contend.lock"
+  ready="$dir/ready"
+  FM_STATE_OVERRIDE="$state" bash -c '
+    . "$1"
+    fm_lock_try_acquire "$2" || exit 7
+    printf "%s\n" "${FM_LOCK_OWNER_DIR:-}" > "$3"
+    while :; do sleep 1; done
+  ' _ "$LIB" "$lockdir" "$ready" &
+  holder=$!
+  while [ ! -s "$ready" ]; do sleep 0.01; done
+  original_owner=$(cat "$ready")
+  kill -STOP "$holder"
+  touch -h -t 202001010000 "$lockdir" 2>/dev/null || sleep 2
+  out=$(FM_STATE_OVERRIDE="$state" bash -c '
+    . "$1"
+    if fm_lock_try_acquire "$2" 1; then rc=0; else rc=1; fi
+    printf "rc=%s owner=%s\n" "$rc" "$(readlink "$2" 2>/dev/null || true)"
+  ' _ "$LIB" "$lockdir")
+  kill -CONT "$holder" 2>/dev/null || true
+  kill "$holder" 2>/dev/null || true
+  wait "$holder" 2>/dev/null || true
+  case "$out" in
+    *"rc=1"*) ;;
+    *) fail "aged live lock owner was reclaimed while paused: $out" ;;
+  esac
+  case "$out" in
+    *"owner=$original_owner"*) ;;
+    *) fail "paused live owner lost its lock before resuming: $out" ;;
+  esac
+  pass "aged live lock owner remains authoritative across pause and resume"
+}
+
+test_lock_reclaims_aged_reused_pid_steal_mutex() {
+  local dir state lockdir dead reused out rc
+  dir=$(make_case lock-aged-reused-steal)
+  state="$dir/state"
+  lockdir="$state/.contend.lock"
+  dead=$(dead_pid)
+  mkdir "$lockdir" "$lockdir.steal"
+  printf '%s\n' "$dead" > "$lockdir/pid"
+  sleep 300 &
+  reused=$!
+  printf '%s\n' "$reused" > "$lockdir.steal/pid"
+  touch -t 202001010000 "$lockdir.steal"
+  rc=0
+  out=$(FM_STATE_OVERRIDE="$state" bash -c '
+    . "$1"
+    fm_lock_try_acquire "$2" 1 || exit 7
+    printf "pid=%s\n" "$(cat "$2/pid")"
+  ' _ "$LIB" "$lockdir") || rc=$?
+  kill "$reused" 2>/dev/null || true
+  wait "$reused" 2>/dev/null || true
+  [ "$rc" -eq 0 ] || fail "aged reused-PID steal mutex blocked recovery (rc=$rc)"
+  case "$out" in
+    "pid=$reused") fail "recovery published the unrelated reused PID: $out" ;;
+  esac
+  [ ! -e "$lockdir.steal" ] && [ ! -L "$lockdir.steal" ] \
+    || fail "aged reused-PID steal mutex survived recovery"
+  pass "aged reused-PID steal mutex is reclaimed recursively"
+}
+
+test_bounded_lock_identity_failure_returns_without_recursing() {
+  local dir state lockdir out worker i
+  dir=$(make_case lock-identity-failure)
+  state="$dir/state"
+  lockdir="$state/.contend.lock"
+  out="$dir/out"
+  FM_STATE_OVERRIDE="$state" bash -c '
+    . "$1"
+    fm_pid_identity() { return 1; }
+    if fm_lock_try_acquire "$2" 1; then rc=0; else rc=1; fi
+    printf "rc=%s\n" "$rc"
+  ' _ "$LIB" "$lockdir" > "$out" &
+  worker=$!
+  i=0
+  while kill -0 "$worker" 2>/dev/null && [ "$i" -lt 100 ]; do
+    sleep 0.01
+    i=$((i + 1))
+  done
+  if kill -0 "$worker" 2>/dev/null; then
+    kill "$worker" 2>/dev/null || true
+    wait "$worker" 2>/dev/null || true
+    fail "bounded lock acquisition recursed when process identity was unavailable"
+  fi
+  wait "$worker" || fail "bounded lock identity failure exited unexpectedly"
+  [ "$(cat "$out")" = "rc=1" ] || fail "bounded lock identity failure did not fail closed: $(cat "$out")"
+  [ -z "$(find "$state" -name '.contend.lock*' -print -quit)" ] || fail "bounded lock identity failure left lock state behind"
+  pass "bounded lock identity failure returns promptly and fails closed"
+}
+
+test_session_lock_publication_is_fenced_by_mutex_ownership() {
+  local dir home state fakebin ready go real_mktemp holder claim_base claim_pid i status out
+  dir=$(make_case session-lock-publication-fence)
+  home="$dir/home"
+  state="$home/state"
+  fakebin="$dir/fakebin"
+  ready="$dir/ready"
+  go="$dir/go"
+  claim_base="$dir/claim"
+  real_mktemp=$(command -v mktemp)
+  mkdir -p "$state" "$fakebin"
+  sleep 300 &
+  holder=$!
+  cat > "$fakebin/ps" <<'SH'
+#!/usr/bin/env bash
+case "$*" in
+  *"lstart="*"command="*) printf 'Sat Jul 11 12:00:00 2026 pi\n' ;;
+  *"comm="*) printf 'pi\n' ;;
+  *"args="*) printf 'pi\n' ;;
+  *"ppid="*) printf '%s\n' "$FM_HOLDER_PID" ;;
+  *) exit 1 ;;
+esac
+SH
+  cat > "$fakebin/mktemp" <<'SH'
+#!/usr/bin/env bash
+case "$*" in
+  *".lock.write."*)
+    : > "$FM_FENCE_READY"
+    while [ ! -e "$FM_FENCE_GO" ]; do sleep 0.01; done
+    ;;
+esac
+exec "$FM_REAL_MKTEMP" "$@"
+SH
+  chmod +x "$fakebin/ps" "$fakebin/mktemp"
+  PATH="$fakebin:$PATH" FM_HOME="$home" FM_HOLDER_PID="$holder" \
+    FM_FENCE_READY="$ready" FM_FENCE_GO="$go" FM_REAL_MKTEMP="$real_mktemp" \
+    "$ROOT/bin/fm-lock.sh" > "$claim_base.out" 2> "$claim_base.err" &
+  claim_pid=$!
+  i=0
+  while [ ! -e "$ready" ] && kill -0 "$claim_pid" 2>/dev/null && [ "$i" -lt 200 ]; do
+    sleep 0.01
+    i=$((i + 1))
+  done
+  [ -e "$ready" ] || fail "session-lock claimant did not reach the publication fence"
+  rm -f "$state/.lock.acquire"
+  mkdir "$state/.lock.acquire"
+  printf '999999\n' > "$state/.lock.acquire/pid"
+  printf 'competing-owner\n' > "$state/.lock"
+  : > "$go"
+  status=0
+  wait "$claim_pid" || status=$?
+  kill "$holder" 2>/dev/null || true
+  wait "$holder" 2>/dev/null || true
+  out=$(cat "$claim_base.err")
+  [ "$status" -ne 0 ] || fail "claimant published after losing its acquisition mutex"
+  case "$out" in
+    *"ownership was lost before publication"*) ;;
+    *) fail "claimant did not report its lost publication fence: $out" ;;
+  esac
+  [ "$(cat "$state/.lock")" = "competing-owner" ] || fail "claimant overwrote the competing canonical owner"
+  pass "session lock publication is fenced by acquisition-mutex ownership"
+}
+
 test_lock_does_not_steal_live_lock() {
   local dir state lockdir live out lockpid
   dir=$(make_case lock-live-noop)
@@ -712,6 +869,10 @@ test_lock_single_winner_under_concurrency
 test_lock_steals_dead_pid_lock
 test_lock_stale_steal_single_winner_under_concurrency
 test_lock_live_steal_mutex_is_not_reclaimed
+test_lock_reclaims_aged_reused_pid_steal_mutex
+test_lock_aged_live_owner_keeps_ownership_after_resume
+test_bounded_lock_identity_failure_returns_without_recursing
+test_session_lock_publication_is_fenced_by_mutex_ownership
 test_lock_does_not_steal_live_lock
 test_lock_empty_pid_uses_minimum_grace
 test_lock_late_claim_loses_after_recreate
