@@ -26,6 +26,28 @@ export const Type = {
 JS
 }
 
+installed_pi_package_dir() {
+  local candidate pi_bin pi_target
+  if [ -n "${FM_PI_PACKAGE_DIR:-}" ]; then
+    printf '%s\n' "$FM_PI_PACKAGE_DIR"
+    return
+  fi
+  candidate="$(npm root -g 2>/dev/null)/@earendil-works/pi-coding-agent"
+  if [ -f "$candidate/dist/core/agent-session.js" ]; then
+    printf '%s\n' "$candidate"
+    return
+  fi
+  pi_bin=$(command -v pi 2>/dev/null || true)
+  [ -L "$pi_bin" ] || return
+  pi_target=$(readlink "$pi_bin")
+  case "$pi_target" in
+    /*) ;;
+    *) pi_target="$(cd "$(dirname "$pi_bin")" && cd "$(dirname "$pi_target")" && pwd -P)/$(basename "$pi_target")" ;;
+  esac
+  candidate=$(cd "$(dirname "$pi_target")/.." 2>/dev/null && pwd -P)
+  [ -f "$candidate/dist/core/agent-session.js" ] && printf '%s\n' "$candidate"
+}
+
 test_tracked_extension_present_and_self_hashing() {
   local text expected_config_source extension_count
   expected_config_source="config_dir=\\\"\${FM_CONFIG_OVERRIDE:-\$FM_HOME/config}\\\""
@@ -36,8 +58,14 @@ test_tracked_extension_present_and_self_hashing() {
   assert_contains "$text" "fm_watch_arm_pi" "tracked extension missing tool name"
   assert_contains "$text" "fm-watch-arm-pi" "tracked extension missing command name"
   assert_contains "$text" "fm-watch-arm.sh" "tracked extension missing watcher arm"
-  assert_contains "$text" "sendUserMessage" "tracked extension missing Pi wake API"
-  assert_contains "$text" "deliverAs: \"followUp\"" "tracked extension missing followUp delivery"
+  assert_contains "$text" "pi.sendMessage" "tracked extension missing Pi custom wake API"
+  assert_contains "$text" 'customType: "firstmate-watcher-wake"' "tracked extension missing stable watcher wake custom type"
+  assert_contains "$text" 'display: true' "tracked extension missing persistent custom wake display"
+  assert_contains "$text" 'deliverAs: "followUp"' "tracked extension missing followUp delivery"
+  assert_contains "$text" 'triggerTurn: true' "tracked extension missing idle turn trigger"
+  assert_not_contains "$text" "sendUserMessage" "tracked extension still manufactures captain-authored user messages"
+  assert_contains "$text" "detached: true" "tracked extension does not own a detached arm process group"
+  assert_contains "$text" "MAX_CAPTURE_BYTES" "tracked extension does not bound watcher output capture"
   assert_contains "$text" ".pi-watch-extension-loaded" "tracked extension missing loaded marker"
   assert_contains "$text" 'createHash("sha256").update(readFileSync(extensionFile)).digest("hex")' "tracked extension does not self-hash its own content for extensionVersion"
   assert_contains "$text" 'fileURLToPath(import.meta.url)' "tracked extension does not self-locate via import.meta.url"
@@ -100,7 +128,7 @@ const pi = {
   on() { registrations += 1; },
   registerCommand() { registrations += 1; },
   registerTool() { registrations += 1; },
-  sendUserMessage: async () => {},
+  sendMessage: async () => {},
 };
 const mod = await import(pathToFileURL(process.env.PLUGIN).href);
 mod.default(pi);
@@ -113,6 +141,39 @@ EOF
   status=$?
   expect_code 0 "$status" "ordinary linked task worktrees must keep the Pi watcher extension inert"
   [ -z "$out" ] || fail "Pi linked-worktree scope test printed output: $out"
+
+  mkdir -p "$worktree/state" "$worktree/config"
+  out=$(PLUGIN="$plugin" FM_HOME="$worktree" FM_ROOT_OVERRIDE="$worktree" node --input-type=module 2>&1 <<'EOF'
+import { existsSync, readFileSync, writeFileSync } from "node:fs";
+import { pathToFileURL } from "node:url";
+
+let command = null;
+let tool = null;
+const pi = {
+  on() {},
+  registerCommand(name) {
+    if (name === "fm-watch-arm-pi") command = name;
+  },
+  registerTool(candidate) {
+    if (candidate.name === "fm_watch_arm_pi") tool = candidate.name;
+  },
+  sendMessage() {},
+};
+writeFileSync(`${process.env.FM_HOME}/state/.lock`, `${process.pid}\n`);
+const mod = await import(pathToFileURL(process.env.PLUGIN).href);
+mod.default(pi);
+if (command !== "fm-watch-arm-pi") throw new Error("effective linked primary did not register the watcher command");
+if (tool !== "fm_watch_arm_pi") throw new Error("effective linked primary did not register the watcher tool");
+const marker = `${process.env.FM_HOME}/state/.pi-watch-extension-loaded`;
+if (!existsSync(marker)) throw new Error("effective linked primary did not write the loaded marker");
+const [version, pid] = readFileSync(marker, "utf8").trim().split("\n");
+if (!version.startsWith("sha256:")) throw new Error(`loaded marker did not contain the candidate hash: ${version}`);
+if (pid !== String(process.pid)) throw new Error(`loaded marker pid ${pid} did not match current Pi-shaped process ${process.pid}`);
+EOF
+)
+  status=$?
+  expect_code 0 "$status" "the effective primary home must load the watcher even when Treehouse represents it as a linked worktree"
+  [ -z "$out" ] || fail "Pi effective linked-primary test printed output: $out"
 
   mkdir -p "$base/bin" "$base/state" "$base/config"
   : > "$base/AGENTS.md"
@@ -136,7 +197,7 @@ const pi = {
   on() { registrations += 1; },
   registerCommand() { registrations += 1; },
   registerTool() { registrations += 1; },
-  sendUserMessage: async () => {},
+  sendMessage: async () => {},
 };
 const mod = await import(pathToFileURL(process.env.PLUGIN).href);
 mod.default(pi);
@@ -160,7 +221,7 @@ const pi = {
   on() {},
   registerCommand() {},
   registerTool(candidate) { if (candidate.name === "fm_watch_arm_pi") tool = candidate; },
-  sendUserMessage: async () => {},
+  sendMessage: async () => {},
 };
 writeFileSync(`${process.env.FM_HOME}/state/.lock`, `${process.pid}\n`);
 const mod = await import(pathToFileURL(process.env.PLUGIN).href);
@@ -176,14 +237,80 @@ EOF
 }
 
 test_pi_live_lab_cleanup_is_owned() {
-  local script text
+  local script helper text helper_text
   script="$ROOT/tests/fm-pi-primary-live-e2e.test.sh"
+  helper="$ROOT/tests/fm-pi-detached-launch-helper.sh"
   text=$(cat "$script")
+  helper_text=$(cat "$helper")
+  # shellcheck disable=SC2016  # These are literal source-code assertions.
   assert_contains "$text" 'mktemp -d "$ROOT/.pi-live-e2e.XXXXXX"' "live Pi test does not allocate a fresh worktree-local lab"
+  # shellcheck disable=SC2016
   assert_contains "$text" 'LAB_SENTINEL="$LAB/.fm-pi-live-e2e-owned"' "live Pi test does not mark ownership of its lab"
+  # shellcheck disable=SC2016
   assert_contains "$text" '[ -f "$LAB_SENTINEL" ]' "live Pi cleanup does not require its ownership sentinel"
   assert_not_contains "$text" 'FM_PI_LIVE_LAB' "live Pi test still accepts a caller-selected cleanup path"
+  assert_contains "$text" 'respawn-pane -k' "live Pi test does not replace the old Pi directly at the pane boundary"
+  assert_contains "$text" 'build_pi_launch_command' "live Pi test does not centralize quoted candidate launch construction"
+  assert_contains "$text" 'LAUNCH_HELPER=' "live Pi candidate launch does not route through the argv-preserving helper"
+  assert_contains "$helper_text" 'exec env' "live Pi candidate launch retains an avoidable wrapper process"
+  assert_contains "$text" 'registration-probe.ts' "live Pi test does not prove tool and command registration after detached restart"
+  assert_present "$helper" "detached Pi launch helper is missing"
   pass "Pi live regression cleanup is confined to its fresh owned lab"
+}
+
+test_pi_detached_launch_helper_preserves_exact_argv() {
+  local helper case_dir fake_pi log pi_dir home watch probe prompt out status helper_pid launched_pid
+  helper="$ROOT/tests/fm-pi-detached-launch-helper.sh"
+  case_dir="$TMP_ROOT/pi detached launch"
+  fake_pi="$case_dir/fake pi"
+  log="$case_dir/launch.log"
+  pi_dir="$case_dir/pi agent"
+  home="$case_dir/firstmate home"
+  watch="$home/.pi/extensions/fm-primary-pi-watch.ts"
+  probe="$home/state/registration probe.ts"
+  prompt="Reply exactly: quote ' and spaces"
+  mkdir -p "$case_dir" "$pi_dir" "$(dirname "$watch")" "$(dirname "$probe")"
+  cat > "$fake_pi" <<'SH'
+#!/usr/bin/env bash
+{
+  printf 'pid=%s\n' "$$"
+  printf 'pi_dir=%s\n' "${PI_CODING_AGENT_DIR:-}"
+  printf 'fm_home=%s\n' "${FM_HOME:-}"
+  printf 'fm_root=%s\n' "${FM_ROOT_OVERRIDE:-}"
+  printf 'probe_env=%s\n' "${FM_PI_REGISTRATION_PROBE:-}"
+  printf 'argc=%s\n' "$#"
+  i=0
+  for arg in "$@"; do
+    printf 'arg_%s=%s\n' "$i" "$arg"
+    i=$((i + 1))
+  done
+} > "${FM_PI_LAUNCH_LOG:?}"
+SH
+  chmod +x "$fake_pi"
+
+  FM_PI_LAUNCH_LOG="$log" "$helper" "$fake_pi" "$pi_dir" "$home" "$watch" "$probe" "$prompt" &
+  helper_pid=$!
+  wait "$helper_pid"
+  status=$?
+  expect_code 0 "$status" "detached Pi launch helper must exec the exact candidate argv"
+  launched_pid=$(sed -n 's/^pid=//p' "$log")
+  [ "$launched_pid" = "$helper_pid" ] || fail "launch helper left a wrapper pid $helper_pid around Pi pid $launched_pid"
+  assert_grep "pi_dir=$pi_dir" "$log" "launch helper split the Pi agent directory"
+  assert_grep "fm_home=$home" "$log" "launch helper split the Firstmate home"
+  assert_grep "fm_root=$home" "$log" "launch helper did not root the candidate at its effective home"
+  assert_grep "probe_env=$home/state/registrations.txt" "$log" "launch helper did not set the registration evidence path"
+  assert_grep 'argc=9' "$log" "launch helper passed the wrong argument count"
+  assert_grep 'arg_0=--approve' "$log" "launch helper omitted one-run project approval"
+  assert_grep 'arg_1=--offline' "$log" "launch helper changed offline startup ordering"
+  assert_grep 'arg_2=--no-session' "$log" "launch helper changed ephemeral-session startup ordering"
+  assert_grep 'arg_3=--verbose' "$log" "launch helper omitted verbose resource evidence"
+  assert_grep 'arg_4=-e' "$log" "launch helper omitted the watcher extension flag"
+  assert_grep "arg_5=$watch" "$log" "launch helper split the watcher extension path"
+  assert_grep 'arg_6=-e' "$log" "launch helper omitted the registration probe flag"
+  assert_grep "arg_7=$probe" "$log" "launch helper split the registration probe path"
+  assert_grep "arg_8=$prompt" "$log" "launch helper split or evaluated the initial prompt"
+  [ -z "${out:-}" ] || fail "detached launch helper printed unexpected output: $out"
+  pass "Pi detached launch helper preserves exact quoted argv and replaces itself with one Pi process"
 }
 
 test_spawn_template_mentions_pi_watch_placeholder() {
@@ -222,8 +349,8 @@ const pi = {
     if (name === "fm-watch-arm-pi") handler = options.handler;
   },
   registerTool() {},
-  sendUserMessage: async (message) => {
-    prompt = message;
+  sendMessage: async (message) => {
+    prompt = message.content;
   },
 };
 writeFileSync(`${process.env.FM_HOME}/state/.lock`, `${process.pid}\n`);
@@ -294,7 +421,7 @@ const pi = {
   registerTool(candidate) {
     if (candidate.name === "fm_watch_arm_pi") tool = candidate;
   },
-  sendUserMessage: async () => {},
+  sendMessage: async () => {},
 };
 writeFileSync(`${process.env.FM_HOME}/state/.lock`, `${process.pid}\n`);
 const mod = await import(pathToFileURL(process.env.PLUGIN).href);
@@ -352,7 +479,7 @@ const pi = {
   registerTool(candidate) {
     if (candidate.name === "fm_watch_arm_pi") tool = candidate;
   },
-  sendUserMessage: async () => {},
+  sendMessage: async () => {},
 };
 writeFileSync(`${process.env.FM_HOME}/state/.lock`, "999999\n");
 const mod = await import(pathToFileURL(process.env.PLUGIN).href);
@@ -424,7 +551,7 @@ try {
     registerTool(candidate) {
       if (candidate.name === "fm_watch_arm_pi") tool = candidate;
     },
-    sendUserMessage: async () => {},
+    sendMessage: async () => {},
   };
   writeFileSync(`${process.env.FM_HOME}/state/.lock`, `${unrelated.pid}\n`);
   const mod = await import(pathToFileURL(process.env.PLUGIN).href);
@@ -502,7 +629,7 @@ try {
     registerTool(candidate) {
       if (candidate.name === "fm_watch_arm_pi") tool = candidate;
     },
-    sendUserMessage: async () => {},
+    sendMessage: async () => {},
   };
   const mod = await import(pathToFileURL(process.env.PLUGIN).href);
   mod.default(pi);
@@ -681,7 +808,7 @@ const pi = {
   },
   registerCommand() {},
   registerTool() {},
-  sendUserMessage: async () => {},
+  sendMessage: async () => {},
 };
 const before = process.listenerCount("exit");
 const mod = await import(pathToFileURL(process.env.PLUGIN).href);
@@ -732,7 +859,7 @@ const pi = {
   registerTool(candidate) {
     if (candidate.name === "fm_watch_arm_pi") tool = candidate;
   },
-  sendUserMessage: async () => {
+  sendMessage: async () => {
     prompts += 1;
   },
 };
@@ -796,7 +923,7 @@ const pi = {
   registerTool(candidate) {
     if (candidate.name === "fm_watch_arm_pi") tool = candidate;
   },
-  sendUserMessage: async () => {
+  sendMessage: async () => {
     prompts += 1;
   },
 };
@@ -824,7 +951,7 @@ if (existsSync(process.env.FM_ARM_LOG)) throw new Error("arm child started after
 if (existsSync(`${process.env.FM_HOME}/state/.watch.lock`)) throw new Error("watcher state survived pending shutdown");
 if (prompts !== 0) throw new Error(`pending shutdown emitted ${prompts} watcher follow-ups`);
 const coordinator = [...globalThis.__firstmatePiWatchCoordinators.values()][0];
-if (coordinator.current || coordinator.startPromise || coordinator.state !== "idle") {
+if (coordinator && (coordinator.current || coordinator.startPromise || coordinator.state !== "idle")) {
   throw new Error(`coordinator survived pending shutdown: ${coordinator.state}`);
 }
 if (process.listenerCount("exit") !== before) throw new Error("pending shutdown retained the process-exit listener");
@@ -834,6 +961,63 @@ EOF
   expect_code 0 "$status" "Pi shutdown must cancel and await a pending session-lock claim"
   [ -z "$out" ] || fail "Pi pending-lock shutdown test printed output: $out"
   pass "Pi session shutdown cancels pending lock startup without an orphan or false wake"
+}
+
+test_pi_custom_wake_is_structured_and_not_user_authored() {
+  local repo home plugin out status
+  repo="$TMP_ROOT/pi-custom-wake-root"
+  home="$TMP_ROOT/pi-custom-wake-home"
+  mkdir -p "$repo/bin" "$home/state" "$home/config"
+  install_pi_watch_extension_fixture "$repo"
+  plugin="$repo/.pi/extensions/fm-primary-pi-watch.ts"
+  cat > "$repo/bin/fm-watch-arm.sh" <<'SH'
+#!/usr/bin/env bash
+printf 'signal: structured wake\n'
+SH
+  chmod +x "$repo/bin/fm-watch-arm.sh"
+  out=$(PLUGIN="$plugin" FM_HOME="$home" FM_ROOT_OVERRIDE="$repo" node --input-type=module 2>&1 <<'EOF'
+import { writeFileSync } from "node:fs";
+import { pathToFileURL } from "node:url";
+
+let tool = null;
+const deliveries = [];
+const pi = {
+  on() {},
+  registerCommand() {},
+  registerTool(candidate) {
+    if (candidate.name === "fm_watch_arm_pi") tool = candidate;
+  },
+  sendMessage(message, options) {
+    deliveries.push({ message, options });
+  },
+  sendUserMessage() {
+    throw new Error("watcher wake was delivered as a user-role message");
+  },
+};
+writeFileSync(`${process.env.FM_HOME}/state/.lock`, `${process.pid}\n`);
+const mod = await import(pathToFileURL(process.env.PLUGIN).href);
+mod.default(pi);
+await tool.execute("structured-wake", {}, undefined, undefined, {});
+for (let i = 0; i < 50 && deliveries.length === 0; i += 1) {
+  await new Promise((resolve) => setTimeout(resolve, 20));
+}
+if (deliveries.length !== 1) throw new Error(`expected one custom wake, saw ${deliveries.length}`);
+const { message, options } = deliveries[0];
+if (message.customType !== "firstmate-watcher-wake") throw new Error(`wrong custom type: ${message.customType}`);
+if (message.display !== true) throw new Error("custom wake is not persisted/displayed");
+if (!message.content.includes("FIRSTMATE WATCHER WAKE: signal: structured wake")) throw new Error(message.content);
+if (message.details?.kind !== "actionable" || message.details?.generation !== 1) {
+  throw new Error(`invalid structured details: ${JSON.stringify(message.details)}`);
+}
+if (options?.deliverAs !== "followUp" || options?.triggerTurn !== true) {
+  throw new Error(`invalid delivery options: ${JSON.stringify(options)}`);
+}
+EOF
+)
+  status=$?
+  expect_code 0 "$status" "Pi watcher wake must persist as a custom background event that triggers an agent turn"
+  [ -z "$out" ] || fail "Pi structured-wake test printed output: $out"
+  pass "Pi watcher wake is a custom follow-up turn, never a user-role message"
 }
 
 test_pi_unexpected_actionable_exit_notifies_once() {
@@ -860,7 +1044,7 @@ const pi = {
   registerTool(candidate) {
     if (candidate.name === "fm_watch_arm_pi") tool = candidate;
   },
-  sendUserMessage: async (message) => {
+  sendMessage: async (message) => {
     prompts.push(message);
   },
 };
@@ -872,7 +1056,7 @@ for (let i = 0; i < 50 && prompts.length === 0; i += 1) {
   await new Promise((resolve) => setTimeout(resolve, 20));
 }
 if (prompts.length !== 1) throw new Error(`expected one actionable follow-up, saw ${prompts.length}`);
-if (!prompts[0].includes("signal: synthetic actionable wake")) throw new Error(prompts[0]);
+if (!prompts[0].content.includes("signal: synthetic actionable wake")) throw new Error(prompts[0].content);
 await new Promise((resolve) => setTimeout(resolve, 80));
 if (prompts.length !== 1) throw new Error(`actionable close notified ${prompts.length} times`);
 EOF
@@ -907,7 +1091,7 @@ const pi = {
   registerTool(candidate) {
     if (candidate.name === "fm_watch_arm_pi") tool = candidate;
   },
-  sendUserMessage: async (message) => {
+  sendMessage: async (message) => {
     prompts.push(message);
   },
 };
@@ -923,7 +1107,7 @@ for (let i = 0; i < 50 && prompts.length === 0; i += 1) {
   await new Promise((resolve) => setTimeout(resolve, 20));
 }
 if (prompts.length !== 1) throw new Error(`expected one signaled-exit follow-up, saw ${prompts.length}`);
-if (!prompts[0].includes("terminated by SIGTERM")) throw new Error(prompts[0]);
+if (!prompts[0].content.includes("terminated by SIGTERM")) throw new Error(prompts[0].content);
 record.child.emit("error", new Error("synthetic post-close error"));
 record.child.emit("close", null, "SIGKILL");
 await new Promise((resolve) => setTimeout(resolve, 80));
@@ -934,6 +1118,190 @@ EOF
   expect_code 0 "$status" "Pi non-intentional signaled arm exit must notify exactly once"
   [ -z "$out" ] || fail "Pi signaled-exit test printed output: $out"
   pass "Pi unexpected signaled arm exit notifies once"
+}
+
+test_pi_spawn_error_then_close_notifies_once() {
+  local repo home plugin node_bin out status
+  repo="$TMP_ROOT/pi-spawn-error-root"
+  home="$TMP_ROOT/pi-spawn-error-home"
+  node_bin=$(command -v node)
+  mkdir -p "$repo/bin" "$home/state" "$home/config"
+  install_pi_watch_extension_fixture "$repo"
+  : > "$repo/.fm-secondmate-home"
+  plugin="$repo/.pi/extensions/fm-primary-pi-watch.ts"
+  : > "$repo/bin/fm-watch-arm.sh"
+  chmod +x "$repo/bin/fm-watch-arm.sh"
+  out=$(PATH=/nonexistent PLUGIN="$plugin" FM_HOME="$home" FM_ROOT_OVERRIDE="$repo" "$node_bin" --input-type=module 2>&1 <<'EOF'
+import { writeFileSync } from "node:fs";
+import { pathToFileURL } from "node:url";
+
+let tool = null;
+const deliveries = [];
+const pi = {
+  on() {}, registerCommand() {},
+  registerTool(candidate) { if (candidate.name === "fm_watch_arm_pi") tool = candidate; },
+  sendMessage(message) { deliveries.push(message); },
+  sendUserMessage() { throw new Error("unexpected user-role wake"); },
+};
+writeFileSync(`${process.env.FM_HOME}/state/.lock`, `${process.pid}\n`);
+const mod = await import(pathToFileURL(process.env.PLUGIN).href);
+mod.default(pi);
+await tool.execute("spawn-error", {}, undefined, undefined, {});
+for (let i = 0; i < 50 && deliveries.length === 0; i += 1) await new Promise((resolve) => setTimeout(resolve, 20));
+if (deliveries.length !== 1) throw new Error(`expected one spawn-error wake, saw ${deliveries.length}`);
+if (!deliveries[0].content.includes("failed: spawn bash ENOENT")) throw new Error(deliveries[0].content);
+await new Promise((resolve) => setTimeout(resolve, 80));
+if (deliveries.length !== 1) throw new Error(`error plus close delivered ${deliveries.length} wakes`);
+EOF
+)
+  status=$?
+  expect_code 0 "$status" "Pi arm spawn error plus close must emit exactly one failure wake"
+  [ -z "$out" ] || fail "Pi spawn-error test printed output: $out"
+  pass "Pi arm error plus close delivers one failure only"
+}
+
+test_pi_unexpected_empty_exit_notifies_once() {
+  local repo home plugin out status
+  repo="$TMP_ROOT/pi-empty-exit-root"
+  home="$TMP_ROOT/pi-empty-exit-home"
+  mkdir -p "$repo/bin" "$home/state" "$home/config"
+  install_pi_watch_extension_fixture "$repo"
+  plugin="$repo/.pi/extensions/fm-primary-pi-watch.ts"
+  cat > "$repo/bin/fm-watch-arm.sh" <<'SH'
+#!/usr/bin/env bash
+exit 0
+SH
+  chmod +x "$repo/bin/fm-watch-arm.sh"
+  out=$(PLUGIN="$plugin" FM_HOME="$home" FM_ROOT_OVERRIDE="$repo" node --input-type=module 2>&1 <<'EOF'
+import { writeFileSync } from "node:fs";
+import { pathToFileURL } from "node:url";
+
+let tool = null;
+const deliveries = [];
+const pi = {
+  on() {}, registerCommand() {},
+  registerTool(candidate) { if (candidate.name === "fm_watch_arm_pi") tool = candidate; },
+  sendMessage(message) { deliveries.push(message); },
+  sendUserMessage() { throw new Error("unexpected user-role wake"); },
+};
+writeFileSync(`${process.env.FM_HOME}/state/.lock`, `${process.pid}\n`);
+const mod = await import(pathToFileURL(process.env.PLUGIN).href);
+mod.default(pi);
+await tool.execute("empty-exit", {}, undefined, undefined, {});
+for (let i = 0; i < 50 && deliveries.length === 0; i += 1) await new Promise((resolve) => setTimeout(resolve, 20));
+if (deliveries.length !== 1) throw new Error(`expected one empty-exit failure, saw ${deliveries.length}`);
+if (!deliveries[0].content.includes("exited unexpectedly with code 0")) throw new Error(deliveries[0].content);
+if (deliveries[0].details?.kind !== "failure") throw new Error(JSON.stringify(deliveries[0].details));
+EOF
+)
+  status=$?
+  expect_code 0 "$status" "Pi empty zero arm exit must emit exactly one failure wake"
+  [ -z "$out" ] || fail "Pi empty-exit test printed output: $out"
+  pass "Pi unexpected empty zero exit notifies once"
+}
+
+test_pi_actionable_streams_deliver_once_and_capture_is_bounded() {
+  local repo home plugin out status
+  repo="$TMP_ROOT/pi-bounded-output-root"
+  home="$TMP_ROOT/pi-bounded-output-home"
+  mkdir -p "$repo/bin" "$home/state" "$home/config"
+  install_pi_watch_extension_fixture "$repo"
+  plugin="$repo/.pi/extensions/fm-primary-pi-watch.ts"
+  cat > "$repo/bin/fm-watch-arm.sh" <<'SH'
+#!/usr/bin/env bash
+printf 'sig'
+printf 'nal: first actionable\n'
+printf 'signal: second actionable\n' >&2
+head -c 1048576 /dev/zero | tr '\0' x
+head -c 1048576 /dev/zero | tr '\0' y >&2
+SH
+  chmod +x "$repo/bin/fm-watch-arm.sh"
+  out=$(PLUGIN="$plugin" FM_HOME="$home" FM_ROOT_OVERRIDE="$repo" node --input-type=module 2>&1 <<'EOF'
+import { writeFileSync } from "node:fs";
+import { pathToFileURL } from "node:url";
+
+let tool = null;
+const deliveries = [];
+const pi = {
+  on() {}, registerCommand() {},
+  registerTool(candidate) { if (candidate.name === "fm_watch_arm_pi") tool = candidate; },
+  sendMessage(message) { deliveries.push(message); },
+  sendUserMessage() { throw new Error("unexpected user-role wake"); },
+};
+writeFileSync(`${process.env.FM_HOME}/state/.lock`, `${process.pid}\n`);
+const mod = await import(pathToFileURL(process.env.PLUGIN).href);
+mod.default(pi);
+await tool.execute("bounded-output", {}, undefined, undefined, {});
+for (let i = 0; i < 100 && deliveries.length === 0; i += 1) await new Promise((resolve) => setTimeout(resolve, 20));
+if (deliveries.length !== 1) throw new Error(`expected one actionable wake, saw ${deliveries.length}`);
+if (!deliveries[0].content.includes("signal: first actionable")) throw new Error(deliveries[0].content);
+if (deliveries[0].details?.truncated !== true) throw new Error(`missing truncation details: ${JSON.stringify(deliveries[0].details)}`);
+const coordinator = [...globalThis.__firstmatePiWatchCoordinators.values()][0];
+const completed = coordinator.lastCompleted;
+if (!completed) throw new Error("coordinator did not retain bounded completion diagnostics");
+if (completed.stdout.length > 32768 || completed.stderr.length > 32768) {
+  throw new Error(`unbounded capture: stdout=${completed.stdout.length} stderr=${completed.stderr.length}`);
+}
+await new Promise((resolve) => setTimeout(resolve, 80));
+if (deliveries.length !== 1) throw new Error(`both streams delivered ${deliveries.length} wakes`);
+EOF
+)
+  status=$?
+  expect_code 0 "$status" "Pi watcher output must be bounded while split and duplicate actionable lines deliver once"
+  [ -z "$out" ] || fail "Pi bounded-output test printed output: $out"
+  pass "Pi watcher output capture is bounded and actionable delivery remains exactly once"
+}
+
+test_pi_session_shutdown_kills_entire_process_group() {
+  local repo home plugin pids out status arm_pid descendant_pid
+  repo="$TMP_ROOT/pi-process-group-root"
+  home="$TMP_ROOT/pi-process-group-home"
+  pids="$TMP_ROOT/pi-process-group-pids"
+  mkdir -p "$repo/bin" "$home/state" "$home/config"
+  install_pi_watch_extension_fixture "$repo"
+  plugin="$repo/.pi/extensions/fm-primary-pi-watch.ts"
+  cat > "$repo/bin/fm-watch-arm.sh" <<'SH'
+#!/usr/bin/env bash
+trap '' TERM
+( trap '' TERM; while :; do sleep 1; done ) &
+printf '%s %s\n' "$$" "$!" > "$FM_GROUP_PIDS"
+while :; do sleep 1; done
+SH
+  chmod +x "$repo/bin/fm-watch-arm.sh"
+  out=$(PLUGIN="$plugin" FM_HOME="$home" FM_ROOT_OVERRIDE="$repo" FM_GROUP_PIDS="$pids" \
+    FM_PI_WATCH_STOP_GRACE_MS=40 node --input-type=module 2>&1 <<'EOF'
+import { existsSync, writeFileSync } from "node:fs";
+import { pathToFileURL } from "node:url";
+
+const handlers = new Map();
+let tool = null;
+const deliveries = [];
+const pi = {
+  on(event, handler) { handlers.set(event, handler); },
+  registerCommand() {},
+  registerTool(candidate) { if (candidate.name === "fm_watch_arm_pi") tool = candidate; },
+  sendMessage(message) { deliveries.push(message); },
+  sendUserMessage() { throw new Error("unexpected user-role wake"); },
+};
+writeFileSync(`${process.env.FM_HOME}/state/.lock`, `${process.pid}\n`);
+const mod = await import(pathToFileURL(process.env.PLUGIN).href);
+mod.default(pi);
+await tool.execute("process-group", {}, undefined, undefined, {});
+for (let i = 0; i < 100 && !existsSync(process.env.FM_GROUP_PIDS); i += 1) await new Promise((resolve) => setTimeout(resolve, 10));
+if (!existsSync(process.env.FM_GROUP_PIDS)) throw new Error("arm process group did not start");
+const started = Date.now();
+await handlers.get("session_shutdown")?.({ type: "session_shutdown", reason: "reload" }, {});
+if (Date.now() - started > 1000) throw new Error("bounded process-group stop exceeded one second");
+if (deliveries.length !== 0) throw new Error(`intentional group stop emitted ${deliveries.length} wakes`);
+EOF
+)
+  status=$?
+  expect_code 0 "$status" "Pi session shutdown must kill the entire detached arm process group within a bound"
+  [ -z "$out" ] || fail "Pi process-group shutdown test printed output: $out"
+  read -r arm_pid descendant_pid < "$pids"
+  kill -0 "$arm_pid" 2>/dev/null && fail "Pi arm process $arm_pid survived bounded group cleanup"
+  kill -0 "$descendant_pid" 2>/dev/null && fail "Pi watcher descendant $descendant_pid survived bounded group cleanup"
+  pass "Pi session shutdown kills the entire arm process group without a wake"
 }
 
 test_pi_duplicate_factories_share_one_arm() {
@@ -974,7 +1342,7 @@ const makePi = () => ({
   registerTool(candidate) {
     if (candidate.name === "fm_watch_arm_pi") tools.push(candidate);
   },
-  sendUserMessage: async () => {},
+  sendMessage: async () => {},
 });
 const a = await import(pathToFileURL(process.env.PLUGIN_A).href);
 const b = await import(`${pathToFileURL(process.env.PLUGIN_B).href}?copy=b`);
@@ -998,6 +1366,64 @@ EOF
   expect_code 0 "$status" "Pi extension factories in one process/home must share one arm coordinator"
   [ -z "$out" ] || fail "Pi duplicate-factory test printed output: $out"
   pass "Pi duplicate extension factories share one attached arm child"
+}
+
+test_pi_reload_routes_wake_only_to_current_client() {
+  local repo home plugin release out status
+  repo="$TMP_ROOT/pi-reload-client-root"
+  home="$TMP_ROOT/pi-reload-client-home"
+  release="$TMP_ROOT/pi-reload-client-release"
+  mkdir -p "$repo/bin" "$home/state" "$home/config"
+  install_pi_watch_extension_fixture "$repo"
+  plugin="$repo/.pi/extensions/fm-primary-pi-watch.ts"
+  cat > "$repo/bin/fm-watch-arm.sh" <<'SH'
+#!/usr/bin/env bash
+while [ ! -f "$FM_RELEASE" ]; do sleep 0.01; done
+printf 'signal: reload client wake\n'
+SH
+  chmod +x "$repo/bin/fm-watch-arm.sh"
+  out=$(PLUGIN="$plugin" FM_HOME="$home" FM_ROOT_OVERRIDE="$repo" FM_RELEASE="$release" node --input-type=module 2>&1 <<'EOF'
+import { writeFileSync } from "node:fs";
+import { pathToFileURL } from "node:url";
+
+const oldHandlers = new Map();
+const newHandlers = new Map();
+let oldTool = null;
+let oldDeliveries = 0;
+let newDeliveries = 0;
+const oldPi = {
+  on(event, handler) { oldHandlers.set(event, handler); },
+  registerCommand() {},
+  registerTool(candidate) { if (candidate.name === "fm_watch_arm_pi") oldTool = candidate; },
+  sendMessage() { oldDeliveries += 1; },
+};
+const newPi = {
+  on(event, handler) { newHandlers.set(event, handler); },
+  registerCommand() {},
+  registerTool() {},
+  sendMessage() { newDeliveries += 1; },
+};
+writeFileSync(`${process.env.FM_HOME}/state/.lock`, `${process.pid}\n`);
+const url = pathToFileURL(process.env.PLUGIN).href;
+const oldModule = await import(`${url}?client=old`);
+oldModule.default(oldPi);
+await oldTool.execute("reload-client", {}, undefined, undefined, {});
+const newModule = await import(`${url}?client=new`);
+newModule.default(newPi);
+await oldHandlers.get("session_shutdown")?.({ type: "session_shutdown", reason: "reload" }, {});
+writeFileSync(process.env.FM_RELEASE, "release\n");
+for (let i = 0; i < 100 && newDeliveries === 0; i += 1) {
+  await new Promise((resolve) => setTimeout(resolve, 20));
+}
+if (oldDeliveries !== 0) throw new Error(`stale Pi send closure received ${oldDeliveries} wakes`);
+if (newDeliveries !== 1) throw new Error(`current Pi send closure received ${newDeliveries} wakes`);
+await newHandlers.get("session_shutdown")?.({ type: "session_shutdown", reason: "quit" }, {});
+EOF
+)
+  status=$?
+  expect_code 0 "$status" "Pi reload must retire stale send closures without stopping the shared current arm"
+  [ -z "$out" ] || fail "Pi reload-client test printed output: $out"
+  pass "Pi reload routes the shared arm wake only through the current client closure"
 }
 
 test_pi_stale_callback_cannot_clear_replacement() {
@@ -1030,7 +1456,7 @@ const pi = {
   registerTool(candidate) {
     if (candidate.name === "fm_watch_arm_pi") tool = candidate;
   },
-  sendUserMessage: async () => {
+  sendMessage: async () => {
     prompts += 1;
   },
 };
@@ -1090,7 +1516,7 @@ const pi = {
   registerTool(candidate) {
     if (candidate.name === "fm_watch_arm_pi") tool = candidate;
   },
-  sendUserMessage: async () => {},
+  sendMessage: async () => {},
 };
 writeFileSync(`${process.env.FM_HOME}/state/.lock`, `${process.pid}\n`);
 const mod = await import(pathToFileURL(process.env.PLUGIN).href);
@@ -1106,18 +1532,69 @@ EOF
   status=$?
   expect_code 0 "$status" "Pi process exit must run the watcher cleanup fallback"
   [ -z "$out" ] || fail "Pi process-exit cleanup test printed output: $out"
+  pid=$(cat "$pid_file")
   i=0
-  while [ "$i" -lt 50 ] && [ ! -f "$cleanup_log" ]; do
+  while [ "$i" -lt 50 ] && kill -0 "$pid" 2>/dev/null; do
     sleep 0.02
     i=$((i + 1))
   done
-  [ -f "$cleanup_log" ] || fail "Pi process-exit fallback did not deliver TERM to the arm child"
-  pid=$(cat "$pid_file")
   if kill -0 "$pid" 2>/dev/null; then
-    kill -TERM "$pid" 2>/dev/null || true
+    kill -KILL "$pid" 2>/dev/null || true
     fail "Pi arm child $pid survived process-exit cleanup"
   fi
   pass "Pi process-exit cleanup stops the attached arm child"
+}
+
+test_pi_0806_custom_wake_runtime_semantics() {
+  local pi_package out status
+  pi_package=$(installed_pi_package_dir)
+  [ -f "$pi_package/dist/core/agent-session.js" ] || fail "Pi 0.80.6 runtime is required for custom wake semantics coverage"
+  out=$(PI_AGENT_SESSION="$pi_package/dist/core/agent-session.js" node --input-type=module 2>&1 <<'EOF'
+import { pathToFileURL } from "node:url";
+
+const { AgentSession } = await import(pathToFileURL(process.env.PI_AGENT_SESSION).href);
+const message = {
+  customType: "firstmate-watcher-wake",
+  content: "FIRSTMATE WATCHER WAKE: signal: runtime probe",
+  display: true,
+  details: { generation: 7, kind: "actionable", reason: "signal: runtime probe" },
+};
+const options = { deliverAs: "followUp", triggerTurn: true };
+let idlePrompt = null;
+const idleSession = {
+  isStreaming: false,
+  async _runAgentPrompt(appMessage) { idlePrompt = appMessage; },
+};
+await AgentSession.prototype.sendCustomMessage.call(idleSession, message, options);
+if (!idlePrompt) throw new Error("idle custom wake did not trigger an agent turn");
+if (idlePrompt.role !== "custom" || idlePrompt.customType !== "firstmate-watcher-wake") {
+  throw new Error(`idle wake was not a custom event: ${JSON.stringify(idlePrompt)}`);
+}
+if (idlePrompt.display !== true || idlePrompt.details?.generation !== 7) {
+  throw new Error(`idle custom wake lost persisted fields: ${JSON.stringify(idlePrompt)}`);
+}
+if (idlePrompt.role === "user") throw new Error("idle wake impersonated a user message");
+
+let followUp = null;
+const streamingSession = {
+  isStreaming: true,
+  agent: {
+    followUp(appMessage) { followUp = appMessage; },
+    steer() { throw new Error("watcher wake steered an active turn"); },
+  },
+  async _runAgentPrompt() { throw new Error("streaming wake started a parallel turn"); },
+};
+await AgentSession.prototype.sendCustomMessage.call(streamingSession, message, options);
+if (!followUp || followUp.role !== "custom" || followUp.customType !== "firstmate-watcher-wake") {
+  throw new Error(`streaming wake was not queued as a custom follow-up: ${JSON.stringify(followUp)}`);
+}
+if (followUp.role === "user") throw new Error("streaming wake impersonated a user message");
+EOF
+)
+  status=$?
+  expect_code 0 "$status" "Pi 0.80.6 must trigger idle turns and queue streaming custom watcher follow-ups"
+  [ -z "$out" ] || fail "Pi runtime custom-message test printed output: $out"
+  pass "Pi 0.80.6 persists watcher wakes as custom events and triggers or queues the correct turn"
 }
 
 test_pi_live_acceptance_helper_records_isolated_evidence() {
@@ -1611,6 +2088,7 @@ EOF
 test_tracked_extension_present_and_self_hashing
 test_pi_extension_supervises_only_primary_or_secondmate_homes
 test_pi_live_lab_cleanup_is_owned
+test_pi_detached_launch_helper_preserves_exact_argv
 test_spawn_template_mentions_pi_watch_placeholder
 test_pi_extension_reports_external_healthy_watcher
 test_pi_tool_returns_agent_tool_result
@@ -1622,11 +2100,18 @@ test_session_lock_reclaim_has_one_atomic_winner
 test_pi_process_exit_cleanup_listener_lifecycle
 test_pi_session_shutdown_suppresses_intentional_exit
 test_pi_session_shutdown_cancels_pending_lock_claim
+test_pi_custom_wake_is_structured_and_not_user_authored
 test_pi_unexpected_actionable_exit_notifies_once
 test_pi_unexpected_signaled_exit_notifies_once
+test_pi_spawn_error_then_close_notifies_once
+test_pi_unexpected_empty_exit_notifies_once
+test_pi_actionable_streams_deliver_once_and_capture_is_bounded
+test_pi_session_shutdown_kills_entire_process_group
 test_pi_duplicate_factories_share_one_arm
+test_pi_reload_routes_wake_only_to_current_client
 test_pi_stale_callback_cannot_clear_replacement
 test_pi_process_exit_cleanup_stops_arm_child
+test_pi_0806_custom_wake_runtime_semantics
 test_pi_live_acceptance_helper_records_isolated_evidence
 test_opencode_primary_watch_plugin_static_wiring
 test_opencode_primary_watch_plugin_uses_effective_state_home

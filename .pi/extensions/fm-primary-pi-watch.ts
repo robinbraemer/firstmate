@@ -14,6 +14,25 @@ type ArmResult = {
 
 type LockOwnership = "owned" | "missing" | "other";
 type CoordinatorState = "idle" | "starting" | "running" | "stopping";
+type WakeKind = "actionable" | "failure";
+
+type WakeDetails = {
+  generation: number;
+  kind: WakeKind;
+  reason: string;
+  exitCode: number | null;
+  signal: NodeJS.Signals | null;
+  truncated: boolean;
+  stdoutTruncated: boolean;
+  stderrTruncated: boolean;
+};
+
+type WakeSender = (message: string, details: WakeDetails) => Promise<void>;
+
+type CompletedCapture = {
+  stdout: string;
+  stderr: string;
+};
 
 type ArmRecord = {
   child: ChildProcess;
@@ -24,17 +43,23 @@ type ArmRecord = {
   resolveCompletion: () => void;
   stdout: string;
   stderr: string;
-  sendWake: (message: string) => Promise<void>;
+  stdoutPending: string;
+  stderrPending: string;
+  stdoutTruncated: boolean;
+  stderrTruncated: boolean;
+  actionable: string;
+  failureHint: string;
 };
 
 type ArmCoordinator = {
   current: ArmRecord | null;
+  lastCompleted: CompletedCapture | null;
   generation: number;
   sequence: number;
   state: CoordinatorState;
   startPromise: Promise<ArmResult> | null;
   startCancelled: boolean;
-  clients: Set<symbol>;
+  clients: Map<symbol, WakeSender>;
   exitListener?: () => void;
 };
 
@@ -53,12 +78,22 @@ const armScript = `${fmRoot}/bin/fm-watch-arm.sh`;
 const lockScript = `${fmRoot}/bin/fm-lock.sh`;
 const marker = `${state}/.pi-watch-extension-loaded`;
 const extensionVersion = `sha256:${createHash("sha256").update(readFileSync(extensionFile)).digest("hex")}`;
+const MAX_CAPTURE_BYTES = 16 * 1024;
+const MAX_PENDING_LINE_BYTES = 4 * 1024;
+const requestedStopGrace = Number(process.env.FM_PI_WATCH_STOP_GRACE_MS ?? "1000");
+const STOP_GRACE_MS = Number.isFinite(requestedStopGrace) && requestedStopGrace >= 0 ? requestedStopGrace : 1000;
+const STOP_KILL_GRACE_MS = 500;
 const coordinatorHost = globalThis as CoordinatorHost;
 const coordinators = coordinatorHost.__firstmatePiWatchCoordinators ??= new Map<string, ArmCoordinator>();
 
 function supervisingHome(): boolean {
   if (existsSync(`${root}/.fm-secondmate-home`)) return true;
   if (!existsSync(`${root}/AGENTS.md`) || !existsSync(`${root}/bin`)) return false;
+  try {
+    if (realpathSync(fmHome) === root) return true;
+  } catch {
+    return false;
+  }
   const gitDir = spawnSync("git", ["-C", root, "rev-parse", "--git-dir"], { encoding: "utf8" });
   const commonDir = spawnSync("git", ["-C", root, "rev-parse", "--git-common-dir"], { encoding: "utf8" });
   if (gitDir.status !== 0 || commonDir.status !== 0) return false;
@@ -70,12 +105,13 @@ function coordinatorForHome(): ArmCoordinator {
   if (existing) return existing;
   const coordinator: ArmCoordinator = {
     current: null,
+    lastCompleted: null,
     generation: 0,
     sequence: 0,
     state: "idle",
     startPromise: null,
     startCancelled: false,
-    clients: new Set<symbol>(),
+    clients: new Map<symbol, WakeSender>(),
   };
   coordinators.set(fmHome, coordinator);
   return coordinator;
@@ -142,25 +178,57 @@ function markLoaded(): void {
   writeFileSync(marker, `${extensionVersion}\n${process.pid}\n`);
 }
 
-function actionableLine(output: string): string {
-  const lines = output.split(/\r?\n/);
-  return lines.find((line) => /^(signal:|stale:|check:|heartbeat($|:))/.test(line)) || "";
+function actionableLine(line: string): string {
+  return /^(signal:|stale:|check:|heartbeat($|:))/.test(line) ? line : "";
 }
 
-function failureLine(
-  stdout: string,
-  stderr: string,
-  code: number | null,
-  signal: NodeJS.Signals | null,
-): string {
-  const combined = `${stdout}\n${stderr}`.trim();
-  const healthy = combined.split(/\r?\n/).find((line) => /^watcher: healthy\b/.test(line));
-  if (healthy) return `watcher: FAILED - Pi extension arm child found an external healthy watcher instead of owning wake delivery\n${healthy}`;
-  const failed = combined.split(/\r?\n/).find((line) => /^watcher: FAILED/.test(line));
-  if (failed) return failed;
+function appendBoundedTail(current: string, text: string): { value: string; truncated: boolean } {
+  const combined = Buffer.from(current + text);
+  if (combined.byteLength <= MAX_CAPTURE_BYTES) return { value: combined.toString(), truncated: false };
+  return {
+    value: combined.subarray(combined.byteLength - MAX_CAPTURE_BYTES).toString(),
+    truncated: true,
+  };
+}
+
+function inspectOutputLine(record: ArmRecord, line: string): void {
+  const lineBuffer = Buffer.from(line);
+  const boundedLine = lineBuffer.byteLength > MAX_PENDING_LINE_BYTES
+    ? lineBuffer.subarray(0, MAX_PENDING_LINE_BYTES).toString()
+    : line;
+  if (!record.actionable) record.actionable = actionableLine(boundedLine);
+  if (!record.failureHint && (/^watcher: healthy\b/.test(boundedLine) || /^watcher: FAILED/.test(boundedLine))) {
+    record.failureHint = boundedLine;
+  }
+}
+
+function captureOutput(record: ArmRecord, stream: "stdout" | "stderr", chunk: Buffer): void {
+  const text = chunk.toString();
+  const tail = appendBoundedTail(record[stream], text);
+  record[stream] = tail.value;
+  const truncatedKey = stream === "stdout" ? "stdoutTruncated" : "stderrTruncated";
+  record[truncatedKey] ||= tail.truncated;
+
+  const pendingKey = stream === "stdout" ? "stdoutPending" : "stderrPending";
+  const lines = `${record[pendingKey]}${text}`.split(/\r?\n/);
+  record[pendingKey] = lines.pop() ?? "";
+  for (const line of lines) inspectOutputLine(record, line);
+  if (Buffer.byteLength(record[pendingKey]) > MAX_PENDING_LINE_BYTES) {
+    inspectOutputLine(record, record[pendingKey]);
+    record[pendingKey] = Buffer.from(record[pendingKey]).subarray(0, MAX_PENDING_LINE_BYTES).toString();
+    record[truncatedKey] = true;
+  }
+}
+
+function failureLine(record: ArmRecord, code: number | null, signal: NodeJS.Signals | null): string {
+  const combined = `${record.stdout}\n${record.stderr}`.trim();
+  if (/^watcher: healthy\b/.test(record.failureHint)) {
+    return `watcher: FAILED - Pi extension arm child found an external healthy watcher instead of owning wake delivery\n${record.failureHint}`;
+  }
+  if (/^watcher: FAILED/.test(record.failureHint)) return record.failureHint;
   if (signal) return `watcher: FAILED - fm-watch-arm.sh terminated by ${signal}${combined ? `\n${combined}` : ""}`;
-  if (code && code !== 0) return `watcher: FAILED - fm-watch-arm.sh exited ${code}${combined ? `\n${combined}` : ""}`;
-  return "";
+  if (code !== null && code !== 0) return `watcher: FAILED - fm-watch-arm.sh exited ${code}${combined ? `\n${combined}` : ""}`;
+  return `watcher: FAILED - fm-watch-arm.sh exited unexpectedly with code ${code ?? "unknown"}${combined ? `\n${combined}` : ""}`;
 }
 
 function settleArm(
@@ -172,32 +240,88 @@ function settleArm(
 ): void {
   if (record.settled) return;
   record.settled = true;
+  inspectOutputLine(record, record.stdoutPending);
+  inspectOutputLine(record, record.stderrPending);
   const ownsGeneration = coordinator.current === record && coordinator.generation === record.generation;
   if (ownsGeneration) {
     coordinator.current = null;
+    coordinator.lastCompleted = { stdout: record.stdout, stderr: record.stderr };
     coordinator.state = "idle";
   }
   record.resolveCompletion();
   if (!ownsGeneration || record.intentionalStopReason) return;
 
-  const reason = error
+  const message = error
     ? `watcher: FAILED - Pi extension arm child ${record.generation} failed: ${error.message}`
-    : actionableLine(`${record.stdout}\n${record.stderr}`);
-  const failure = reason || error ? "" : failureLine(record.stdout, record.stderr, code, signal);
-  const message = reason || failure;
-  if (!message) return;
-  void record.sendWake(message).catch(() => {
+    : record.actionable || failureLine(record, code, signal);
+  const kind: WakeKind = record.actionable && !error ? "actionable" : "failure";
+  const details: WakeDetails = {
+    generation: record.generation,
+    kind,
+    reason: message,
+    exitCode: code,
+    signal,
+    truncated: record.stdoutTruncated || record.stderrTruncated,
+    stdoutTruncated: record.stdoutTruncated,
+    stderrTruncated: record.stderrTruncated,
+  };
+  const sendWake = [...coordinator.clients.values()].at(-1);
+  if (!sendWake) return;
+  void sendWake(message, details).catch(() => {
     // Pi owns delivery errors; fail open so the extension never wedges the session.
   });
 }
 
-function stopArm(coordinator: ArmCoordinator, reason: string): Promise<void> {
+function signalArm(record: ArmRecord, signal: NodeJS.Signals): void {
+  const pid = record.child.pid;
+  if (pid) {
+    try {
+      process.kill(-pid, signal);
+      return;
+    } catch {
+      // Fall back to the direct child only when group signaling is unavailable.
+    }
+  }
+  try {
+    record.child.kill(signal);
+  } catch {
+    // The process may already be gone; settlement remains event-driven or bounded below.
+  }
+}
+
+function settlesWithin(record: ArmRecord, milliseconds: number): Promise<boolean> {
+  return new Promise<boolean>((resolvePromise) => {
+    let settled = false;
+    const finish = (result: boolean) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      resolvePromise(result);
+    };
+    const timer = setTimeout(() => finish(false), milliseconds);
+    timer.unref();
+    void record.completion.then(() => finish(true));
+  });
+}
+
+async function stopArm(coordinator: ArmCoordinator, reason: string): Promise<void> {
   const record = coordinator.current;
-  if (!record) return Promise.resolve();
+  if (!record) return;
   if (!record.intentionalStopReason) record.intentionalStopReason = reason;
   if (coordinator.current === record) coordinator.state = "stopping";
-  record.child.kill("SIGTERM");
-  return record.completion;
+  signalArm(record, "SIGTERM");
+  if (await settlesWithin(record, STOP_GRACE_MS)) return;
+  signalArm(record, "SIGKILL");
+  if (await settlesWithin(record, STOP_KILL_GRACE_MS)) return;
+  settleArm(coordinator, record, null, "SIGKILL");
+}
+
+function stopArmOnProcessExit(coordinator: ArmCoordinator): void {
+  const record = coordinator.current;
+  if (!record) return;
+  if (!record.intentionalStopReason) record.intentionalStopReason = "process-exit";
+  signalArm(record, "SIGTERM");
+  signalArm(record, "SIGKILL");
 }
 
 function runPretoolCheck(command: string): Promise<{ code: number; stderr: string }> {
@@ -218,21 +342,27 @@ export default function (pi: ExtensionAPI) {
   if (!supervisingHome()) return;
   const coordinator = coordinatorForHome();
   const client = Symbol("pi-watch-extension-client");
-  coordinator.clients.add(client);
+
+  async function sendWake(message: string, details: WakeDetails): Promise<void> {
+    pi.sendMessage(
+      {
+        customType: "firstmate-watcher-wake",
+        content: `FIRSTMATE WATCHER WAKE: ${message}\n\nRun bin/fm-wake-drain.sh first, handle the queued wake, then resume Pi supervision.`,
+        display: true,
+        details,
+      },
+      { deliverAs: "followUp", triggerTurn: true },
+    );
+  }
+
+  coordinator.clients.set(client, sendWake);
 
   const cleanupOnProcessExit = () => {
-    void stopArm(coordinator, "process-exit");
+    stopArmOnProcessExit(coordinator);
   };
   if (!coordinator.exitListener) {
     coordinator.exitListener = cleanupOnProcessExit;
     process.once("exit", cleanupOnProcessExit);
-  }
-
-  async function sendWake(message: string): Promise<void> {
-    await pi.sendUserMessage(
-      `FIRSTMATE WATCHER WAKE: ${message}\n\nRun bin/fm-wake-drain.sh first, handle the queued wake, then resume Pi supervision.`,
-      { deliverAs: "followUp" },
-    );
   }
 
   async function startArmOnce(): Promise<ArmResult> {
@@ -256,6 +386,7 @@ export default function (pi: ExtensionAPI) {
     const child = spawn("bash", ["-lc", "config_dir=\"${FM_CONFIG_OVERRIDE:-$FM_HOME/config}\"; [ -f \"$config_dir/x-mode.env\" ] && . \"$config_dir/x-mode.env\"; exec \"$FM_WATCH_ARM_SCRIPT\" --restart"], {
       cwd: fmRoot,
       env,
+      detached: true,
       stdio: ["ignore", "pipe", "pipe"],
     });
     let resolveCompletion = () => {};
@@ -271,15 +402,20 @@ export default function (pi: ExtensionAPI) {
       resolveCompletion,
       stdout: "",
       stderr: "",
-      sendWake,
+      stdoutPending: "",
+      stderrPending: "",
+      stdoutTruncated: false,
+      stderrTruncated: false,
+      actionable: "",
+      failureHint: "",
     };
     coordinator.current = record;
     coordinator.state = "running";
     child.stdout?.on("data", (chunk: Buffer) => {
-      record.stdout += chunk.toString();
+      captureOutput(record, "stdout", chunk);
     });
     child.stderr?.on("data", (chunk: Buffer) => {
-      record.stderr += chunk.toString();
+      captureOutput(record, "stderr", chunk);
     });
     child.on("close", (code: number | null, signal: NodeJS.Signals | null) => {
       settleArm(coordinator, record, code, signal);
