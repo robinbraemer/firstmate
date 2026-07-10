@@ -1,5 +1,5 @@
 // Firstmate primary watcher bridge for Pi.
-import { spawn, spawnSync } from "node:child_process";
+import { spawn, spawnSync, type ChildProcess } from "node:child_process";
 import { createHash } from "node:crypto";
 import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { dirname, resolve } from "node:path";
@@ -13,20 +13,59 @@ type ArmResult = {
 };
 
 type LockOwnership = "owned" | "missing" | "other";
+type CoordinatorState = "idle" | "starting" | "running" | "stopping";
+
+type ArmRecord = {
+  child: ChildProcess;
+  generation: number;
+  intentionalStopReason: string;
+  settled: boolean;
+  completion: Promise<void>;
+  resolveCompletion: () => void;
+  stdout: string;
+  stderr: string;
+  sendWake: (message: string) => Promise<void>;
+};
+
+type ArmCoordinator = {
+  current: ArmRecord | null;
+  generation: number;
+  sequence: number;
+  state: CoordinatorState;
+  clients: Set<symbol>;
+  exitListener?: () => void;
+};
+
+type CoordinatorHost = typeof globalThis & {
+  __firstmatePiWatchCoordinators?: Map<string, ArmCoordinator>;
+};
 
 const extensionFile = fileURLToPath(import.meta.url);
 const extensionDir = dirname(extensionFile);
 const root = resolve(extensionDir, "../..");
-const fmHome = process.env.FM_HOME || process.env.FM_ROOT_OVERRIDE || root;
-const fmRoot = process.env.FM_ROOT_OVERRIDE || root;
+const fmHome = resolve(process.env.FM_HOME || process.env.FM_ROOT_OVERRIDE || root);
+const fmRoot = resolve(process.env.FM_ROOT_OVERRIDE || root);
 const state = process.env.FM_STATE_OVERRIDE || `${fmHome}/state`;
 const config = process.env.FM_CONFIG_OVERRIDE || `${fmHome}/config`;
 const armScript = `${fmRoot}/bin/fm-watch-arm.sh`;
 const marker = `${state}/.pi-watch-extension-loaded`;
 const extensionVersion = `sha256:${createHash("sha256").update(readFileSync(extensionFile)).digest("hex")}`;
+const coordinatorHost = globalThis as CoordinatorHost;
+const coordinators = coordinatorHost.__firstmatePiWatchCoordinators ??= new Map<string, ArmCoordinator>();
 
-let child: any = null;
-let seq = 0;
+function coordinatorForHome(): ArmCoordinator {
+  const existing = coordinators.get(fmHome);
+  if (existing) return existing;
+  const coordinator: ArmCoordinator = {
+    current: null,
+    generation: 0,
+    sequence: 0,
+    state: "idle",
+    clients: new Set<symbol>(),
+  };
+  coordinators.set(fmHome, coordinator);
+  return coordinator;
+}
 
 function parentPid(pid: string): string {
   const result = spawnSync("ps", ["-o", "ppid=", "-p", pid], { encoding: "utf8" });
@@ -85,18 +124,56 @@ function failureLine(stdout: string, stderr: string, code: number | null): strin
   return "";
 }
 
-export default function (pi: ExtensionAPI) {
-  function stopArm(): void {
-    if (child) child.kill("SIGTERM");
-    child = null;
+function settleArm(
+  coordinator: ArmCoordinator,
+  record: ArmRecord,
+  code: number | null,
+  error?: Error,
+): void {
+  if (record.settled) return;
+  record.settled = true;
+  const ownsGeneration = coordinator.current === record && coordinator.generation === record.generation;
+  if (ownsGeneration) {
+    coordinator.current = null;
+    coordinator.state = "idle";
   }
+  record.resolveCompletion();
+  if (!ownsGeneration || record.intentionalStopReason) return;
+
+  const reason = error
+    ? `watcher: FAILED - Pi extension arm child ${record.generation} failed: ${error.message}`
+    : actionableLine(`${record.stdout}\n${record.stderr}`);
+  const failure = reason || error ? "" : failureLine(record.stdout, record.stderr, code);
+  const message = reason || failure;
+  if (!message) return;
+  void record.sendWake(message).catch(() => {
+    // Pi owns delivery errors; fail open so the extension never wedges the session.
+  });
+}
+
+function stopArm(coordinator: ArmCoordinator, reason: string): Promise<void> {
+  const record = coordinator.current;
+  if (!record) return Promise.resolve();
+  if (!record.intentionalStopReason) record.intentionalStopReason = reason;
+  if (coordinator.current === record) coordinator.state = "stopping";
+  record.child.kill("SIGTERM");
+  return record.completion;
+}
+
+export default function (pi: ExtensionAPI) {
+  const coordinator = coordinatorForHome();
+  const client = Symbol("pi-watch-extension-client");
+  coordinator.clients.add(client);
 
   const cleanupOnProcessExit = () => {
-    stopArm();
+    void stopArm(coordinator, "process-exit");
   };
-  process.once("exit", cleanupOnProcessExit);
+  if (!coordinator.exitListener) {
+    coordinator.exitListener = cleanupOnProcessExit;
+    process.once("exit", cleanupOnProcessExit);
+  }
 
-  async function sendWake(message: string) {
+  async function sendWake(message: string): Promise<void> {
     await pi.sendUserMessage(
       `FIRSTMATE WATCHER WAKE: ${message}\n\nRun bin/fm-wake-drain.sh first, handle the queued wake, then resume Pi supervision.`,
       { deliverAs: "followUp" },
@@ -106,8 +183,10 @@ export default function (pi: ExtensionAPI) {
   function startArm(): ArmResult {
     if (!sessionOwnsLock()) return { ok: false, message: "watcher: read-only - session lock is held by another firstmate session" };
     markLoaded();
-    if (child) return { ok: true, message: "watcher: healthy - Pi extension already has an arm child" };
-    const id = ++seq;
+    if (coordinator.current) return { ok: true, message: "watcher: healthy - Pi extension already has an arm child" };
+
+    const id = ++coordinator.sequence;
+    const generation = ++coordinator.generation;
     const env = {
       ...process.env,
       FM_HOME: fmHome,
@@ -115,37 +194,40 @@ export default function (pi: ExtensionAPI) {
       FM_CONFIG_OVERRIDE: config,
       FM_WATCH_ARM_SCRIPT: armScript,
     };
-    child = spawn("bash", ["-lc", "config_dir=\"${FM_CONFIG_OVERRIDE:-$FM_HOME/config}\"; [ -f \"$config_dir/x-mode.env\" ] && . \"$config_dir/x-mode.env\"; exec \"$FM_WATCH_ARM_SCRIPT\" --restart"], {
+    coordinator.state = "starting";
+    const child = spawn("bash", ["-lc", "config_dir=\"${FM_CONFIG_OVERRIDE:-$FM_HOME/config}\"; [ -f \"$config_dir/x-mode.env\" ] && . \"$config_dir/x-mode.env\"; exec \"$FM_WATCH_ARM_SCRIPT\" --restart"], {
       cwd: fmRoot,
       env,
       stdio: ["ignore", "pipe", "pipe"],
     });
-    let stdout = "";
-    let stderr = "";
-    child.stdout.on("data", (chunk: Buffer) => {
-      stdout += chunk.toString();
+    let resolveCompletion = () => {};
+    const completion = new Promise<void>((resolvePromise) => {
+      resolveCompletion = resolvePromise;
     });
-    child.stderr.on("data", (chunk: Buffer) => {
-      stderr += chunk.toString();
+    const record: ArmRecord = {
+      child,
+      generation,
+      intentionalStopReason: "",
+      settled: false,
+      completion,
+      resolveCompletion,
+      stdout: "",
+      stderr: "",
+      sendWake,
+    };
+    coordinator.current = record;
+    coordinator.state = "running";
+    child.stdout?.on("data", (chunk: Buffer) => {
+      record.stdout += chunk.toString();
     });
-    child.on("close", async (code: number | null) => {
-      child = null;
-      const reason = actionableLine(`${stdout}\n${stderr}`);
-      const failure = reason ? "" : failureLine(stdout, stderr, code);
-      if (!reason && !failure) return;
-      try {
-        await sendWake(reason || failure);
-      } catch {
-        // Pi owns delivery errors; fail open so the extension never wedges the session.
-      }
+    child.stderr?.on("data", (chunk: Buffer) => {
+      record.stderr += chunk.toString();
     });
-    child.on("error", async (error: Error) => {
-      child = null;
-      try {
-        await sendWake(`watcher: FAILED - Pi extension arm child ${id} failed: ${error.message}`);
-      } catch {
-        // Fail open.
-      }
+    child.on("close", (code: number | null) => {
+      settleArm(coordinator, record, code);
+    });
+    child.on("error", (error: Error) => {
+      settleArm(coordinator, record, null, error);
     });
     return { ok: true, message: `watcher: started Pi extension arm child ${id}` };
   }
@@ -153,9 +235,14 @@ export default function (pi: ExtensionAPI) {
   pi.on?.("session_start", () => {
     markLoaded();
   });
-  pi.on?.("session_shutdown", () => {
-    stopArm();
-    process.off("exit", cleanupOnProcessExit);
+  pi.on?.("session_shutdown", async () => {
+    coordinator.clients.delete(client);
+    if (coordinator.clients.size > 0) return;
+    await stopArm(coordinator, "session-shutdown");
+    if (coordinator.clients.size === 0 && coordinator.exitListener) {
+      process.off("exit", coordinator.exitListener);
+      coordinator.exitListener = undefined;
+    }
   });
 
   pi.registerCommand?.("fm-watch-arm-pi", {

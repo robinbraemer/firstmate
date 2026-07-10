@@ -136,22 +136,51 @@ fm_backend_tmux_current_command() {  # <target>
   tmux display-message -p -t "$1" '#{pane_current_command}' 2>/dev/null
 }
 
+# fm_backend_tmux_pi_process_alive: inspect a node-reported pane's exact
+# foreground process rather than treating generic `node` as Pi. tmux gives us
+# the pane shell pid; ps gives that tty's foreground process-group leader and
+# its command/argv. Return success only for the two Pi 0.80.6 shapes verified
+# on macOS and Linux-style installs: argv0/comm both identify `pi`, or node is
+# executing @earendil-works/pi-coding-agent's dist/cli.js entrypoint.
+fm_backend_tmux_pi_process_alive() {  # <target>
+  local target=$1 pane_pid foreground_pid comm args argv0 comm_base argv_base
+  pane_pid=$(tmux display-message -p -t "$target" '#{pane_pid}' 2>/dev/null) || return 1
+  pane_pid=$(printf '%s' "$pane_pid" | tr -d '[:space:]')
+  case "$pane_pid" in ''|*[!0-9]*) return 1 ;; esac
+
+  foreground_pid=$(ps -o tpgid= -p "$pane_pid" 2>/dev/null) || return 1
+  foreground_pid=$(printf '%s' "$foreground_pid" | tr -d '[:space:]')
+  case "$foreground_pid" in ''|*[!0-9]*) return 1 ;; esac
+
+  comm=$(ps -o comm= -p "$foreground_pid" 2>/dev/null) || return 1
+  args=$(ps -o args= -p "$foreground_pid" 2>/dev/null) || return 1
+  comm=${comm#-}
+  comm_base=${comm##*/}
+  args=${args#"${args%%[![:space:]]*}"}
+  argv0=${args%%[[:space:]]*}
+  argv_base=${argv0##*/}
+  if [ "$comm_base" = pi ] && [ "$argv_base" = pi ]; then
+    return 0
+  fi
+  case "$comm_base:$args" in
+    node*:*/@earendil-works/pi-coding-agent/dist/cli.js*) return 0 ;;
+  esac
+  return 1
+}
+
 # fm_backend_tmux_agent_alive: CONFIDENT liveness of a live harness-agent
 # PROCESS in <target>'s pane, distinct from fm_backend_target_exists's
 # pane-PRESENCE-only check (a pane that still exists but is sitting at a bare
 # idle shell passes THAT check as "alive" - the secondmate-liveness gap
 # AGENTS.md's session-start guarantee closes). See docs/tmux-backend.md
 # "Agent liveness probe" for the empirical basis. Prints one of:
-#   alive   - the foreground command is one of the verified harness binaries
-#             (claude, codex, opencode, grok - each confirmed to run as its
-#             own process name, never wrapped by a generic interpreter).
+#   alive   - the foreground command is one of the verified harness binaries,
+#             or a node-reported pane's exact foreground process matches the
+#             verified Pi CLI command/entrypoint shape above.
 #   dead    - the foreground command is a bare shell: nothing is running in
 #             the pane, so a prior agent process has exited.
-#   unknown - anything else, INCLUDING a bare "node"/"python" interpreter
-#             name (pi's own launcher execs into a generic "node" process
-#             with no reliable way to attribute it back to pi from outside
-#             the pane - docs/tmux-backend.md "Known gaps"), or an unreadable
-#             pane. Callers must never treat unknown as a confirmed-dead
+#   unknown - anything else, INCLUDING an unverified bare node/python process
+#             or an unreadable pane. Callers must never treat unknown as a confirmed-dead
 #             signal (bin/fm-bootstrap.sh's secondmate-liveness sweep gates a
 #             respawn on `dead` only).
 fm_backend_tmux_agent_alive() {  # <target>
@@ -161,6 +190,8 @@ fm_backend_tmux_agent_alive() {  # <target>
   case "$comm" in
     '') printf 'unknown' ;;
     *claude*|*codex*|*opencode*|*grok*) printf 'alive' ;;
+    node)
+      if fm_backend_tmux_pi_process_alive "$target"; then printf 'alive'; else printf 'unknown'; fi ;;
     zsh|bash|sh|dash|ash|ksh|mksh|tcsh|csh|fish) printf 'dead' ;;
     *) printf 'unknown' ;;
   esac
