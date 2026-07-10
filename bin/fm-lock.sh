@@ -15,6 +15,7 @@ FM_HOME="${FM_HOME:-${FM_ROOT_OVERRIDE:-$FM_ROOT}}"
 STATE="${FM_STATE_OVERRIDE:-$FM_HOME/state}"
 LOCK="$STATE/.lock"
 LOCK_MUTEX="$STATE/.lock.acquire"
+LOCK_MUTEX_STALE_AFTER=10
 mkdir -p "$STATE"
 
 # shellcheck source=bin/fm-wake-lib.sh
@@ -71,7 +72,7 @@ if [ "${1:-}" = "status" ]; then
 fi
 
 me=$(harness_pid) || { echo "error: cannot locate harness process in ancestry" >&2; exit 1; }
-if ! fm_lock_try_acquire "$LOCK_MUTEX"; then
+if ! fm_lock_try_acquire "$LOCK_MUTEX" "$LOCK_MUTEX_STALE_AFTER"; then
   echo "error: another session lock acquisition is in progress; retry before mutating fleet state" >&2
   exit 1
 fi
