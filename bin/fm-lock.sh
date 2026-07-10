@@ -18,18 +18,29 @@ mkdir -p "$STATE"
 # shellcheck source=bin/fm-wake-lib.sh
 . "$SCRIPT_DIR/fm-wake-lib.sh"
 
-# Known harness command names; extend when a new adapter is verified.
-HARNESS_RE='claude|codex|opencode|grok|^pi$'
+HARNESS_RE='claude|codex|opencode|grok'
 
 process_is_harness() {
-  local pid=$1 comm args
+  local pid=$1 comm args argv0 comm_base argv_base
   comm=$(ps -o comm= -p "$pid" 2>/dev/null) || return 1
-  args=$(ps -o args= -p "$pid" 2>/dev/null)
-  if printf '%s' "$(basename "$comm")" | grep -qE "$HARNESS_RE"; then
+  args=$(ps -o args= -p "$pid" 2>/dev/null) || return 1
+  comm=${comm#-}
+  comm_base=${comm##*/}
+  args=${args#"${args%%[![:space:]]*}"}
+  argv0=${args%%[[:space:]]*}
+  argv_base=${argv0##*/}
+  if printf '%s' "$comm_base" | grep -qE "$HARNESS_RE"; then
     return 0
   fi
-  case "$comm" in
-    *node*|*python*) printf '%s' "$args" | grep -qE "$HARNESS_RE" ;;
+  case "$comm_base" in
+    pi) [ "$argv_base" = pi ] ;;
+    node*)
+      if printf '%s\n' "$args" | grep -qE '(^|[[:space:]])[^[:space:]]*/@earendil-works/pi-coding-agent/dist/cli\.js([[:space:]]|$)'; then
+        return 0
+      fi
+      printf '%s' "$args" | grep -qE "$HARNESS_RE"
+      ;;
+    python*) printf '%s' "$args" | grep -qE "$HARNESS_RE" ;;
     *) return 1 ;;
   esac
 }

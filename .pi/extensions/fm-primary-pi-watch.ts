@@ -136,12 +136,18 @@ function actionableLine(output: string): string {
   return lines.find((line) => /^(signal:|stale:|check:|heartbeat($|:))/.test(line)) || "";
 }
 
-function failureLine(stdout: string, stderr: string, code: number | null): string {
+function failureLine(
+  stdout: string,
+  stderr: string,
+  code: number | null,
+  signal: NodeJS.Signals | null,
+): string {
   const combined = `${stdout}\n${stderr}`.trim();
   const healthy = combined.split(/\r?\n/).find((line) => /^watcher: healthy\b/.test(line));
   if (healthy) return `watcher: FAILED - Pi extension arm child found an external healthy watcher instead of owning wake delivery\n${healthy}`;
   const failed = combined.split(/\r?\n/).find((line) => /^watcher: FAILED/.test(line));
   if (failed) return failed;
+  if (signal) return `watcher: FAILED - fm-watch-arm.sh terminated by ${signal}${combined ? `\n${combined}` : ""}`;
   if (code && code !== 0) return `watcher: FAILED - fm-watch-arm.sh exited ${code}${combined ? `\n${combined}` : ""}`;
   return "";
 }
@@ -150,6 +156,7 @@ function settleArm(
   coordinator: ArmCoordinator,
   record: ArmRecord,
   code: number | null,
+  signal: NodeJS.Signals | null,
   error?: Error,
 ): void {
   if (record.settled) return;
@@ -165,7 +172,7 @@ function settleArm(
   const reason = error
     ? `watcher: FAILED - Pi extension arm child ${record.generation} failed: ${error.message}`
     : actionableLine(`${record.stdout}\n${record.stderr}`);
-  const failure = reason || error ? "" : failureLine(record.stdout, record.stderr, code);
+  const failure = reason || error ? "" : failureLine(record.stdout, record.stderr, code, signal);
   const message = reason || failure;
   if (!message) return;
   void record.sendWake(message).catch(() => {
@@ -245,11 +252,11 @@ export default function (pi: ExtensionAPI) {
     child.stderr?.on("data", (chunk: Buffer) => {
       record.stderr += chunk.toString();
     });
-    child.on("close", (code: number | null) => {
-      settleArm(coordinator, record, code);
+    child.on("close", (code: number | null, signal: NodeJS.Signals | null) => {
+      settleArm(coordinator, record, code, signal);
     });
     child.on("error", (error: Error) => {
-      settleArm(coordinator, record, null, error);
+      settleArm(coordinator, record, null, null, error);
     });
     return { ok: true, message: `watcher: started Pi extension arm child ${id}` };
   }
