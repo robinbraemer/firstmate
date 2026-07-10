@@ -32,6 +32,7 @@ type ArmCoordinator = {
   generation: number;
   sequence: number;
   state: CoordinatorState;
+  startPromise: Promise<ArmResult> | null;
   clients: Set<symbol>;
   exitListener?: () => void;
 };
@@ -62,6 +63,7 @@ function coordinatorForHome(): ArmCoordinator {
     generation: 0,
     sequence: 0,
     state: "idle",
+    startPromise: null,
     clients: new Set<symbol>(),
   };
   coordinators.set(fmHome, coordinator);
@@ -100,7 +102,7 @@ function lockOwnership(): LockOwnership {
   return pidAlive(lockPid) ? "other" : "missing";
 }
 
-function recoverMissingLock(): Promise<void> {
+function claimSessionLock(): Promise<void> {
   return new Promise((resolvePromise) => {
     const child = spawn(lockScript, [], {
       cwd: fmRoot,
@@ -200,10 +202,8 @@ export default function (pi: ExtensionAPI) {
     );
   }
 
-  async function startArm(): Promise<ArmResult> {
-    const ownership = lockOwnership();
-    if (ownership === "other") return { ok: false, message: "watcher: read-only - session lock is held by another firstmate session" };
-    if (ownership === "missing") await recoverMissingLock();
+  async function startArmOnce(): Promise<ArmResult> {
+    if (lockOwnership() !== "owned") await claimSessionLock();
     if (lockOwnership() !== "owned") return { ok: false, message: "watcher: read-only - session lock is held by another firstmate session" };
     markLoaded();
     if (coordinator.current) return { ok: true, message: "watcher: healthy - Pi extension already has an arm child" };
@@ -217,7 +217,6 @@ export default function (pi: ExtensionAPI) {
       FM_CONFIG_OVERRIDE: config,
       FM_WATCH_ARM_SCRIPT: armScript,
     };
-    coordinator.state = "starting";
     const child = spawn("bash", ["-lc", "config_dir=\"${FM_CONFIG_OVERRIDE:-$FM_HOME/config}\"; [ -f \"$config_dir/x-mode.env\" ] && . \"$config_dir/x-mode.env\"; exec \"$FM_WATCH_ARM_SCRIPT\" --restart"], {
       cwd: fmRoot,
       env,
@@ -253,6 +252,19 @@ export default function (pi: ExtensionAPI) {
       settleArm(coordinator, record, null, error);
     });
     return { ok: true, message: `watcher: started Pi extension arm child ${id}` };
+  }
+
+  function startArm(): Promise<ArmResult> {
+    if (coordinator.startPromise) return coordinator.startPromise;
+    coordinator.state = "starting";
+    let startPromise: Promise<ArmResult>;
+    startPromise = startArmOnce().finally(() => {
+      if (coordinator.startPromise !== startPromise) return;
+      coordinator.startPromise = null;
+      coordinator.state = coordinator.current ? "running" : "idle";
+    });
+    coordinator.startPromise = startPromise;
+    return startPromise;
   }
 
   pi.on?.("session_start", () => {

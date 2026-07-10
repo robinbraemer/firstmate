@@ -21,7 +21,11 @@ if [ "$actual_commit" != "$CANDIDATE_COMMIT" ]; then
 fi
 
 file_epoch() {
-  stat -f %m "$1" 2>/dev/null || stat -c %Y "$1" 2>/dev/null || printf 'unknown'
+  if [ "$(uname)" = Darwin ]; then
+    stat -f %m "$1" 2>/dev/null || printf 'unknown'
+  else
+    stat -c %Y "$1" 2>/dev/null || printf 'unknown'
+  fi
 }
 
 hash_file() {
