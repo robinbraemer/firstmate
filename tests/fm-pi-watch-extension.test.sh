@@ -458,7 +458,7 @@ test_pi_stale_lock_recovers_through_home_protocol() {
   cat > "$repo/bin/fm-lock.sh" <<'SH'
 #!/usr/bin/env bash
 printf 'invoked\n' >> "${FM_LOCK_LOG:?}"
-exec "${FM_REAL_LOCK:?}"
+exec "${FM_REAL_LOCK:?}" "$@"
 SH
   cat > "$repo/bin/fm-watch-arm.sh" <<'SH'
 #!/usr/bin/env bash
@@ -524,7 +524,7 @@ test_pi_live_non_harness_lock_is_reclaimed() {
   cat > "$repo/bin/fm-lock.sh" <<'SH'
 #!/usr/bin/env bash
 printf 'invoked\n' >> "${FM_LOCK_LOG:?}"
-exec "${FM_REAL_LOCK:?}"
+exec "${FM_REAL_LOCK:?}" "$@"
 SH
   cat > "$repo/bin/fm-watch-arm.sh" <<'SH'
 #!/usr/bin/env bash
@@ -554,6 +554,9 @@ try {
   writeFileSync(`${process.env.FM_HOME}/state/.lock`, `${unrelated.pid}\n`);
   const mod = await import(pathToFileURL(process.env.PLUGIN).href);
   mod.default(pi);
+  if (!existsSync(`${process.env.FM_HOME}/state/.pi-watch-extension-loaded`)) {
+    throw new Error("canonical stale/non-harness classification did not publish the loaded marker");
+  }
   const result = await tool.execute("reused-non-harness-lock", {}, undefined, undefined, {});
   if (result.details?.ok !== true) throw new Error(result.content?.[0]?.text || "non-harness lock recovery failed");
   const owner = readFileSync(`${process.env.FM_HOME}/state/.lock`, "utf8").trim();
@@ -580,7 +583,7 @@ EOF
     FM_REAL_LOCK="$ROOT/bin/fm-lock.sh" FM_ARM_LOG="$arm_log" node "$probe" 2>&1)
   status=$?
   expect_code 0 "$status" "Pi watcher must reclaim a live non-harness PID through fm-lock.sh"
-  [ "$(wc -l < "$lock_log" | tr -d ' ')" -eq 1 ] || fail "Pi non-harness recovery did not invoke fm-lock.sh exactly once"
+  [ "$(wc -l < "$lock_log" | tr -d ' ')" -eq 2 ] || fail "Pi non-harness recovery did not run canonical status plus acquisition exactly once each"
   [ -z "$out" ] || fail "Pi non-harness lock recovery test printed output: $out"
   pass "Pi live non-harness lock is reclaimed through the canonical protocol"
 }
@@ -601,7 +604,7 @@ test_pi_live_other_lock_owner_is_refused() {
   cat > "$repo/bin/fm-lock.sh" <<'SH'
 #!/usr/bin/env bash
 printf 'invoked\n' >> "${FM_LOCK_LOG:?}"
-exec "${FM_REAL_LOCK:?}"
+exec "${FM_REAL_LOCK:?}" "$@"
 SH
   cat > "$repo/bin/fm-watch-arm.sh" <<'SH'
 #!/usr/bin/env bash
@@ -631,6 +634,9 @@ try {
   };
   const mod = await import(pathToFileURL(process.env.PLUGIN).href);
   mod.default(pi);
+  if (existsSync(`${process.env.FM_HOME}/state/.pi-watch-extension-loaded`)) {
+    throw new Error("verified live other owner allowed this session to publish the loaded marker");
+  }
   const result = await tool.execute("live-other-lock", {}, undefined, undefined, {});
   if (result.details?.ok !== false || !result.content?.[0]?.text.includes("read-only")) {
     throw new Error(`unexpected live-other result: ${JSON.stringify(result)}`);
@@ -647,7 +653,7 @@ EOF
     FM_REAL_LOCK="$ROOT/bin/fm-lock.sh" FM_ARM_LOG="$arm_log" node "$probe" 2>&1)
   status=$?
   expect_code 0 "$status" "Pi watcher must let fm-lock.sh refuse a verified live other session owner"
-  [ "$(wc -l < "$lock_log" | tr -d ' ')" -eq 1 ] || fail "Pi live-owner classification did not invoke fm-lock.sh exactly once"
+  [ "$(wc -l < "$lock_log" | tr -d ' ')" -eq 2 ] || fail "Pi live-owner refusal did not run canonical status plus acquisition exactly once each"
   [ -z "$out" ] || fail "Pi live-other lock test printed output: $out"
   pass "Pi verified live other lock owner remains read-only"
 }

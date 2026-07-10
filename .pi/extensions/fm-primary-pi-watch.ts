@@ -172,8 +172,22 @@ function claimSessionLock(): Promise<void> {
   });
 }
 
+function canonicalLockIsStale(): boolean {
+  const result = spawnSync(lockScript, ["status"], {
+    cwd: fmRoot,
+    env: {
+      ...process.env,
+      FM_HOME: fmHome,
+      FM_ROOT_OVERRIDE: fmRoot,
+      FM_STATE_OVERRIDE: state,
+    },
+    encoding: "utf8",
+  });
+  return result.status === 0 && /^lock: stale\b/.test(result.stdout.trim());
+}
+
 function markLoaded(): void {
-  if (lockOwnership() === "other") return;
+  if (lockOwnership() === "other" && !canonicalLockIsStale()) return;
   mkdirSync(state, { recursive: true });
   writeFileSync(marker, `${extensionVersion}\n${process.pid}\n`);
 }
