@@ -613,8 +613,11 @@ If a crewmate sent to work firstmate-on-itself branches or commits in the primar
 Only a named non-default branch checked out in the primary alarms: detached HEAD (the legitimate resting state of crewmate worktrees and secondmate homes) and the default branch never do.
 The same assertion runs at session start as the bootstrap `TANGLE:` line (handled via `bootstrap-diagnostics`), and two upstream guards prevent the tangle: `fm-spawn`'s isolated-worktree assertion and the ship brief's opening isolation check (section 11).
 
-Every verified non-Pi primary harness has a structural "no turn ends blind" backstop, while Pi uses watcher-only native supervision.
-`docs/turnend-guard.md` owns the non-Pi guard contract, hook mechanisms, empirical validation, scoping details, and fail-open tradeoffs.
+On every verified primary harness except Pi (`claude`, `codex`, `opencode`, and `grok`), "no turn ends blind" has a structural backstop beyond the pull-based `fm-guard.sh` banner.
+The shared predicate is `bin/fm-turnend-guard.sh`: when tasks are in flight without a live identity-matched watcher lock and fresh beacon, direct-blocking harnesses block the turn end and passive harnesses force one bounded follow-up turn.
+It shares status fields with `fm-guard.sh` via `bin/fm-supervision-lib.sh`, uses `bin/fm-wake-lib.sh` for live watcher lock health, and never blocks or follows up more than once per turn.
+It is scoped to fire only in the actual primary checkout - never in a crewmate/scout worktree or a secondmate home - and stays silent when supervision is healthy.
+See `docs/turnend-guard.md` for the per-harness hook mechanisms, empirical validation, scoping details, and documented fail-open tradeoffs.
 Watcher liveness is harness-aware.
 Do not assume one primary harness can use another harness's foreground or background shape.
 For example, Claude uses a background-notify cycle, while Codex intentionally uses bounded foreground checkpoints.

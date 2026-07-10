@@ -7,22 +7,18 @@ if [ "${FM_PI_LIVE_E2E:-0}" != 1 ]; then
   exit 0
 fi
 
-ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd -P)"
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 command -v pi >/dev/null 2>&1 || { echo "not ok - pi is required for the live Pi regression" >&2; exit 1; }
 command -v tmux >/dev/null 2>&1 || { echo "not ok - tmux is required for the live Pi regression" >&2; exit 1; }
 AUTH_FILE=${FM_PI_LIVE_AUTH_FILE:-}
 [ -n "$AUTH_FILE" ] && [ -f "$AUTH_FILE" ] || { echo "not ok - set FM_PI_LIVE_AUTH_FILE to the auth.json imported into the isolated Pi home" >&2; exit 1; }
-TMP_BASE=$(cd "${TMPDIR:-/tmp}" && pwd -P) || { echo "not ok - temporary directory is unavailable" >&2; exit 1; }
-case "$TMP_BASE" in
-  "$ROOT"|"$ROOT"/*) echo "not ok - temporary directory must be outside the worktree" >&2; exit 1 ;;
-esac
 
 TMUX=$(command -v tmux)
 PI_BIN=$(command -v pi)
 LAUNCH_HELPER="$ROOT/tests/fm-pi-detached-launch-helper.sh"
 SOCKET="fm-pi-live-e2e-$$"
 SESSION=pi-live-e2e
-LAB=$(umask 077; mktemp -d "$TMP_BASE/fm-pi-live-e2e.XXXXXX")
+LAB=$(mktemp -d "$ROOT/.pi-live-e2e.XXXXXX")
 LAB_SENTINEL="$LAB/.fm-pi-live-e2e-owned"
 PROJECT="$LAB/project with spaces"
 PI_DIR="$LAB/pi agent"

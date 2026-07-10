@@ -154,14 +154,10 @@ function coordinatorForHome(): ArmCoordinator {
 
 function writeClientStatus(client: StatusClient, status: WatcherStatus | undefined): void {
   if (!client.active || !client.ui) return;
-  try {
-    client.ui.setStatus(
-      FIRSTMATE_PI_WATCHER_STATUS_KEY,
-      status === undefined ? undefined : WATCHER_STATUS_TEXT[status],
-    );
-  } catch {
-    return;
-  }
+  client.ui.setStatus(
+    FIRSTMATE_PI_WATCHER_STATUS_KEY,
+    status === undefined ? undefined : WATCHER_STATUS_TEXT[status],
+  );
 }
 
 function publishStatus(coordinator: ArmCoordinator, status: WatcherStatus): void {

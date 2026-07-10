@@ -156,7 +156,7 @@ fm_backend_tmux_pi_process_alive() {  # <target>
 
   comm=$(ps -o comm= -p "$foreground_pid" 2>/dev/null) || return 1
   args=$(ps -o args= -p "$foreground_pid" 2>/dev/null) || return 1
-  fm_process_is_pi "$foreground_pid" "$comm" "$args"
+  fm_process_is_pi "$comm" "$args"
 }
 
 # fm_backend_tmux_agent_alive: CONFIDENT liveness of a live harness-agent
