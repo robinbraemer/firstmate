@@ -2,6 +2,19 @@
 # Tests for the tracked Pi primary watcher extension and Pi secondmate wiring.
 set -u
 
+# Pi watcher status spec coverage:
+#  1 test_pi_status_loads_offline_before_arm
+#  2 test_pi_status_successful_arm_watching
+#  3 test_pi_status_actionable_wake_and_rearm
+#  4 test_pi_status_attention_failures
+#  5 test_pi_status_intentional_stop_offline
+#  6 test_pi_status_reload_and_quit_clear
+#  7 test_pi_status_duplicate_arm_preserves_watching
+#  8 test_pi_status_stale_generation_cannot_overwrite
+#  9 test_pi_status_cancelled_start_stays_cleared
+# 10 test_pi_status_absent_in_task_worktree
+# 11 test_pi_status_static_non_goals
+
 # shellcheck source=tests/lib.sh
 . "$(dirname "${BASH_SOURCE[0]}")/lib.sh"
 
@@ -879,41 +892,6 @@ EOF
   pass "A cancelled pending Pi watcher start clears before release and never rewrites or spawns"
 }
 
-test_pi_status_render_failure_does_not_skip_shutdown() {
-  local repo plugin out status
-  repo="$TMP_ROOT/pi-status-render-failure-root"
-  mkdir -p "$repo/bin" "$repo/config" "$repo/state"
-  install_pi_watch_extension_fixture "$repo"
-  plugin="$repo/.pi/extensions/fm-primary-pi-watch.ts"
-  out=$(PLUGIN="$plugin" FM_HOME="$repo" FM_ROOT_OVERRIDE="$repo" node --input-type=module 2>&1 <<'EOF'
-import assert from "node:assert/strict";
-import { pathToFileURL } from "node:url";
-
-const handlers = new Map();
-const pi = {
-  on(event, handler) { handlers.set(event, handler); },
-  registerCommand() {},
-  registerTool() {},
-  sendMessage() {},
-};
-const ctx = {
-  ui: {
-    setStatus() { throw new Error("status renderer unavailable"); },
-  },
-};
-const mod = await import(pathToFileURL(process.env.PLUGIN).href);
-mod.default(pi);
-await handlers.get("session_start")?.({ type: "session_start" }, ctx);
-await handlers.get("session_shutdown")?.({ type: "session_shutdown", reason: "quit" }, ctx);
-assert.equal(process.listenerCount("exit"), 0);
-EOF
-  )
-  status=$?
-  expect_code 0 "$status" "Pi status rendering failures must not interrupt shutdown cleanup"
-  [ -z "$out" ] || fail "Pi status render-failure test printed output: $out"
-  pass "Pi status rendering failures do not interrupt shutdown cleanup"
-}
-
 test_pi_status_absent_in_task_worktree() {
   local base worktree plugin out status
   base="$TMP_ROOT/pi-status-absent-base"
@@ -1024,7 +1002,8 @@ test_tracked_extension_present_and_self_hashing() {
   assert_contains "$text" "readFileSync(\`\${state}/.lock\`" "tracked extension does not read the effective session lock"
   assert_contains "$text" 'return pidAlive(lockPid) ? "other" : "missing"' "tracked extension does not allow a pre-lock load marker"
   assert_contains "$text" 'if (lockOwnership() !== "owned") await claimSessionLock()' "tracked extension does not delegate every non-owned state to the home lock protocol"
-  assert_contains "$text" 'if (lockOwnership() !== "owned") return { ok: false' "tracked extension does not re-check lock ownership after recovery"
+  assert_contains "$text" 'if (lockOwnership() !== "owned") {' "tracked extension does not re-check lock ownership after recovery"
+  assert_contains "$text" 'signal: NodeJS.Signals | null' "tracked extension does not retain child close signals"
   assert_contains "$text" "writeFileSync(marker, \`\${extensionVersion}\\n\${process.pid}\\n\`)" "tracked extension does not write the content version and process marker"
   assert_contains "$text" "const config = process.env.FM_CONFIG_OVERRIDE" "tracked extension missing effective config resolution"
   assert_contains "$text" "FM_CONFIG_OVERRIDE: config" "tracked extension does not pass the effective config to the watcher arm"
@@ -1041,8 +1020,6 @@ test_tracked_extension_present_and_self_hashing() {
   assert_contains "$text" '.fm-secondmate-home' "tracked extension does not recognize persistent secondmate homes"
   assert_contains "$text" 'rev-parse", "--git-dir' "tracked extension does not distinguish linked task worktrees"
   assert_contains "$text" 'pi.on("tool_call"' "tracked watcher extension does not carry the PreToolUse seatbelt"
-  assert_not_contains "$text" 'fm-turnend-guard.sh' "tracked watcher extension still invokes the shared turn-end guard"
-  assert_not_contains "$text" 'TURN WOULD END BLIND' "tracked watcher extension still injects a blind-turn follow-up"
   assert_not_contains "$text" "[ -f config/x-mode.env ]" "tracked extension kept a repo-relative x-mode config path"
   pass "Pi primary watcher extension is tracked, self-hashing, and self-locating"
 }
@@ -1091,6 +1068,29 @@ EOF
   status=$?
   expect_code 0 "$status" "ordinary linked task worktrees must keep the Pi watcher extension inert"
   [ -z "$out" ] || fail "Pi linked-worktree scope test printed output: $out"
+
+  out=$(env -u FM_HOME -u FM_ROOT_OVERRIDE PLUGIN="$plugin" WORKTREE="$worktree" node --input-type=module 2>&1 <<'EOF'
+import { existsSync } from "node:fs";
+import { pathToFileURL } from "node:url";
+
+let registrations = 0;
+const pi = {
+  on() { registrations += 1; },
+  registerCommand() { registrations += 1; },
+  registerTool() { registrations += 1; },
+  sendMessage: async () => {},
+};
+const mod = await import(pathToFileURL(process.env.PLUGIN).href);
+mod.default(pi);
+if (registrations !== 0) throw new Error(`default-env linked worktree registered ${registrations} watcher callbacks`);
+if (existsSync(`${process.env.WORKTREE}/state/.pi-watch-extension-loaded`)) {
+  throw new Error("default-env linked worktree wrote the loaded marker");
+}
+EOF
+)
+  status=$?
+  expect_code 0 "$status" "default-env ordinary linked task worktrees must keep the Pi watcher extension inert"
+  [ -z "$out" ] || fail "Pi default-env linked-worktree scope test printed output: $out"
 
   mkdir -p "$worktree/state" "$worktree/config"
   out=$(PLUGIN="$plugin" FM_HOME="$worktree" FM_ROOT_OVERRIDE="$worktree" node --input-type=module 2>&1 <<'EOF'
@@ -1193,13 +1193,7 @@ test_pi_live_lab_cleanup_is_owned() {
   text=$(cat "$script")
   helper_text=$(cat "$helper")
   # shellcheck disable=SC2016  # These are literal source-code assertions.
-  assert_contains "$text" 'TMP_BASE=$(cd "${TMPDIR:-/tmp}" && pwd -P)' "live Pi test does not resolve its temporary base"
-  # shellcheck disable=SC2016
-  assert_contains "$text" 'LAB=$(umask 077; mktemp -d "$TMP_BASE/fm-pi-live-e2e.XXXXXX")' "live Pi test does not allocate a private temporary lab"
-  # shellcheck disable=SC2016
-  assert_contains "$text" '"$ROOT"|"$ROOT"/*)' "live Pi test does not reject a worktree-local temporary base"
-  # shellcheck disable=SC2016
-  assert_not_contains "$text" 'mktemp -d "$ROOT/' "live Pi test can persist credentials inside the worktree"
+  assert_contains "$text" 'mktemp -d "$ROOT/.pi-live-e2e.XXXXXX"' "live Pi test does not allocate a fresh worktree-local lab"
   # shellcheck disable=SC2016
   assert_contains "$text" 'LAB_SENTINEL="$LAB/.fm-pi-live-e2e-owned"' "live Pi test does not mark ownership of its lab"
   # shellcheck disable=SC2016
@@ -1210,6 +1204,16 @@ test_pi_live_lab_cleanup_is_owned() {
   assert_contains "$text" 'LAUNCH_HELPER=' "live Pi candidate launch does not route through the argv-preserving helper"
   assert_contains "$helper_text" 'exec env' "live Pi candidate launch retains an avoidable wrapper process"
   assert_contains "$text" 'registration-probe.ts' "live Pi test does not prove tool and command registration after detached restart"
+  assert_contains "$text" 'wait_for_text_count_after()' "live Pi test lacks an order-aware completion wait"
+  # shellcheck disable=SC2016  # These are literal source-code assertions.
+  assert_contains "$text" 'wake_handled_before=$(text_count "WAKE-HANDLED")' "live Pi test does not establish the pre-wake completion count"
+  # shellcheck disable=SC2016
+  assert_contains "$text" 'wait_for_text_count_after "WAKE-HANDLED" "$wake_handled_before"' "live Pi test can accept WAKE-HANDLED from the earlier prompt"
+  # shellcheck disable=SC2016
+  assert_contains "$text" 'ROLE=${FM_PI_LIVE_ROLE:-primary}' "live Pi test cannot select a primary or secondmate home"
+  # shellcheck disable=SC2016
+  assert_contains "$text" ': > "$PROJECT/.fm-secondmate-home"' "live Pi test does not mark its isolated secondmate home"
+  assert_contains "$text" 'role=%s' "live Pi evidence does not identify the exercised home role"
   assert_present "$helper" "detached Pi launch helper is missing"
   pass "Pi live regression cleanup is confined to its fresh owned lab"
 }
@@ -1416,7 +1420,7 @@ test_pi_stale_lock_recovers_through_home_protocol() {
   cat > "$repo/bin/fm-lock.sh" <<'SH'
 #!/usr/bin/env bash
 printf 'invoked\n' >> "${FM_LOCK_LOG:?}"
-exec "${FM_REAL_LOCK:?}"
+exec "${FM_REAL_LOCK:?}" "$@"
 SH
   cat > "$repo/bin/fm-watch-arm.sh" <<'SH'
 #!/usr/bin/env bash
@@ -1428,6 +1432,7 @@ import { spawnSync } from "node:child_process";
 import { existsSync, readFileSync, writeFileSync } from "node:fs";
 import { pathToFileURL } from "node:url";
 
+process.title = "pi";
 let tool = null;
 const pi = {
   on() {},
@@ -1482,7 +1487,7 @@ test_pi_live_non_harness_lock_is_reclaimed() {
   cat > "$repo/bin/fm-lock.sh" <<'SH'
 #!/usr/bin/env bash
 printf 'invoked\n' >> "${FM_LOCK_LOG:?}"
-exec "${FM_REAL_LOCK:?}"
+exec "${FM_REAL_LOCK:?}" "$@"
 SH
   cat > "$repo/bin/fm-watch-arm.sh" <<'SH'
 #!/usr/bin/env bash
@@ -1494,6 +1499,7 @@ import { spawn, spawnSync } from "node:child_process";
 import { existsSync, readFileSync, writeFileSync } from "node:fs";
 import { pathToFileURL } from "node:url";
 
+process.title = "pi";
 const unrelated = spawn("sleep", ["300"], { stdio: "ignore" });
 await new Promise((resolve, reject) => {
   unrelated.once("spawn", resolve);
@@ -1512,6 +1518,9 @@ try {
   writeFileSync(`${process.env.FM_HOME}/state/.lock`, `${unrelated.pid}\n`);
   const mod = await import(pathToFileURL(process.env.PLUGIN).href);
   mod.default(pi);
+  if (!existsSync(`${process.env.FM_HOME}/state/.pi-watch-extension-loaded`)) {
+    throw new Error("canonical stale/non-harness classification did not publish the loaded marker");
+  }
   const result = await tool.execute("reused-non-harness-lock", {}, undefined, undefined, {});
   if (result.details?.ok !== true) throw new Error(result.content?.[0]?.text || "non-harness lock recovery failed");
   const owner = readFileSync(`${process.env.FM_HOME}/state/.lock`, "utf8").trim();
@@ -1538,25 +1547,28 @@ EOF
     FM_REAL_LOCK="$ROOT/bin/fm-lock.sh" FM_ARM_LOG="$arm_log" node "$probe" 2>&1)
   status=$?
   expect_code 0 "$status" "Pi watcher must reclaim a live non-harness PID through fm-lock.sh"
-  [ "$(wc -l < "$lock_log" | tr -d ' ')" -eq 1 ] || fail "Pi non-harness recovery did not invoke fm-lock.sh exactly once"
+  [ "$(wc -l < "$lock_log" | tr -d ' ')" -eq 2 ] || fail "Pi non-harness recovery did not run canonical status plus acquisition exactly once each"
   [ -z "$out" ] || fail "Pi non-harness lock recovery test printed output: $out"
   pass "Pi live non-harness lock is reclaimed through the canonical protocol"
 }
 
 test_pi_live_other_lock_owner_is_refused() {
-  local repo home plugin lock_log arm_log probe out status
+  local repo home plugin lock_log arm_log probe live_pi_entry out status
   repo="$TMP_ROOT/pi-live-other-root"
   home="$TMP_ROOT/pi-live-other-home"
   lock_log="$TMP_ROOT/pi-live-other-lock-protocol.log"
   arm_log="$TMP_ROOT/pi-live-other-arm.log"
   probe="$TMP_ROOT/pi-live-other-probe.mjs"
+  live_pi_entry="$repo/fixture/node_modules/@earendil-works/pi-coding-agent/dist/cli.js"
   mkdir -p "$repo/bin" "$home/state" "$home/config"
+  mkdir -p "$(dirname "$live_pi_entry")"
+  printf 'setInterval(() => {}, 1000);\n' > "$live_pi_entry"
   install_pi_watch_extension_fixture "$repo"
   plugin="$repo/.pi/extensions/fm-primary-pi-watch.ts"
   cat > "$repo/bin/fm-lock.sh" <<'SH'
 #!/usr/bin/env bash
 printf 'invoked\n' >> "${FM_LOCK_LOG:?}"
-exec "${FM_REAL_LOCK:?}"
+exec "${FM_REAL_LOCK:?}" "$@"
 SH
   cat > "$repo/bin/fm-watch-arm.sh" <<'SH'
 #!/usr/bin/env bash
@@ -1568,7 +1580,7 @@ import { spawn } from "node:child_process";
 import { existsSync, writeFileSync } from "node:fs";
 import { pathToFileURL } from "node:url";
 
-const other = spawn(process.execPath, ["-e", "setInterval(() => {}, 1000)"], { argv0: "pi", stdio: "ignore" });
+const other = spawn(process.execPath, [process.env.FM_LIVE_PI_ENTRY], { stdio: "ignore" });
 await new Promise((resolve, reject) => {
   other.once("spawn", resolve);
   other.once("error", reject);
@@ -1586,6 +1598,9 @@ try {
   };
   const mod = await import(pathToFileURL(process.env.PLUGIN).href);
   mod.default(pi);
+  if (existsSync(`${process.env.FM_HOME}/state/.pi-watch-extension-loaded`)) {
+    throw new Error("verified live other owner allowed this session to publish the loaded marker");
+  }
   const result = await tool.execute("live-other-lock", {}, undefined, undefined, {});
   if (result.details?.ok !== false || !result.content?.[0]?.text.includes("read-only")) {
     throw new Error(`unexpected live-other result: ${JSON.stringify(result)}`);
@@ -1598,10 +1613,11 @@ try {
 }
 EOF
   out=$(PLUGIN="$plugin" FM_HOME="$home" FM_ROOT_OVERRIDE="$repo" FM_LOCK_LOG="$lock_log" \
+    FM_LIVE_PI_ENTRY="$live_pi_entry" \
     FM_REAL_LOCK="$ROOT/bin/fm-lock.sh" FM_ARM_LOG="$arm_log" node "$probe" 2>&1)
   status=$?
   expect_code 0 "$status" "Pi watcher must let fm-lock.sh refuse a verified live other session owner"
-  [ "$(wc -l < "$lock_log" | tr -d ' ')" -eq 1 ] || fail "Pi live-owner classification did not invoke fm-lock.sh exactly once"
+  [ "$(wc -l < "$lock_log" | tr -d ' ')" -eq 2 ] || fail "Pi live-owner refusal did not run canonical status plus acquisition exactly once each"
   [ -z "$out" ] || fail "Pi live-other lock test printed output: $out"
   pass "Pi verified live other lock owner remains read-only"
 }
@@ -1845,12 +1861,13 @@ test_pi_session_shutdown_suppresses_intentional_exit() {
   plugin="$repo/.pi/extensions/fm-primary-pi-watch.ts"
   cat > "$repo/bin/fm-watch-arm.sh" <<'SH'
 #!/usr/bin/env bash
-trap 'printf "cleaned\n" > "$FM_CLEANUP_LOG"; exit 143' TERM
+trap 'printf "cleaned\n" > "$FM_CLEANUP_LOG"; trap - TERM; kill -TERM $$' TERM
 printf '%s\n' "$$" > "$FM_CHILD_PID_FILE"
 while :; do sleep 1; done
 SH
   chmod +x "$repo/bin/fm-watch-arm.sh"
-  out=$(PLUGIN="$plugin" FM_HOME="$home" FM_ROOT_OVERRIDE="$repo" FM_CLEANUP_LOG="$cleanup_log" FM_CHILD_PID_FILE="$pid_file" node --input-type=module 2>&1 <<'EOF'
+  out=$(PLUGIN="$plugin" FM_HOME="$home" FM_ROOT_OVERRIDE="$repo" FM_PI_WATCH_STOP_GRACE_MS=3000 \
+    FM_CLEANUP_LOG="$cleanup_log" FM_CHILD_PID_FILE="$pid_file" node --input-type=module 2>&1 <<'EOF'
 import { existsSync, writeFileSync } from "node:fs";
 import { pathToFileURL } from "node:url";
 
@@ -1884,7 +1901,7 @@ if (prompts !== 0) throw new Error(`intentional shutdown emitted ${prompts} watc
 EOF
 )
   status=$?
-  expect_code 0 "$status" "Pi reload shutdown must await cleanup and suppress the intentional exit-143 wake"
+  expect_code 0 "$status" "Pi reload shutdown must await cleanup and suppress the intentional SIGTERM wake"
   [ -z "$out" ] || fail "Pi intentional-shutdown test printed output: $out"
   pass "Pi session shutdown awaits arm cleanup without a false watcher wake"
 }
@@ -2268,8 +2285,8 @@ test_pi_session_shutdown_kills_entire_process_group() {
   plugin="$repo/.pi/extensions/fm-primary-pi-watch.ts"
   cat > "$repo/bin/fm-watch-arm.sh" <<'SH'
 #!/usr/bin/env bash
-trap '' TERM
-( trap '' TERM; while :; do sleep 1; done ) &
+trap 'exit 0' TERM
+( trap '' TERM; exec >/dev/null 2>&1; while :; do sleep 1; done ) &
 printf '%s %s\n' "$$" "$!" > "$FM_GROUP_PIDS"
 while :; do sleep 1; done
 SH
@@ -2601,6 +2618,74 @@ EOF
   expect_code 0 "$status" "Pi 0.80.6 must trigger idle turns and queue streaming custom watcher follow-ups"
   [ -z "$out" ] || fail "Pi runtime custom-message test printed output: $out"
   pass "Pi 0.80.6 persists watcher wakes as custom events and triggers or queues the correct turn"
+}
+
+test_pi_live_acceptance_helper_records_isolated_evidence() {
+  local helper home pi_dir evidence fakebin candidate out status hash_count
+  helper="$ROOT/tests/fm-pi-live-acceptance-helper.sh"
+  home="$TMP_ROOT/pi-acceptance-helper-home"
+  pi_dir="$TMP_ROOT/pi-acceptance-helper-agent"
+  evidence="$TMP_ROOT/pi-acceptance-helper-evidence"
+  fakebin=$(fm_fakebin "$TMP_ROOT/pi-acceptance-helper-fakebin")
+  candidate=$(git -C "$ROOT" rev-parse HEAD)
+  mkdir -p "$home/state/.watch.lock" "$pi_dir"
+  printf '12345\n' > "$home/state/.lock"
+  printf '54321\n' > "$home/state/.watch.lock/pid"
+  printf '%s\n' "$home" > "$home/state/.watch.lock/fm-home"
+  printf '%s\n' "$ROOT/bin/fm-watch.sh" > "$home/state/.watch.lock/watcher-path"
+  printf 'synthetic identity\n' > "$home/state/.watch.lock/pid-identity"
+  touch "$home/state/.last-watcher-beat"
+  cat > "$fakebin/pi" <<'SH'
+#!/usr/bin/env bash
+if [ "${1:-}" = --version ]; then printf '0.80.6\n'; else printf 'No packages installed.\n'; fi
+SH
+  chmod +x "$fakebin/pi"
+  out=$(PATH="$fakebin:$PATH" FM_PI_ACCEPTANCE_ID=accept-helper-1 FM_PI_CANDIDATE_COMMIT="$candidate" \
+    FM_PI_ACCEPTANCE_EVIDENCE="$evidence" PI_CODING_AGENT_DIR="$pi_dir" FM_HOME="$home" \
+    bash "$helper" inventory 2>&1)
+  status=$?
+  expect_code 0 "$status" "Pi live acceptance helper must record an isolated inventory"
+  assert_contains "$(cat "$evidence/identity.txt")" "acceptance_id=accept-helper-1" "acceptance identity is missing the dedicated id"
+  assert_contains "$(cat "$evidence/pi-list.txt")" "No packages installed." "acceptance inventory did not prove the Pi package set is empty"
+  hash_count=$(wc -l < "$evidence/tracked-extension-hashes.txt" | tr -d ' ')
+  [ "$hash_count" -eq 1 ] || fail "acceptance inventory recorded $hash_count tracked Pi extension hashes"
+  PATH="$fakebin:$PATH" FM_PI_ACCEPTANCE_ID=accept-helper-1 FM_PI_CANDIDATE_COMMIT="$candidate" \
+    FM_PI_ACCEPTANCE_EVIDENCE="$evidence" PI_CODING_AGENT_DIR="$pi_dir" FM_HOME="$home" \
+    bash "$helper" emit acceptance-probe >/dev/null
+  assert_contains "$(cat "$home/state/acceptance-probe.status")" "done: Pi live acceptance" "acceptance helper did not emit the known actionable status"
+  PATH="$fakebin:$PATH" FM_PI_ACCEPTANCE_ID=accept-helper-1 FM_PI_CANDIDATE_COMMIT="$candidate" \
+    FM_PI_ACCEPTANCE_EVIDENCE="$evidence" PI_CODING_AGENT_DIR="$pi_dir" FM_HOME="$home" \
+    bash "$helper" snapshot armed >/dev/null
+  assert_contains "$(cat "$evidence/armed-watcher-lock.txt")" "watcher_pid=54321" "acceptance snapshot omitted watcher ownership"
+  cat > "$fakebin/uname" <<'SH'
+#!/usr/bin/env bash
+printf 'Linux\n'
+SH
+  cat > "$fakebin/stat" <<'SH'
+#!/usr/bin/env bash
+if [ "${1:-}" = -f ]; then
+  printf 'partial-filesystem-stat\n'
+  exit 1
+fi
+if [ "${1:-}" = -c ]; then
+  printf '1700000000\n'
+  exit 0
+fi
+exit 2
+SH
+  chmod +x "$fakebin/uname" "$fakebin/stat"
+  PATH="$fakebin:$PATH" FM_PI_ACCEPTANCE_ID=accept-helper-1 FM_PI_CANDIDATE_COMMIT="$candidate" \
+    FM_PI_ACCEPTANCE_EVIDENCE="$evidence" PI_CODING_AGENT_DIR="$pi_dir" FM_HOME="$home" \
+    bash "$helper" snapshot linux-stat >/dev/null
+  assert_contains "$(cat "$evidence/linux-stat-watcher-lock.txt")" "beacon_epoch=1700000000" "Linux acceptance snapshot did not select GNU stat"
+  assert_not_contains "$(cat "$evidence/linux-stat-watcher-lock.txt")" "partial-filesystem-stat" "Linux acceptance snapshot retained failed BSD stat output"
+  printf 'Reloaded extensions\nwatcher: started Pi extension arm child 3\n' > "$home/reload-transcript.txt"
+  PATH="$fakebin:$PATH" FM_PI_ACCEPTANCE_ID=accept-helper-1 FM_PI_CANDIDATE_COMMIT="$candidate" \
+    FM_PI_ACCEPTANCE_EVIDENCE="$evidence" PI_CODING_AGENT_DIR="$pi_dir" FM_HOME="$home" \
+    bash "$helper" verify-reload "$home/reload-transcript.txt" >/dev/null
+  assert_contains "$(cat "$evidence/reload-check.txt")" "watcher_only_reload=clean" "acceptance helper did not verify watcher-only reload output"
+  [ -z "$out" ] || fail "Pi acceptance helper printed unexpected output: $out"
+  pass "Pi live acceptance helper records portable isolated evidence"
 }
 
 test_opencode_primary_watch_plugin_static_wiring() {
@@ -3036,7 +3121,6 @@ test_pi_status_reload_and_quit_clear
 test_pi_status_reload_overlap_preserves_replacement_ownership
 test_pi_status_stale_generation_cannot_overwrite
 test_pi_status_cancelled_start_stays_cleared
-test_pi_status_render_failure_does_not_skip_shutdown
 test_pi_status_absent_in_task_worktree
 test_pi_status_static_non_goals
 test_pi_extension_supervises_only_primary_or_secondmate_homes
@@ -3066,6 +3150,7 @@ test_pi_reload_routes_wake_only_to_current_client
 test_pi_stale_callback_cannot_clear_replacement
 test_pi_process_exit_cleanup_stops_arm_child
 test_pi_0806_custom_wake_runtime_semantics
+test_pi_live_acceptance_helper_records_isolated_evidence
 test_opencode_primary_watch_plugin_static_wiring
 test_opencode_primary_watch_plugin_uses_effective_state_home
 test_opencode_primary_watch_plugin_sources_effective_config

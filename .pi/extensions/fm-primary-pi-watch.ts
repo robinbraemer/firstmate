@@ -15,6 +15,9 @@ type ArmResult = {
 type LockOwnership = "owned" | "missing" | "other";
 type CoordinatorState = "idle" | "starting" | "running" | "stopping";
 type WakeKind = "actionable" | "failure";
+type WatcherStatus = "offline" | "watching" | "handling wake" | "attention";
+type StopDisposition = "offline" | "clear";
+type StatusUi = { setStatus(key: string, text: string | undefined): void };
 
 type WakeDetails = {
   generation: number;
@@ -29,6 +32,13 @@ type WakeDetails = {
 
 type WakeSender = (message: string, details: WakeDetails) => Promise<void>;
 
+type StatusClient = WakeSender & {
+  token: symbol;
+  ui: StatusUi | null;
+  active: boolean;
+  sendWake: WakeSender;
+};
+
 type CompletedCapture = {
   stdout: string;
   stderr: string;
@@ -39,8 +49,6 @@ type ArmRecord = {
   generation: number;
   intentionalStopReason: string;
   settled: boolean;
-  completion: Promise<void>;
-  resolveCompletion: () => void;
   stdout: string;
   stderr: string;
   stdoutPending: string;
@@ -57,9 +65,13 @@ type ArmCoordinator = {
   generation: number;
   sequence: number;
   state: CoordinatorState;
+  visibleStatus: WatcherStatus;
   startPromise: Promise<ArmResult> | null;
   startCancelled: boolean;
-  clients: Map<symbol, WakeSender>;
+  shuttingDown: boolean;
+  shutdownPromise: Promise<void> | null;
+  shutdownToken: symbol | null;
+  clients: Map<symbol, StatusClient>;
   exitListener?: () => void;
 };
 
@@ -80,6 +92,13 @@ const marker = `${state}/.pi-watch-extension-loaded`;
 const extensionVersion = `sha256:${createHash("sha256").update(readFileSync(extensionFile)).digest("hex")}`;
 const MAX_CAPTURE_BYTES = 16 * 1024;
 const MAX_PENDING_LINE_BYTES = 4 * 1024;
+const FIRSTMATE_PI_WATCHER_STATUS_KEY = "firstmate-pi-watcher" as const;
+const WATCHER_STATUS_TEXT: Record<WatcherStatus, WatcherStatus> = {
+  offline: "offline",
+  watching: "watching",
+  "handling wake": "handling wake",
+  attention: "attention",
+};
 const requestedStopGrace = Number(process.env.FM_PI_WATCH_STOP_GRACE_MS ?? "1000");
 const STOP_GRACE_MS = Number.isFinite(requestedStopGrace) && requestedStopGrace >= 0 ? requestedStopGrace : 1000;
 const STOP_KILL_GRACE_MS = 500;
@@ -89,10 +108,12 @@ const coordinators = coordinatorHost.__firstmatePiWatchCoordinators ??= new Map<
 function supervisingHome(): boolean {
   if (existsSync(`${root}/.fm-secondmate-home`)) return true;
   if (!existsSync(`${root}/AGENTS.md`) || !existsSync(`${root}/bin`)) return false;
-  try {
-    if (realpathSync(fmHome) === root) return true;
-  } catch {
-    return false;
+  if (process.env.FM_HOME || process.env.FM_ROOT_OVERRIDE) {
+    try {
+      if (realpathSync(fmHome) === root) return true;
+    } catch {
+      return false;
+    }
   }
   const gitDir = spawnSync("git", ["-C", root, "rev-parse", "--git-dir"], { encoding: "utf8" });
   const commonDir = spawnSync("git", ["-C", root, "rev-parse", "--git-common-dir"], { encoding: "utf8" });
@@ -102,16 +123,30 @@ function supervisingHome(): boolean {
 
 function coordinatorForHome(): ArmCoordinator {
   const existing = coordinators.get(fmHome);
-  if (existing) return existing;
+  if (existing) {
+    existing.visibleStatus ??= "offline";
+    if (existing.clients.size === 0) existing.visibleStatus = "offline";
+    existing.shutdownPromise ??= null;
+    existing.shutdownToken ??= null;
+    if (!existing.shutdownPromise) {
+      existing.shuttingDown = false;
+      existing.startCancelled = false;
+    }
+    return existing;
+  }
   const coordinator: ArmCoordinator = {
     current: null,
     lastCompleted: null,
     generation: 0,
     sequence: 0,
     state: "idle",
+    visibleStatus: "offline",
     startPromise: null,
     startCancelled: false,
-    clients: new Map<symbol, WakeSender>(),
+    shuttingDown: false,
+    shutdownPromise: null,
+    shutdownToken: null,
+    clients: new Map<symbol, StatusClient>(),
   };
   coordinators.set(fmHome, coordinator);
   return coordinator;
@@ -119,14 +154,10 @@ function coordinatorForHome(): ArmCoordinator {
 
 function writeClientStatus(client: StatusClient, status: WatcherStatus | undefined): void {
   if (!client.active || !client.ui) return;
-  try {
-    client.ui.setStatus(
-      FIRSTMATE_PI_WATCHER_STATUS_KEY,
-      status === undefined ? undefined : WATCHER_STATUS_TEXT[status],
-    );
-  } catch {
-    return;
-  }
+  client.ui.setStatus(
+    FIRSTMATE_PI_WATCHER_STATUS_KEY,
+    status === undefined ? undefined : WATCHER_STATUS_TEXT[status],
+  );
 }
 
 function publishStatus(coordinator: ArmCoordinator, status: WatcherStatus): void {
@@ -190,8 +221,22 @@ function claimSessionLock(): Promise<void> {
   });
 }
 
+function canonicalLockIsStale(): boolean {
+  const result = spawnSync(lockScript, ["status"], {
+    cwd: fmRoot,
+    env: {
+      ...process.env,
+      FM_HOME: fmHome,
+      FM_ROOT_OVERRIDE: fmRoot,
+      FM_STATE_OVERRIDE: state,
+    },
+    encoding: "utf8",
+  });
+  return result.status === 0 && /^lock: stale\b/.test(result.stdout.trim());
+}
+
 function markLoaded(): void {
-  if (lockOwnership() === "other") return;
+  if (lockOwnership() === "other" && !canonicalLockIsStale()) return;
   mkdirSync(state, { recursive: true });
   writeFileSync(marker, `${extensionVersion}\n${process.pid}\n`);
 }
@@ -266,8 +311,7 @@ function settleArm(
     coordinator.lastCompleted = { stdout: record.stdout, stderr: record.stderr };
     coordinator.state = "idle";
   }
-  record.resolveCompletion();
-  if (!ownsGeneration || record.intentionalStopReason) return;
+  if (!ownsGeneration || coordinator.shuttingDown || record.intentionalStopReason) return;
 
   const message = error
     ? `watcher: FAILED - Pi extension arm child ${record.generation} failed: ${error.message}`
@@ -283,10 +327,28 @@ function settleArm(
     stdoutTruncated: record.stdoutTruncated,
     stderrTruncated: record.stderrTruncated,
   };
-  const sendWake = [...coordinator.clients.values()].at(-1);
-  if (!sendWake) return;
-  void sendWake(message, details).catch(() => {
-    // Pi owns delivery errors; fail open so the extension never wedges the session.
+  if (kind === "failure") publishStatus(coordinator, "attention");
+  const activeClient = [...coordinator.clients.values()].reverse().find((candidate) => candidate.active);
+  if (!activeClient) return;
+  void activeClient.sendWake(message, details).then(() => {
+    if (
+      kind === "actionable" &&
+      coordinator.generation === record.generation &&
+      !coordinator.shuttingDown &&
+      activeClient.active &&
+      coordinator.clients.get(activeClient.token) === activeClient
+    ) {
+      publishStatus(coordinator, "handling wake");
+    }
+  }).catch(() => {
+    if (
+      coordinator.generation === record.generation &&
+      !coordinator.shuttingDown &&
+      activeClient.active &&
+      coordinator.clients.get(activeClient.token) === activeClient
+    ) {
+      publishStatus(coordinator, "attention");
+    }
   });
 }
 
@@ -307,31 +369,79 @@ function signalArm(record: ArmRecord, signal: NodeJS.Signals): void {
   }
 }
 
-function settlesWithin(record: ArmRecord, milliseconds: number): Promise<boolean> {
+function processGroupAlive(record: ArmRecord): boolean {
+  const pid = record.child.pid;
+  if (!pid) return false;
+  try {
+    process.kill(-pid, 0);
+    return true;
+  } catch (error) {
+    return (error as NodeJS.ErrnoException).code !== "ESRCH";
+  }
+}
+
+function stopsWithin(record: ArmRecord, milliseconds: number): Promise<boolean> {
   return new Promise<boolean>((resolvePromise) => {
-    let settled = false;
-    const finish = (result: boolean) => {
-      if (settled) return;
-      settled = true;
-      clearTimeout(timer);
-      resolvePromise(result);
+    const deadline = Date.now() + milliseconds;
+    const check = () => {
+      if (record.settled && !processGroupAlive(record)) {
+        resolvePromise(true);
+        return;
+      }
+      const remaining = deadline - Date.now();
+      if (remaining <= 0) {
+        resolvePromise(false);
+        return;
+      }
+      setTimeout(check, Math.min(10, remaining));
     };
-    const timer = setTimeout(() => finish(false), milliseconds);
-    timer.unref();
-    void record.completion.then(() => finish(true));
+    check();
   });
 }
 
-async function stopArm(coordinator: ArmCoordinator, reason: string): Promise<void> {
-  const record = coordinator.current;
-  if (!record) return;
+async function stopArmRecord(
+  coordinator: ArmCoordinator,
+  record: ArmRecord,
+  reason: string,
+  disposition: StopDisposition,
+): Promise<void> {
   if (!record.intentionalStopReason) record.intentionalStopReason = reason;
   if (coordinator.current === record) coordinator.state = "stopping";
   signalArm(record, "SIGTERM");
-  if (await settlesWithin(record, STOP_GRACE_MS)) return;
-  signalArm(record, "SIGKILL");
-  if (await settlesWithin(record, STOP_KILL_GRACE_MS)) return;
-  settleArm(coordinator, record, null, "SIGKILL");
+  if (!(await stopsWithin(record, STOP_GRACE_MS))) {
+    signalArm(record, "SIGKILL");
+    if (!(await stopsWithin(record, STOP_KILL_GRACE_MS))) {
+      if (!record.settled) settleArm(coordinator, record, null, "SIGKILL");
+      if (processGroupAlive(record)) {
+        throw new Error(`watcher: FAILED - process group ${record.child.pid} survived SIGKILL`);
+      }
+    }
+  }
+  if (coordinator.current === record) {
+    coordinator.current = null;
+    coordinator.lastCompleted = { stdout: record.stdout, stderr: record.stderr };
+    coordinator.state = "idle";
+  }
+  if (
+    disposition === "offline" &&
+    !coordinator.shuttingDown &&
+    coordinator.clients.size > 0
+  ) {
+    publishStatus(coordinator, "offline");
+  }
+}
+
+export async function stopArm(
+  coordinator: ArmCoordinator,
+  reason: string,
+  disposition: StopDisposition = "clear",
+): Promise<void> {
+  const record = coordinator.current;
+  if (record) {
+    await stopArmRecord(coordinator, record, reason, disposition);
+  } else if (disposition === "offline" && coordinator.clients.size > 0) {
+    publishStatus(coordinator, "offline");
+  }
 }
 
 function stopArmOnProcessExit(coordinator: ArmCoordinator): void {
@@ -359,7 +469,6 @@ function runPretoolCheck(command: string): Promise<{ code: number; stderr: strin
 export default function (pi: ExtensionAPI) {
   if (!supervisingHome()) return;
   const coordinator = coordinatorForHome();
-  const client = Symbol("pi-watch-extension-client");
 
   async function sendWake(message: string, details: WakeDetails): Promise<void> {
     pi.sendMessage(
@@ -373,9 +482,23 @@ export default function (pi: ExtensionAPI) {
     );
   }
 
-  coordinator.clients.set(client, sendWake);
+  const client: StatusClient = Object.assign(sendWake, {
+    token: Symbol("pi-watch-extension-client"),
+    ui: null as StatusUi | null,
+    active: true,
+    sendWake,
+  });
+  coordinator.clients.set(client.token, client);
 
   const cleanupOnProcessExit = () => {
+    for (const activeClient of coordinator.clients.values()) {
+      writeClientStatus(activeClient, undefined);
+      activeClient.active = false;
+    }
+    coordinator.clients.clear();
+    coordinator.shuttingDown = true;
+    coordinator.startCancelled = true;
+    coordinator.generation += 1;
     stopArmOnProcessExit(coordinator);
   };
   if (!coordinator.exitListener) {
@@ -385,10 +508,13 @@ export default function (pi: ExtensionAPI) {
 
   async function startArmOnce(): Promise<ArmResult> {
     if (lockOwnership() !== "owned") await claimSessionLock();
-    if (coordinator.startCancelled || coordinator.clients.size === 0) {
+    if (coordinator.startCancelled || coordinator.shuttingDown || coordinator.clients.size === 0) {
       return { ok: false, message: "watcher: not started - Pi extension session shut down" };
     }
-    if (lockOwnership() !== "owned") return { ok: false, message: "watcher: read-only - session lock is held by another firstmate session" };
+    if (lockOwnership() !== "owned") {
+      publishStatus(coordinator, "attention");
+      return { ok: false, message: "watcher: read-only - session lock is held by another firstmate session" };
+    }
     markLoaded();
     if (coordinator.current) return { ok: true, message: "watcher: healthy - Pi extension already has an arm child" };
 
@@ -407,17 +533,11 @@ export default function (pi: ExtensionAPI) {
       detached: true,
       stdio: ["ignore", "pipe", "pipe"],
     });
-    let resolveCompletion = () => {};
-    const completion = new Promise<void>((resolvePromise) => {
-      resolveCompletion = resolvePromise;
-    });
     const record: ArmRecord = {
       child,
       generation,
       intentionalStopReason: "",
       settled: false,
-      completion,
-      resolveCompletion,
       stdout: "",
       stderr: "",
       stdoutPending: "",
@@ -429,6 +549,7 @@ export default function (pi: ExtensionAPI) {
     };
     coordinator.current = record;
     coordinator.state = "running";
+    publishStatus(coordinator, "watching");
     child.stdout?.on("data", (chunk: Buffer) => {
       captureOutput(record, "stdout", chunk);
     });
@@ -444,9 +565,28 @@ export default function (pi: ExtensionAPI) {
     return { ok: true, message: `watcher: started Pi extension arm child ${id}` };
   }
 
-  function startArm(): Promise<ArmResult> {
+  async function startArm(): Promise<ArmResult> {
+    const pendingShutdown = coordinator.shutdownPromise;
+    if (pendingShutdown) {
+      try {
+        await pendingShutdown;
+      } catch (error) {
+        if (client.active && coordinator.clients.get(client.token) === client) {
+          publishStatus(coordinator, "attention");
+        }
+        return {
+          ok: false,
+          message: error instanceof Error
+            ? error.message
+            : "watcher: FAILED - Pi extension reload cleanup failed",
+        };
+      }
+    }
+    if (!client.active || coordinator.clients.get(client.token) !== client) {
+      return { ok: false, message: "watcher: not started - Pi extension session shut down" };
+    }
     if (coordinator.startPromise) return coordinator.startPromise;
-    if (coordinator.clients.size === 0) {
+    if (coordinator.shuttingDown || coordinator.clients.size === 0) {
       return Promise.resolve({ ok: false, message: "watcher: not started - Pi extension session shut down" });
     }
     coordinator.startCancelled = false;
@@ -461,21 +601,61 @@ export default function (pi: ExtensionAPI) {
     return startPromise;
   }
 
-  pi.on?.("session_start", () => {
+  pi.on?.("session_start", (_event, ctx) => {
+    client.ui = ctx.ui;
+    writeClientStatus(client, coordinator.visibleStatus);
     markLoaded();
   });
-  pi.on?.("session_shutdown", async () => {
-    coordinator.clients.delete(client);
+
+  async function shutdownClient(reason: string): Promise<void> {
+    if (!client.active) return;
+    writeClientStatus(client, undefined);
+    client.active = false;
+    coordinator.clients.delete(client.token);
     if (coordinator.clients.size > 0) return;
-    coordinator.startCancelled = true;
-    const pendingStart = coordinator.startPromise;
-    if (pendingStart) await pendingStart.catch(() => undefined);
-    if (coordinator.clients.size > 0) return;
-    await stopArm(coordinator, "session-shutdown");
-    if (coordinator.clients.size === 0 && coordinator.exitListener) {
-      process.off("exit", coordinator.exitListener);
-      coordinator.exitListener = undefined;
+    if (coordinator.shutdownPromise) {
+      await coordinator.shutdownPromise;
+      return;
     }
+
+    coordinator.shuttingDown = true;
+    coordinator.startCancelled = true;
+    const record = coordinator.current;
+    if (record && !record.intentionalStopReason) record.intentionalStopReason = reason;
+    coordinator.generation += 1;
+
+    const pendingStart = coordinator.startPromise;
+    const exitListener = coordinator.exitListener;
+    const shutdownToken = Symbol("pi-watch-extension-shutdown");
+    coordinator.shutdownToken = shutdownToken;
+    const shutdownPromise = Promise.resolve().then(async () => {
+      try {
+        if (pendingStart) await pendingStart.catch(() => undefined);
+        if (coordinator.shutdownToken !== shutdownToken) return;
+        if (record) await stopArmRecord(coordinator, record, reason, "clear");
+        if (coordinator.shutdownToken !== shutdownToken) return;
+      } finally {
+        if (coordinator.shutdownToken === shutdownToken) {
+          if (coordinator.clients.size === 0) {
+            if (exitListener && coordinator.exitListener === exitListener) {
+              process.off("exit", exitListener);
+              coordinator.exitListener = undefined;
+            }
+          } else {
+            coordinator.shuttingDown = false;
+            coordinator.startCancelled = false;
+          }
+          coordinator.shutdownToken = null;
+          coordinator.shutdownPromise = null;
+        }
+      }
+    });
+    coordinator.shutdownPromise = shutdownPromise;
+    await shutdownPromise;
+  }
+
+  pi.on?.("session_shutdown", async (event) => {
+    await shutdownClient(event.reason || "session-shutdown");
   });
 
   pi.on("tool_call", async (event) => {

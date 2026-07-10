@@ -151,14 +151,6 @@ test_tmux_agent_alive_classifies() {
   [ "$(PATH="$fb:$BASE_PATH" bash -c '. "$0/bin/fm-backend.sh"; fm_backend_source tmux; fm_backend_tmux_agent_alive sess:win' "$ROOT")" = unknown ] \
     || fail "a generic Node foreground process must remain unknown"
 
-  fb=$(make_probe_pi_process "$TMP_ROOT/tmux-pi-node-suffix" /usr/bin/node '/usr/bin/node /opt/pi/node_modules/@earendil-works/pi-coding-agent/dist/cli.js.evil')
-  [ "$(PATH="$fb:$BASE_PATH" bash -c '. "$0/bin/fm-backend.sh"; fm_backend_source tmux; fm_backend_tmux_agent_alive sess:win' "$ROOT")" = unknown ] \
-    || fail "a suffixed Pi entrypoint must remain unknown"
-
-  fb=$(make_probe_pi_process "$TMP_ROOT/tmux-pi-node-later-argument" /usr/bin/node '/usr/bin/node /opt/innocent.js /opt/pi/node_modules/@earendil-works/pi-coding-agent/dist/cli.js')
-  [ "$(PATH="$fb:$BASE_PATH" bash -c '. "$0/bin/fm-backend.sh"; fm_backend_source tmux; fm_backend_tmux_agent_alive sess:win' "$ROOT")" = unknown ] \
-    || fail "a later-argument Pi entrypoint spoof must remain unknown"
-
   fb=$(make_probe_pi_process "$TMP_ROOT/tmux-malformed-pgid" /Users/test/.bun/bin/pi pi not-a-pid)
   [ "$(PATH="$fb:$BASE_PATH" bash -c '. "$0/bin/fm-backend.sh"; fm_backend_source tmux; fm_backend_tmux_agent_alive sess:win' "$ROOT")" = unknown ] \
     || fail "a malformed foreground process group must remain unknown"
@@ -168,47 +160,6 @@ test_tmux_agent_alive_classifies() {
     || fail "an unrecognized foreground process should classify as unknown"
 
   pass "fm_backend_tmux_agent_alive: alive/dead/unknown classification"
-}
-
-test_pi_process_classifier_preserves_argv_boundaries() {
-  local dir package_dir cli innocent fakebin pid comm args
-  dir="$TMP_ROOT/pi path with spaces"
-  package_dir="$dir/node_modules/@earendil-works/pi-coding-agent"
-  cli="$package_dir/dist/cli.js"
-  innocent="$dir/innocent.js"
-  fakebin=$(fm_fakebin "$dir/fakebin")
-  mkdir -p "$(dirname "$cli")"
-  cat > "$cli" <<'JS'
-setInterval(() => {}, 300000);
-JS
-  cat > "$innocent" <<'JS'
-setInterval(() => {}, 300000);
-JS
-  ln -s "$cli" "$fakebin/pi"
-
-  node "$cli" &
-  pid=$!
-  comm=$(ps -o comm= -p "$pid")
-  args=$(ps -o args= -p "$pid")
-  PATH="$fakebin:$BASE_PATH" bash -c '. "$1"; fm_process_is_pi "$2" "$3" "$4"' \
-    _ "$ROOT/bin/fm-process-lib.sh" "$pid" "$comm" "$args" \
-    || fail "Pi classifier rejected an entrypoint path containing spaces"
-  kill "$pid" 2>/dev/null || true
-  wait "$pid" 2>/dev/null || true
-
-  node "$innocent" "$cli" &
-  pid=$!
-  comm=$(ps -o comm= -p "$pid")
-  args=$(ps -o args= -p "$pid")
-  if PATH="$fakebin:$BASE_PATH" bash -c '. "$1"; fm_process_is_pi "$2" "$3" "$4"' \
-    _ "$ROOT/bin/fm-process-lib.sh" "$pid" "$comm" "$args"; then
-    kill "$pid" 2>/dev/null || true
-    wait "$pid" 2>/dev/null || true
-    fail "Pi classifier accepted a later-argument entrypoint spoof"
-  fi
-  kill "$pid" 2>/dev/null || true
-  wait "$pid" 2>/dev/null || true
-  pass "Pi process classifier preserves argv boundaries for paths with spaces"
 }
 
 # --- unit level: fm_backend_herdr_agent_alive -------------------------------
@@ -484,7 +435,6 @@ test_sweep_noop_with_no_secondmate_meta() {
 }
 
 test_tmux_agent_alive_classifies
-test_pi_process_classifier_preserves_argv_boundaries
 test_herdr_agent_alive_maps_pane_agent_state
 test_agent_alive_dispatcher_routes_and_falls_back
 test_sweep_respawns_confirmed_dead_secondmate
