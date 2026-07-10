@@ -19,7 +19,7 @@ The existing child, lock, generation, startup-cancellation, and intentional-stop
 - An ordinary linked task worktree performs no status write and leaves the key absent.
 - Status changes are coordinator-event driven only.
 - No status polling, filesystem polling, `setInterval`, or status-refresh `setTimeout` is allowed.
-- The bounded child-cleanup wait may use one `setTimeout` source behind an absolute deadline; it must not read or refresh status.
+- A one-shot bounded child-cleanup deadline may use `setTimeout`; it must not read or refresh status.
 - Pi wake injection uses `pi.sendMessage(...)` with `customType: "firstmate-watcher-wake"`, `deliverAs: "followUp"`, and `triggerTurn: true`.
 - The watcher extension must not call `pi.sendUserMessage(...)`.
 - Pi 0.80.6 declares `ExtensionAPI.sendMessage(...)` as returning `void`, so delivery acceptance means the call returned normally and delivery failure means it threw synchronously.
@@ -56,7 +56,6 @@ type StatusClient = {
   token: symbol;
   ui: StatusUi | null;
   active: boolean;
-  sendWake: WakeSender;
 };
 
 type StopDisposition = "offline" | "clear";
@@ -66,19 +65,15 @@ type ArmRecord = {
   generation: number;
   intentionalStopReason: string;
   settled: boolean;
+  completion: Promise<void>;
+  resolveCompletion: () => void;
   stdout: string;
   stderr: string;
-  stdoutPending: string;
-  stderrPending: string;
-  stdoutTruncated: boolean;
-  stderrTruncated: boolean;
-  actionable: string;
-  failureHint: string;
+  sendWake: (message: string) => void;
 };
 
 type ArmCoordinator = {
   current: ArmRecord | null;
-  lastCompleted: CompletedCapture | null;
   generation: number;
   sequence: number;
   state: CoordinatorState;
@@ -322,9 +317,9 @@ git commit -m "feat(pi): publish watcher startup status"
 
 **Interfaces:**
 
-- Preserves `WakeSender`, `WakeDetails`, and each active client's current `sendWake` closure; `ArmRecord` never owns a Pi runtime closure.
-- Preserves `sendWake(message, details): Promise<void>` using the exact Pi custom-message contract and structured bounded-output metadata.
-- Extends `settleArm(coordinator, record, code, signal, error?)` without replacing incremental `captureOutput`, `record.actionable`, `failureLine(record, ...)`, or exactly-once settlement.
+- Changes `ArmRecord.sendWake` from `(message: string) => Promise<void>` to `(message: string) => void`.
+- Produces `sendWake(message: string): void` using the exact Pi custom-message contract.
+- Produces `settleArm(coordinator, record, code, signal, error?)` with current-generation, intentional, actionable, and generic-failure precedence.
 - Preserves all existing wake text after the `FIRSTMATE WATCHER WAKE:` prefix.
 
 - [ ] **Step 1: Add failing tests 3 and 4 before changing production code**
@@ -402,57 +397,86 @@ tests/fm-pi-watch-extension.test.sh
 
 Expected: nonzero exit because the candidate still calls the user-message API and does not publish settled actionable or failure status.
 
-- [ ] **Step 3: Preserve the exact custom-message wake API while attaching status to the current client**
+- [ ] **Step 3: Replace the wake helper with the exact synchronous Pi API**
 
-Keep the candidate helper's existing signature and structured details:
+Replace the candidate helper with:
 
 ```typescript
-async function sendWake(message: string, details: WakeDetails): Promise<void> {
+function sendWake(message: string): void {
   pi.sendMessage(
     {
       customType: "firstmate-watcher-wake",
       content: `FIRSTMATE WATCHER WAKE: ${message}\n\nRun bin/fm-wake-drain.sh first, handle the queued wake, then resume Pi supervision.`,
       display: true,
-      details,
     },
-    { deliverAs: "followUp", triggerTurn: true },
+    {
+      deliverAs: "followUp",
+      triggerTurn: true,
+    },
   );
 }
 ```
 
-Store that closure on the active `StatusClient`, not on `ArmRecord`.
-Keep every fixture on fake `sendMessage`, and keep `test_tracked_extension_present_and_self_hashing` requiring `sendMessage`, `firstmate-watcher-wake`, `deliverAs: "followUp"`, and `triggerTurn: true` while rejecting the old API name.
+Update every fixture in `tests/fm-pi-watch-extension.test.sh` from a fake user-message method to a fake `sendMessage` method.
+Update `test_tracked_extension_present_and_self_hashing` to require `sendMessage`, `firstmate-watcher-wake`, `deliverAs: "followUp"`, and `triggerTurn: true`, and to reject the old API name.
 
-- [ ] **Step 4: Extend the current bounded, exactly-once `settleArm` precedence**
+- [ ] **Step 4: Make `settleArm` apply the approved precedence**
 
-Do not replace the candidate implementation with whole-buffer rescanning or record-owned delivery.
-Keep `record.settled` as the sole completion gate, call `inspectOutputLine` for the bounded pending fragments, retain the current-generation identity check, save only the bounded `CompletedCapture`, and classify from `record.actionable` or `failureLine(record, code, signal)`.
-Build the existing `WakeDetails`, then select the newest active client:
+Implement this order without asynchronous delivery promises:
 
 ```typescript
-const activeClient = [...coordinator.clients.values()].at(-1);
-if (!activeClient || !activeClient.active) return;
+function settleArm(
+  coordinator: ArmCoordinator,
+  record: ArmRecord,
+  code: number | null,
+  signal: NodeJS.Signals | null,
+  error?: Error,
+): void {
+  if (record.settled) return;
+  record.settled = true;
 
-const delivery = activeClient.sendWake(message, details);
-void delivery.then(() => {
-  if (
-    kind === "actionable" &&
-    coordinator.generation === record.generation &&
-    !coordinator.shuttingDown &&
-    activeClient.active
-  ) {
-    publishStatus(coordinator, "handling wake");
+  const ownsGeneration =
+    coordinator.current === record &&
+    coordinator.generation === record.generation;
+  if (!ownsGeneration) {
+    record.resolveCompletion();
+    return;
   }
-}).catch(() => {
-  if (coordinator.generation === record.generation && !coordinator.shuttingDown) {
-    publishStatus(coordinator, "attention");
+
+  coordinator.current = null;
+  coordinator.state = "idle";
+  record.resolveCompletion();
+  if (coordinator.shuttingDown || record.intentionalStopReason) return;
+
+  const actionable = error ? "" : actionableLine(`${record.stdout}\n${record.stderr}`);
+  if (actionable) {
+    try {
+      record.sendWake(actionable);
+      if (coordinator.generation === record.generation && !coordinator.shuttingDown) {
+        publishStatus(coordinator, "handling wake");
+      }
+    } catch {
+      publishStatus(coordinator, "attention");
+    }
+    return;
   }
-});
+
+  const failure = error
+    ? `watcher: FAILED - Pi extension arm child ${record.generation} failed: ${error.message}`
+    : failureLine(record.stdout, record.stderr, code, signal);
+  publishStatus(coordinator, "attention");
+  if (failure) {
+    try {
+      record.sendWake(failure);
+    } catch {
+      // The already-published attention state is the delivery-failure result.
+    }
+  }
+}
 ```
 
-Publish `attention` synchronously for every generic failure before attempting its wake delivery.
-An unexplained clean exit remains a synthesized failure wake and `attention`; actionable classification remains ahead of generic failure classification.
-Never restore whole-buffer actionable-line scanning across `record.stdout` and `record.stderr`, because incremental capture already handles split chunks while keeping memory bounded.
+This makes an unexplained clean exit `attention` even when it has no failure wake text.
+Actionable classification occurs before generic exit failure classification.
 
 - [ ] **Step 5: Publish startup and ownership failures before returning**
 
@@ -500,10 +524,10 @@ git commit -m "feat(pi): publish watcher outcome status"
 
 **Interfaces:**
 
-- Extends the existing bounded `stopArm(coordinator, reason): Promise<void>` with a status disposition without replacing `signalArm`, `stopsWithin`, `STOP_GRACE_MS`, or `STOP_KILL_GRACE_MS`.
-- Produces `shutdownClient(reason): Promise<void>` for last-client invalidation, clear, cancellation, bounded process-group settlement, and listener removal.
-- Keeps the existing `startPromise` cancellation and monotonic generation contracts.
-- Keeps the per-home coordinator across reload so sequence/generation ownership remains monotonic; a replacement client explicitly resets shutdown state and publishes fresh `offline`.
+- Produces `stopArm(coordinator, reason, disposition): Promise<void>`.
+- Produces `shutdownClient(reason): Promise<void>` for last-client invalidation, clear, cancellation, settlement, listener removal, and coordinator deletion.
+- Keeps the existing `startPromise` cancellation contract.
+- Deletes the per-home coordinator after last-client shutdown so the replacement instance starts with fresh `offline` state.
 
 - [ ] **Step 1: Add failing tests 5, 6, 8, and 9**
 
@@ -516,13 +540,17 @@ test_pi_status_stale_generation_cannot_overwrite
 test_pi_status_cancelled_start_stays_cleared
 ```
 
-For the normal intentional-stop test, import the named `stopArm` helper and instrument the existing `signalArm` path (or observe the detached process group) before calling it:
+For the normal intentional-stop test, import the named `stopArm` helper and wrap `record.child.kill` before calling it:
 
 ```javascript
+const originalKill = record.child.kill.bind(record.child);
+record.child.kill = (signal) => {
+  if (record.intentionalStopReason !== "manual-stop") {
+    throw new Error("intentional stop reason was not installed before signal");
+  }
+  return originalKill(signal);
+};
 await mod.stopArm(coordinator, "manual-stop", "offline");
-if (record.intentionalStopReason !== "manual-stop") {
-  throw new Error("intentional stop reason was not installed before process-group signaling");
-}
 assert.deepEqual(harness.writes.at(-1), ["firstmate-pi-watcher", "offline"]);
 assert.equal(harness.writes.some(([, value]) => value === "attention"), false);
 assert.equal(harness.messages.length, 0);
@@ -559,15 +587,15 @@ tests/fm-pi-watch-extension.test.sh
 
 Expected: nonzero exit because the candidate does not clear the key, export the normal stop helper, or create fresh status state after reload.
 
-- [ ] **Step 3: Extend intentional-stop settlement without weakening process cleanup**
+- [ ] **Step 3: Implement intentional-stop settlement**
 
-Add the status disposition to the existing helper, but preserve its bounded detached-process-group algorithm exactly:
+Export the helper with this signature:
 
 ```typescript
 export async function stopArm(
   coordinator: ArmCoordinator,
   reason: string,
-  disposition: StopDisposition = "clear",
+  disposition: StopDisposition,
 ): Promise<void> {
   const record = coordinator.current;
   if (!record) {
@@ -579,13 +607,10 @@ export async function stopArm(
 
   if (!record.intentionalStopReason) record.intentionalStopReason = reason;
   if (coordinator.current === record) coordinator.state = "stopping";
-  signalArm(record, "SIGTERM");
-  if (!(await stopsWithin(record, STOP_GRACE_MS))) {
-    signalArm(record, "SIGKILL");
-    if (!(await stopsWithin(record, STOP_KILL_GRACE_MS))) {
-      settleArm(coordinator, record, null, "SIGKILL");
-    }
-  }
+  record.child.kill("SIGTERM");
+  await record.completion;
+  if (coordinator.current === record) coordinator.current = null;
+  coordinator.state = coordinator.current ? "running" : "idle";
 
   if (
     disposition === "offline" &&
@@ -597,8 +622,8 @@ export async function stopArm(
 }
 ```
 
-The status slice adds no polling or status timer.
-The existing deadline-bounded TERM and KILL waits remain cleanup mechanics only; never replace them with an unbounded wait for child settlement or direct-child-only `record.child.kill(...)`.
+This status slice adds no timer.
+If the execution base already has a one-shot bounded child-cleanup deadline named `STOP_TIMEOUT_MS`, preserve it inside this helper and do not use it to read or refresh status.
 
 - [ ] **Step 4: Clear before awaiting last-client shutdown**
 
@@ -626,12 +651,12 @@ async function shutdownClient(reason: string): Promise<void> {
     process.off("exit", coordinator.exitListener);
     coordinator.exitListener = undefined;
   }
+  coordinators.delete(fmHome);
 }
 ```
 
 Wire `session_shutdown` to `await shutdownClient(event.reason || "session-shutdown")`.
-A replacement factory reuses the coordinator, installs only its new client closure, resets `shuttingDown`/`startCancelled`, and publishes fresh `offline`; no stale Pi closure survives in `clients`.
-Make the process-exit listener perform the synchronous prefix of the same ordering while preserving full-group cleanup:
+Make the process-exit listener perform the synchronous prefix of the same ordering:
 
 ```typescript
 const cleanupOnProcessExit = () => {
@@ -642,12 +667,15 @@ const cleanupOnProcessExit = () => {
   coordinator.clients.clear();
   coordinator.shuttingDown = true;
   coordinator.startCancelled = true;
+  const record = coordinator.current;
+  if (record && !record.intentionalStopReason) {
+    record.intentionalStopReason = "process-exit";
+  }
   coordinator.generation += 1;
-  stopArmOnProcessExit(coordinator);
+  record?.child.kill("SIGTERM");
+  coordinators.delete(fmHome);
 };
 ```
-
-`stopArmOnProcessExit` remains the current detached-group TERM-then-KILL fallback; never replace it with direct PID signaling.
 
 - [ ] **Step 5: Prevent pending startup from restoring status**
 
@@ -744,22 +772,15 @@ assert_not_contains "$text" 'sendUserMessage' "Pi watcher still sends a syntheti
 for forbidden in 'setInterval(' 'setWidget(' 'setFooter(' 'gh pr' 'backlog.md' 'fm-pr-' 'tmux job' 'stall watchdog'; do
   assert_not_contains "$text" "$forbidden" "Pi watcher status introduced forbidden surface: $forbidden"
 done
-timer_lines=$(grep -n 'setTimeout(' "$EXT" || true)
-[ "$(printf '%s\n' "$timer_lines" | grep -c .)" -eq 1 ] \
-  || fail "Pi watcher must keep exactly one bounded cleanup timer source"
-assert_contains "$timer_lines" 'setTimeout(check, Math.min(10, remaining))' \
-  "Pi watcher contains a non-cleanup timer"
-timer_block=$(sed -n '/function stopsWithin/,/^}/p' "$EXT")
-assert_contains "$timer_block" 'const deadline = Date.now() + milliseconds' \
-  "Pi watcher cleanup timer lost its absolute bound"
-assert_contains "$timer_block" 'if (remaining <= 0)' \
-  "Pi watcher cleanup timer lost its deadline exit"
-assert_not_contains "$timer_block" 'publishStatus' "Pi watcher cleanup timer refreshes status"
-assert_not_contains "$timer_block" 'writeClientStatus' "Pi watcher cleanup timer writes client status"
-assert_not_contains "$timer_block" 'visibleStatus' "Pi watcher cleanup timer reads visible status"
+while IFS= read -r timer_line; do
+  case "$timer_line" in
+    *'setTimeout('*'STOP_TIMEOUT_MS'*) ;;
+    *) fail "Pi watcher contains a non-cleanup timer: $timer_line" ;;
+  esac
+done < <(grep -n 'setTimeout(' "$EXT" || true)
 ```
 
-The timer allow-list permits only the deadline-bounded polling source inside `stopsWithin`; callers bind it to `STOP_GRACE_MS` or `STOP_KILL_GRACE_MS`.
+The timer allow-list permits only a one-shot bounded cleanup deadline named `STOP_TIMEOUT_MS`.
 It does not permit a polling or status-refresh timer.
 
 - [ ] **Step 3: Record the exact 11-test mapping at the top of the existing test file**
@@ -963,7 +984,7 @@ git commit -m "test(pi): verify live watcher status sequence"
 Apply callback precedence in this exact order:
 
 1. Return if the record is already settled.
-2. Return if the record is not both `coordinator.current` and the current `generation`.
+2. Return after resolving completion if the record is not both `coordinator.current` and the current `generation`.
 3. Clear current ownership for the valid record.
 4. Return without wake or status if shutdown has begun or the record has an intentional-stop reason.
 5. Classify an actionable watcher line and call `sendMessage`.
@@ -983,13 +1004,11 @@ No callback, promise finalizer, or cleanup deadline may publish after that point
 - [ ] Confirm cancelled pending startup and ordinary task-worktree absence are both covered.
 - [ ] Search for key drift with `rg -n 'firstmate[.-]pi[.-]watcher' .pi tests docs/superpowers/plans/2026-07-10-pi-watcher-status-implementation.md` and require every status-key occurrence to be `firstmate-pi-watcher`.
 - [ ] Search for the obsolete wake API with `rg -n 'sendUserMessage' .pi/extensions/fm-primary-pi-watch.ts tests/fm-pi-watch-extension.test.sh` and require no matches.
-- [ ] Search for forbidden status timers with `rg -n 'setInterval|setTimeout' .pi/extensions/fm-primary-pi-watch.ts`; allow only the deadline-bounded cleanup polling source behind `stopsWithin`, `STOP_GRACE_MS`, and `STOP_KILL_GRACE_MS`.
+- [ ] Search for forbidden status timers with `rg -n 'setInterval|setTimeout' .pi/extensions/fm-primary-pi-watch.ts` and allow only a one-shot line using `STOP_TIMEOUT_MS`.
 - [ ] Run the writing-plans placeholder scan and remove every unresolved marker or deferred instruction.
-- [ ] Confirm `ArmRecord` owns no Pi runtime closure, every active client owns one `WakeSender`, and settlement routes through only the newest active client.
+- [ ] Confirm `ArmRecord.sendWake` returns `void` everywhere and no caller awaits it.
 - [ ] Confirm `StatusUi.setStatus(key, text)` accepts `string | undefined` and every clear passes `undefined`.
-- [ ] Confirm every status callback checks current record, current generation, active client, and shutdown state before writing.
-- [ ] Confirm output remains incremental and bounded, structured wake details preserve truncation metadata, and status changes never rescan unbounded process output.
-- [ ] Confirm intentional stop and process exit retain detached process-group TERM-to-KILL cleanup with bounded waits and no direct-child-only fallback as the primary path.
+- [ ] Confirm every status callback checks current record, current generation, and shutdown state before writing.
 - [ ] Confirm the old client clears on reload, the replacement starts `offline`, and quit clears before process cleanup.
 - [ ] Confirm the live script observes `offline` -> `watching` -> `handling wake` -> `watching` without combining the wake and re-arm into one prompt.
 - [ ] Confirm no PR, backlog, decision, widget, custom-footer, polling, jobs, tmux-job, or stall-watchdog behavior appears in the changed extension.
