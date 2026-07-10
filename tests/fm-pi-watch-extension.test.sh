@@ -185,6 +185,71 @@ EOF
   pass "A duplicate Pi watcher arm preserves watching without another start or generation"
 }
 
+test_pi_status_legacy_coordinator_reload_compatibility() {
+  local repo plugin out status
+  repo="$TMP_ROOT/pi-status-legacy-reload-root"
+  mkdir -p "$repo/bin" "$repo/config" "$repo/state"
+  install_pi_watch_extension_fixture "$repo"
+  install_pi_status_harness "$repo"
+  plugin="$repo/.pi/extensions/fm-primary-pi-watch.ts"
+  out=$(PLUGIN="$plugin" FM_HOME="$repo" FM_ROOT_OVERRIDE="$repo" STATUS_HARNESS="$repo/status-harness.mjs" \
+    node --input-type=module 2>&1 <<'EOF'
+import assert from "node:assert/strict";
+import { resolve } from "node:path";
+import { pathToFileURL } from "node:url";
+
+const { makeStatusHarness } = await import(
+  pathToFileURL(process.env.STATUS_HARNESS).href,
+);
+const harness = makeStatusHarness();
+const legacySender = async () => {};
+const legacyCoordinator = {
+  current: null,
+  lastCompleted: null,
+  generation: 0,
+  sequence: 0,
+  state: "idle",
+  startPromise: null,
+  startCancelled: false,
+  clients: new Map([[Symbol("legacy-pi-watch-client"), legacySender]]),
+};
+globalThis.__firstmatePiWatchCoordinators = new Map([
+  [resolve(process.env.FM_HOME), legacyCoordinator],
+]);
+
+const mod = await import(pathToFileURL(process.env.PLUGIN).href);
+mod.default(harness.pi);
+await harness.handlers.get("session_start")?.({ type: "session_start" }, harness.ctx);
+assert.deepEqual(harness.writes, [["firstmate-pi-watcher", "offline"]]);
+
+const newestClient = [...legacyCoordinator.clients.values()].at(-1);
+assert.equal(typeof newestClient, "function");
+assert.equal(newestClient.sendWake, newestClient);
+await newestClient("legacy callback wake", {
+  generation: 1,
+  kind: "actionable",
+  reason: "signal: legacy callback wake",
+  exitCode: 0,
+  signal: null,
+  truncated: false,
+  stdoutTruncated: false,
+  stderrTruncated: false,
+});
+assert.equal(harness.messages.length, 1);
+assert.equal(harness.messages[0].message.customType, "firstmate-watcher-wake");
+assert.match(harness.messages[0].message.content, /^FIRSTMATE WATCHER WAKE: legacy callback wake/);
+assert.deepEqual(harness.messages[0].options, {
+  deliverAs: "followUp",
+  triggerTurn: true,
+});
+EOF
+  )
+  status=$?
+  expect_code 0 "$status" "Pi status clients must remain callable across a legacy same-process reload"
+  [ -z "$out" ] || fail "Pi legacy reload-status test printed output: $out"
+  pass "Pi status clients remain callable across a legacy same-process reload"
+}
+
 installed_pi_package_dir() {
   local candidate pi_bin pi_target
   if [ -n "${FM_PI_PACKAGE_DIR:-}" ]; then
@@ -2275,6 +2340,7 @@ test_tracked_extension_present_and_self_hashing
 test_pi_status_loads_offline_before_arm
 test_pi_status_successful_arm_watching
 test_pi_status_duplicate_arm_preserves_watching
+test_pi_status_legacy_coordinator_reload_compatibility
 test_pi_extension_supervises_only_primary_or_secondmate_homes
 test_pi_live_lab_cleanup_is_owned
 test_pi_detached_launch_helper_preserves_exact_argv
