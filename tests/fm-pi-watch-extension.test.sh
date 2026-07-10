@@ -37,12 +37,13 @@ test_tracked_extension_present_and_self_hashing() {
   assert_contains "$text" ".pi-watch-extension-loaded" "tracked extension missing loaded marker"
   assert_contains "$text" 'createHash("sha256").update(readFileSync(extensionFile)).digest("hex")' "tracked extension does not self-hash its own content for extensionVersion"
   assert_contains "$text" 'fileURLToPath(import.meta.url)' "tracked extension does not self-locate via import.meta.url"
-  assert_contains "$text" "sessionOwnsLock" "tracked extension missing session lock ownership check"
   assert_contains "$text" 'type LockOwnership = "owned" | "missing" | "other"' "tracked extension does not distinguish missing lock from another owner"
   assert_contains "$text" "readFileSync(\`\${state}/.lock\`" "tracked extension does not read the effective session lock"
   assert_contains "$text" 'return pidAlive(lockPid) ? "other" : "missing"' "tracked extension does not allow a pre-lock load marker"
   assert_contains "$text" 'if (lockOwnership() === "other") return' "tracked extension overwrites another live session marker"
-  assert_contains "$text" "if (!sessionOwnsLock()) return { ok: false" "tracked extension arms without the session lock"
+  assert_contains "$text" "await recoverMissingLock()" "tracked extension does not recover a missing or stale session lock"
+  assert_contains "$text" 'if (ownership === "other") return { ok: false' "tracked extension does not refuse another live lock owner"
+  assert_contains "$text" 'if (lockOwnership() !== "owned") return { ok: false' "tracked extension does not re-check lock ownership after recovery"
   assert_contains "$text" "writeFileSync(marker, \`\${extensionVersion}\\n\${process.pid}\\n\`)" "tracked extension does not write the content version and process marker"
   assert_contains "$text" "const config = process.env.FM_CONFIG_OVERRIDE" "tracked extension missing effective config resolution"
   assert_contains "$text" "FM_CONFIG_OVERRIDE: config" "tracked extension does not pass the effective config to the watcher arm"
@@ -192,6 +193,134 @@ EOF
   expect_code 0 "$status" "Pi custom tool must return Pi's AgentToolResult shape"
   [ -z "$out" ] || fail "Pi tool-result test printed output: $out"
   pass "Pi custom tool returns text content and structured details"
+}
+
+test_pi_stale_lock_recovers_through_home_protocol() {
+  local repo home plugin lock_log arm_log probe out status
+  repo="$TMP_ROOT/pi-stale-lock-root"
+  home="$TMP_ROOT/pi-stale-lock-home"
+  lock_log="$TMP_ROOT/pi-stale-lock-protocol.log"
+  arm_log="$TMP_ROOT/pi-stale-lock-arm.log"
+  probe="$TMP_ROOT/pi-stale-lock-probe.mjs"
+  mkdir -p "$repo/bin" "$home/state" "$home/config"
+  install_pi_watch_extension_fixture "$repo"
+  plugin="$repo/.pi/extensions/fm-primary-pi-watch.ts"
+  cat > "$repo/bin/fm-lock.sh" <<'SH'
+#!/usr/bin/env bash
+printf 'invoked\n' >> "${FM_LOCK_LOG:?}"
+exec "${FM_REAL_LOCK:?}"
+SH
+  cat > "$repo/bin/fm-watch-arm.sh" <<'SH'
+#!/usr/bin/env bash
+printf 'arm\n' >> "${FM_ARM_LOG:?}"
+SH
+  chmod +x "$repo/bin/fm-lock.sh" "$repo/bin/fm-watch-arm.sh"
+  cat > "$probe" <<'EOF'
+import { spawnSync } from "node:child_process";
+import { existsSync, readFileSync, writeFileSync } from "node:fs";
+import { pathToFileURL } from "node:url";
+
+let tool = null;
+const pi = {
+  on() {},
+  registerCommand() {},
+  registerTool(candidate) {
+    if (candidate.name === "fm_watch_arm_pi") tool = candidate;
+  },
+  sendUserMessage: async () => {},
+};
+writeFileSync(`${process.env.FM_HOME}/state/.lock`, "999999\n");
+const mod = await import(pathToFileURL(process.env.PLUGIN).href);
+mod.default(pi);
+const result = await tool.execute("stale-lock", {}, undefined, undefined, {});
+if (result.details?.ok !== true) throw new Error(result.content?.[0]?.text || "stale lock recovery failed");
+const owner = readFileSync(`${process.env.FM_HOME}/state/.lock`, "utf8").trim();
+let pid = String(process.pid);
+let attached = false;
+for (let i = 0; i < 8 && pid && pid !== "1"; i += 1) {
+  if (pid === owner) {
+    attached = true;
+    break;
+  }
+  pid = spawnSync("ps", ["-o", "ppid=", "-p", pid], { encoding: "utf8" }).stdout.trim();
+}
+if (!attached) {
+  throw new Error("home lock protocol did not assign ownership to the attached Pi process");
+}
+for (let i = 0; i < 50 && !existsSync(process.env.FM_ARM_LOG); i += 1) {
+  await new Promise((resolve) => setTimeout(resolve, 20));
+}
+if (!existsSync(process.env.FM_ARM_LOG)) throw new Error("watch arm did not run after stale lock recovery");
+EOF
+  out=$(PLUGIN="$plugin" FM_HOME="$home" FM_ROOT_OVERRIDE="$repo" FM_LOCK_LOG="$lock_log" \
+    FM_REAL_LOCK="$ROOT/bin/fm-lock.sh" FM_ARM_LOG="$arm_log" node "$probe" 2>&1)
+  status=$?
+  expect_code 0 "$status" "Pi watcher must recover a stale dead lock through fm-lock.sh before arming"
+  [ "$(wc -l < "$lock_log" | tr -d ' ')" -eq 1 ] || fail "Pi stale-lock recovery invoked fm-lock.sh more than once"
+  [ -z "$out" ] || fail "Pi stale-lock recovery test printed output: $out"
+  pass "Pi stale lock recovers through the home-scoped lock protocol"
+}
+
+test_pi_live_other_lock_owner_is_refused() {
+  local repo home plugin lock_log arm_log probe out status
+  repo="$TMP_ROOT/pi-live-other-root"
+  home="$TMP_ROOT/pi-live-other-home"
+  lock_log="$TMP_ROOT/pi-live-other-lock-protocol.log"
+  arm_log="$TMP_ROOT/pi-live-other-arm.log"
+  probe="$TMP_ROOT/pi-live-other-probe.mjs"
+  mkdir -p "$repo/bin" "$home/state" "$home/config"
+  install_pi_watch_extension_fixture "$repo"
+  plugin="$repo/.pi/extensions/fm-primary-pi-watch.ts"
+  cat > "$repo/bin/fm-lock.sh" <<'SH'
+#!/usr/bin/env bash
+printf 'invoked\n' >> "${FM_LOCK_LOG:?}"
+exec "${FM_REAL_LOCK:?}"
+SH
+  cat > "$repo/bin/fm-watch-arm.sh" <<'SH'
+#!/usr/bin/env bash
+printf 'arm\n' >> "${FM_ARM_LOG:?}"
+SH
+  chmod +x "$repo/bin/fm-lock.sh" "$repo/bin/fm-watch-arm.sh"
+  cat > "$probe" <<'EOF'
+import { spawn } from "node:child_process";
+import { existsSync, writeFileSync } from "node:fs";
+import { pathToFileURL } from "node:url";
+
+const other = spawn(process.execPath, ["-e", "setInterval(() => {}, 1000)"], { stdio: "ignore" });
+await new Promise((resolve, reject) => {
+  other.once("spawn", resolve);
+  other.once("error", reject);
+});
+let tool = null;
+try {
+  writeFileSync(`${process.env.FM_HOME}/state/.lock`, `${other.pid}\n`);
+  const pi = {
+    on() {},
+    registerCommand() {},
+    registerTool(candidate) {
+      if (candidate.name === "fm_watch_arm_pi") tool = candidate;
+    },
+    sendUserMessage: async () => {},
+  };
+  const mod = await import(pathToFileURL(process.env.PLUGIN).href);
+  mod.default(pi);
+  const result = await tool.execute("live-other-lock", {}, undefined, undefined, {});
+  if (result.details?.ok !== false || !result.content?.[0]?.text.includes("read-only")) {
+    throw new Error(`unexpected live-other result: ${JSON.stringify(result)}`);
+  }
+  if (existsSync(process.env.FM_LOCK_LOG)) throw new Error("fm-lock.sh ran against a live other owner");
+  if (existsSync(process.env.FM_ARM_LOG)) throw new Error("watch arm ran against a live other owner");
+} finally {
+  other.kill("SIGTERM");
+  await new Promise((resolve) => other.once("close", resolve));
+}
+EOF
+  out=$(PLUGIN="$plugin" FM_HOME="$home" FM_ROOT_OVERRIDE="$repo" FM_LOCK_LOG="$lock_log" \
+    FM_REAL_LOCK="$ROOT/bin/fm-lock.sh" FM_ARM_LOG="$arm_log" node "$probe" 2>&1)
+  status=$?
+  expect_code 0 "$status" "Pi watcher must refuse a live other session owner without lock recovery"
+  [ -z "$out" ] || fail "Pi live-other lock test printed output: $out"
+  pass "Pi live other lock owner remains read-only"
 }
 
 test_pi_process_exit_cleanup_listener_lifecycle() {
@@ -556,7 +685,7 @@ test_opencode_primary_watch_plugin_static_wiring() {
   assert_contains "$text" "session.idle" "OpenCode plugin does not listen for session.idle"
   assert_contains "$text" "fm-watch-arm.sh" "OpenCode plugin does not spawn the watcher arm"
   assert_contains "$text" "promptAsync" "OpenCode plugin does not wake with promptAsync"
-  assert_contains "$text" ".fm-secondmate-home" "OpenCode plugin does not scope out secondmate homes"
+  assert_contains "$text" ".fm-secondmate-home" "OpenCode plugin does not recognize marked secondmate supervising homes"
   assert_contains "$text" "rev-parse\", \"--git-dir" "OpenCode plugin does not check linked worktree scope"
   assert_contains "$text" "sessionOwnsLock" "OpenCode plugin does not gate arm attempts on the session lock"
   assert_contains "$text" 'fm-watch-arm.sh" --restart' "OpenCode plugin does not restart into its own watcher child"
@@ -760,6 +889,52 @@ EOF
   expect_code 0 "$status" "OpenCode watch coordinator must keep primary scope checks in the shared arm path"
   [ -z "$out" ] || fail "OpenCode coordinator-scope test printed output: $out"
   pass "OpenCode watcher coordinator respects primary scope"
+}
+
+test_opencode_watch_arm_coordinator_accepts_marked_secondmate() {
+  local plugin base repo log out status
+  plugin="$ROOT/.opencode/plugins/fm-primary-watch-arm.js"
+  base="$TMP_ROOT/opencode-secondmate-base"
+  repo="$TMP_ROOT/opencode-secondmate-wt"
+  log="$TMP_ROOT/opencode-secondmate.log"
+  fm_git_worktree "$base" "$repo" fm/opencode-secondmate
+  mkdir -p "$repo/bin" "$repo/state" "$repo/config"
+  : > "$repo/AGENTS.md"
+  printf 'sm-opencode\n' > "$repo/.fm-secondmate-home"
+  : > "$repo/state/task.meta"
+  cat > "$repo/bin/fm-watch-arm.sh" <<'SH'
+#!/usr/bin/env bash
+printf 'arm\n' >> "${FM_ARM_LOG:?}"
+printf 'watcher: started pid=1 (beacon fresh)\n'
+SH
+  chmod +x "$repo/bin/fm-watch-arm.sh"
+  out=$(PLUGIN="$plugin" WORKTREE="$repo" FM_HOME="$repo" FM_ARM_LOG="$log" node 2>&1 <<'EOF'
+import { existsSync, writeFileSync } from "node:fs";
+import { pathToFileURL } from "node:url";
+
+const mod = await import(pathToFileURL(process.env.PLUGIN).href);
+const client = { session: { promptAsync: async () => {} } };
+await mod.FmPrimaryWatchArm({
+  client,
+  directory: process.env.WORKTREE,
+  worktree: process.env.WORKTREE,
+});
+writeFileSync(`${process.env.FM_HOME}/state/.lock`, `${process.pid}\n`);
+const status = await globalThis.__firstmateOpenCodeWatchArm.ensureArmed("session-test", client);
+if (status !== "armed") {
+  console.error(`expected armed, got ${status}`);
+  process.exit(1);
+}
+if (!existsSync(process.env.FM_ARM_LOG)) {
+  console.error("coordinator did not arm from a marked secondmate home");
+  process.exit(1);
+}
+EOF
+)
+  status=$?
+  expect_code 0 "$status" "OpenCode watch coordinator must accept a marked persistent secondmate home"
+  [ -z "$out" ] || fail "OpenCode marked-secondmate test printed output: $out"
+  pass "OpenCode watcher coordinator accepts a marked secondmate supervising home"
 }
 
 test_opencode_primary_watch_plugin_rearms_after_wake() {
@@ -972,6 +1147,8 @@ test_tracked_extension_present_and_self_hashing
 test_spawn_template_mentions_pi_watch_placeholder
 test_pi_extension_reports_external_healthy_watcher
 test_pi_tool_returns_agent_tool_result
+test_pi_stale_lock_recovers_through_home_protocol
+test_pi_live_other_lock_owner_is_refused
 test_pi_process_exit_cleanup_listener_lifecycle
 test_pi_session_shutdown_suppresses_intentional_exit
 test_pi_unexpected_actionable_exit_notifies_once
@@ -984,6 +1161,7 @@ test_opencode_primary_watch_plugin_uses_effective_state_home
 test_opencode_primary_watch_plugin_sources_effective_config
 test_opencode_primary_watch_plugin_requires_session_lock
 test_opencode_watch_arm_coordinator_respects_primary_scope
+test_opencode_watch_arm_coordinator_accepts_marked_secondmate
 test_opencode_primary_watch_plugin_rearms_after_wake
 test_opencode_watch_arm_coordinates_with_turnend_guard
 test_opencode_healthy_arm_output_does_not_suppress_guard
