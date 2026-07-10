@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Primary turn-end guard for the firstmate PRIMARY session only.
+# Turn-end guard for a firstmate primary or persistent secondmate supervisor.
 #
 # fm-guard.sh (bin/fm-guard.sh) is pull-based: it only warns when some other
 # supervision script happens to run. A primary session that ends a turn without
@@ -18,7 +18,7 @@
 # crewmate/scout task worktree spawned to work on firstmate itself (the
 # recursive "firstmate improving itself" case), and every secondmate home
 # (treehouse-leased or git-cloned). It must therefore scope itself to the
-# PRIMARY at runtime and stay a silent, fast no-op everywhere else.
+# SUPERVISING HOME at runtime and stay a silent, fast no-op everywhere else.
 #
 # Loop-guard: never block twice in the same turn. Claude Code and codex Stop
 # payloads carry stop_hook_active=true when the CURRENT stop attempt was itself
@@ -55,19 +55,17 @@ command -v jq >/dev/null 2>&1 || exit 0
 STOP_HOOK_ACTIVE=$(printf '%s' "$PAYLOAD" | jq -r '.stop_hook_active // false' 2>/dev/null) || exit 0
 [ "$STOP_HOOK_ACTIVE" = "true" ] && exit 0
 
-# --- scope precisely to the PRIMARY checkout --------------------------------
-# Excludes secondmate homes (the .fm-secondmate-home marker is written at seed
-# time regardless of whether the home was treehouse-leased or git-cloned; see
-# bin/fm-home-seed.sh) and ordinary crewmate/scout task worktrees of
-# firstmate-on-itself (bin/fm-spawn.sh only ever hands those out as genuine
-# linked `git worktree`s - it aborts the spawn otherwise - so a plain,
-# non-worktree checkout is never one of those). A linked worktree's git-dir
-# lives under the main repo's .git/worktrees/<name> and differs from the common
-# (shared) git-dir; only the main, non-worktree checkout has the two equal.
-[ -f "$FM_ROOT/.fm-secondmate-home" ] && exit 0
-GIT_DIR=$(git -C "$FM_ROOT" rev-parse --git-dir 2>/dev/null) || exit 0
-GIT_COMMON_DIR=$(git -C "$FM_ROOT" rev-parse --git-common-dir 2>/dev/null) || exit 0
-[ "$GIT_DIR" = "$GIT_COMMON_DIR" ] || exit 0
+# --- scope precisely to a SUPERVISING HOME ----------------------------------
+# A .fm-secondmate-home marker explicitly identifies a persistent secondmate
+# supervising its own isolated FM_HOME, whether the home is treehouse-leased
+# or git-cloned. Without that marker, only the main plain checkout is in scope.
+# Ordinary crewmate/scout task worktrees of firstmate-on-itself are genuine
+# linked git worktrees with distinct git-dir/common-dir values and stay inert.
+if [ ! -f "$FM_ROOT/.fm-secondmate-home" ]; then
+  GIT_DIR=$(git -C "$FM_ROOT" rev-parse --git-dir 2>/dev/null) || exit 0
+  GIT_COMMON_DIR=$(git -C "$FM_ROOT" rev-parse --git-common-dir 2>/dev/null) || exit 0
+  [ "$GIT_DIR" = "$GIT_COMMON_DIR" ] || exit 0
+fi
 [ -f "$FM_ROOT/AGENTS.md" ] || exit 0
 [ -d "$FM_ROOT/bin" ] || exit 0
 [ -d "$STATE" ] || exit 0

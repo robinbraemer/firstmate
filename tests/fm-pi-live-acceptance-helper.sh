@@ -127,6 +127,10 @@ verify_reload() {  # <path>
   local path=${1:?reload transcript path required}
   [ -f "$path" ] || { printf 'error: transcript not found: %s\n' "$path" >&2; exit 1; }
   cp "$path" "$EVIDENCE/reload-transcript.txt"
+  if grep -Fq 'TURN WOULD END BLIND' "$path"; then
+    printf 'error: Pi reload transcript contains a turn-end guard follow-up\n' >&2
+    exit 1
+  fi
   if grep -Fq 'FIRSTMATE WATCHER WAKE: watcher: FAILED' "$path"; then
     printf 'error: Pi reload transcript contains a false watcher failure\n' >&2
     exit 1

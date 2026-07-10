@@ -17,9 +17,9 @@ Ship native, unattended watcher supervision for Pi primaries and persistent seco
 
 1. Resolve `FM_ROOT`, `FM_HOME`, state, config, watcher arm, and lock paths from the extension's canonical file path and effective environment.
 2. Store a process-wide coordinator keyed by resolved `FM_HOME`.
-3. Share startup and the current owned arm across duplicate factories for that home.
+3. Share startup and the current attached arm across duplicate factories for that home.
 4. Delegate non-owned lock states to `bin/fm-lock.sh` and re-check ownership before arming.
-5. Spawn `bin/fm-watch-arm.sh --restart` as an owned detached process group with effective home and config overrides.
+5. Spawn `bin/fm-watch-arm.sh --restart` as an attached child with effective home and config overrides.
 6. Inject one follow-up for actionable, failed, or unexpectedly signaled exits.
 7. Suppress follow-ups for intentional reload, quit, process exit, and ownership transfer.
 8. Cancel and await an in-progress startup when the final extension client shuts down.
@@ -47,7 +47,7 @@ Ship native, unattended watcher supervision for Pi primaries and persistent seco
 
 1. Verify the watcher file is self-locating, self-hashing, and exposes one tool plus one command.
 2. Verify actionable output drains through one Pi follow-up and can re-arm a replacement generation.
-3. Verify reload and quit intentionally stop the owned process group without false wake injection.
+3. Verify reload and quit intentionally stop attached children without false wake injection.
 4. Verify duplicate factories share one lock claim and one arm.
 5. Verify a stale callback cannot clear a replacement generation.
 6. Verify shutdown during a delayed lock claim leaves no arm, watcher, or wake.
