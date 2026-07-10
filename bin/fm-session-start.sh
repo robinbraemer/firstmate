@@ -129,6 +129,12 @@ hash_file() {
   fi
 }
 
+shell_quote() {
+  printf "'"
+  printf '%s' "$1" | sed "s/'/'\\\\''/g"
+  printf "'"
+}
+
 pi_extension_loaded() {
   local marker=$1 expected_version=$2 lock=$3 marker_version marker_pid lock_pid
   [ -f "$marker" ] && [ -f "$lock" ] && [ -n "$expected_version" ] || return 1
@@ -212,7 +218,7 @@ if [ "$PRIMARY_HARNESS" = pi ]; then
   PI_LOCK="$STATE/.lock"
   PI_WATCH_VERSION=$(hash_file "$PI_EXT" || printf '')
   if ! pi_extension_loaded "$PI_WATCH_MARKER" "$PI_WATCH_VERSION" "$PI_LOCK"; then
-    printf 'PI_WATCH_EXTENSION: not loaded - approve Pi project trust once per clone, then restart plain pi so %s auto-loads for background wake coverage; use -e %s only if project hooks are not trusted\n' "$PI_EXT" "$PI_EXT"
+    printf 'PI_WATCH_EXTENSION: not loaded - restart Pi outside its composer with --approve -e %s; never submit the launch as a Pi prompt or start a nested Pi through its Bash tool\n' "$(shell_quote "$PI_EXT")"
   fi
 fi
 "$SCRIPT_DIR/fm-supervision-instructions.sh" \
