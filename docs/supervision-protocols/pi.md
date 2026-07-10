@@ -4,7 +4,7 @@ When this session owns supervision and away mode is not active:
 1. Drain first with `bin/fm-wake-drain.sh`.
 2. Confirm Pi loaded the tracked project watcher extension.
 3. A trusted plain Firstmate checkout auto-loads it, and explicitly naming the same canonical file with `-e` is safely deduplicated by Pi.
-4. For an unattended firstmate or secondmate launch, use `--approve -e '__FM_PI_EXT__'` so project resources are approved for that run and the tracked extension still resolves to one canonical source.
+4. For an unattended firstmate or secondmate launch, use `--approve -e __FM_PI_EXT_SH__` so project resources are approved for that run and the tracked extension still resolves to one canonical source.
    Replace the Pi process from outside its composer; never submit a Pi launch command as a Pi prompt or start a nested Pi through its own Bash tool.
 5. Bare `-e` does not suppress Pi's project-trust dialog.
 6. Arm supervision with the `fm_watch_arm_pi` tool.

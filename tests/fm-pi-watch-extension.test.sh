@@ -140,6 +140,29 @@ EOF
   expect_code 0 "$status" "ordinary linked task worktrees must keep the Pi watcher extension inert"
   [ -z "$out" ] || fail "Pi linked-worktree scope test printed output: $out"
 
+  out=$(env -u FM_HOME -u FM_ROOT_OVERRIDE PLUGIN="$plugin" WORKTREE="$worktree" node --input-type=module 2>&1 <<'EOF'
+import { existsSync } from "node:fs";
+import { pathToFileURL } from "node:url";
+
+let registrations = 0;
+const pi = {
+  on() { registrations += 1; },
+  registerCommand() { registrations += 1; },
+  registerTool() { registrations += 1; },
+  sendMessage: async () => {},
+};
+const mod = await import(pathToFileURL(process.env.PLUGIN).href);
+mod.default(pi);
+if (registrations !== 0) throw new Error(`default-env linked worktree registered ${registrations} watcher callbacks`);
+if (existsSync(`${process.env.WORKTREE}/state/.pi-watch-extension-loaded`)) {
+  throw new Error("default-env linked worktree wrote the loaded marker");
+}
+EOF
+)
+  status=$?
+  expect_code 0 "$status" "default-env ordinary linked task worktrees must keep the Pi watcher extension inert"
+  [ -z "$out" ] || fail "Pi default-env linked-worktree scope test printed output: $out"
+
   mkdir -p "$worktree/state" "$worktree/config"
   out=$(PLUGIN="$plugin" FM_HOME="$worktree" FM_ROOT_OVERRIDE="$worktree" node --input-type=module 2>&1 <<'EOF'
 import { existsSync, readFileSync, writeFileSync } from "node:fs";
@@ -1266,8 +1289,8 @@ test_pi_session_shutdown_kills_entire_process_group() {
   plugin="$repo/.pi/extensions/fm-primary-pi-watch.ts"
   cat > "$repo/bin/fm-watch-arm.sh" <<'SH'
 #!/usr/bin/env bash
-trap '' TERM
-( trap '' TERM; while :; do sleep 1; done ) &
+trap 'exit 0' TERM
+( trap '' TERM; exec >/dev/null 2>&1; while :; do sleep 1; done ) &
 printf '%s %s\n' "$$" "$!" > "$FM_GROUP_PIDS"
 while :; do sleep 1; done
 SH
