@@ -699,6 +699,58 @@ SH
   pass "session lock recognizes only verified Pi process identities"
 }
 
+test_session_lock_reclaims_aged_acquisition_mutex_with_reused_pid() {
+  local home state fakebin reused holder out status
+  home="$TMP_ROOT/session-lock-aged-mutex-home"
+  state="$home/state"
+  fakebin="$TMP_ROOT/session-lock-aged-mutex-fakebin"
+  mkdir -p "$state/.lock.acquire" "$fakebin"
+  sleep 300 & reused=$!
+  sleep 300 & holder=$!
+  printf '%s\n' "$reused" > "$state/.lock.acquire/pid"
+  cat > "$fakebin/ps" <<'SH'
+#!/usr/bin/env bash
+set -u
+pid=
+prev=
+for arg in "$@"; do
+  [ "$prev" = -p ] && pid=$arg
+  prev=$arg
+done
+case "$*" in
+  *"comm="*)
+    if [ "$pid" = "$FM_HOLDER_PID" ]; then printf 'pi\n'; else printf 'bash\n'; fi
+    ;;
+  *"args="*)
+    if [ "$pid" = "$FM_HOLDER_PID" ]; then printf 'pi\n'; else printf 'bash fm-lock.sh\n'; fi
+    ;;
+  *"ppid="*) printf '%s\n' "$FM_HOLDER_PID" ;;
+  *) exit 1 ;;
+esac
+SH
+  chmod +x "$fakebin/ps"
+
+  out=$(PATH="$fakebin:$PATH" FM_HOME="$home" FM_HOLDER_PID="$holder" \
+    "$ROOT/bin/fm-lock.sh" 2>&1)
+  status=$?
+  expect_code 1 "$status" "a fresh acquisition mutex with a live PID must remain authoritative"
+  assert_contains "$out" "another session lock acquisition is in progress" "fresh live mutex refusal was not reported"
+  [ ! -e "$state/.lock" ] || fail "fresh live mutex refusal published a session owner"
+
+  touch -t 202001010000 "$state/.lock.acquire"
+  out=$(PATH="$fakebin:$PATH" FM_HOME="$home" FM_HOLDER_PID="$holder" \
+    "$ROOT/bin/fm-lock.sh" 2>&1)
+  status=$?
+  kill "$reused" "$holder" 2>/dev/null || true
+  wait "$reused" "$holder" 2>/dev/null || true
+
+  expect_code 0 "$status" "an aged acquisition mutex with a reused live PID must be reclaimed"
+  assert_contains "$out" "lock acquired: harness pid $holder" "aged mutex recovery did not publish the session owner"
+  [ "$(cat "$state/.lock")" = "$holder" ] || fail "aged mutex recovery published the wrong session owner"
+  [ -z "$(find "$state" -name '.lock.acquire*' -print -quit)" ] || fail "aged acquisition mutex state survived recovery"
+  pass "session lock reclaims an aged acquisition mutex with a reused PID"
+}
+
 test_session_lock_reclaim_has_one_atomic_winner() {
   local home state fakebin barrier stale holder_a holder_b mutex_dead claim_a claim_b rc_a rc_b wins owner
   home="$TMP_ROOT/session-lock-race-home"
@@ -2090,6 +2142,8 @@ test_pi_tool_returns_agent_tool_result
 test_pi_stale_lock_recovers_through_home_protocol
 test_pi_live_non_harness_lock_is_reclaimed
 test_pi_live_other_lock_owner_is_refused
+test_session_lock_recognizes_only_verified_pi_processes
+test_session_lock_reclaims_aged_acquisition_mutex_with_reused_pid
 test_session_lock_reclaim_has_one_atomic_winner
 test_pi_process_exit_cleanup_listener_lifecycle
 test_pi_session_shutdown_suppresses_intentional_exit
