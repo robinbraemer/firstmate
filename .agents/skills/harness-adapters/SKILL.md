@@ -204,7 +204,7 @@ Pi sets `PI_CODING_AGENT=true` for its children; this is its harness-detection e
 **Primary-session watcher fact (verified 2026-07-10, Pi 0.80.6).**
 The firstmate PRIMARY's own `.pi/extensions/fm-primary-pi-watch.ts` owns actionable watcher wake delivery, re-arm, shutdown, and the PreToolUse watcher-arm seatbelt.
 The model arms through `fm_watch_arm_pi`, never a foreground bash arm; the watcher tool result and clean-exit fallback are owned by `docs/supervision-protocols/pi.md`.
-`bin/fm-session-start.sh` reports when the live Pi session has not loaded the watcher extension, and points at an outside-the-composer restart with one-run `--approve -e <canonical-watcher-path>` so the extension loads without a saved trust decision.
+`bin/fm-session-start.sh` reports when the live Pi session has not loaded the watcher extension, and points at plain `pi` after project trust as the fix, with `-e` as a trust-free fallback.
 When a secondmate is launched on Pi, `fm-spawn.sh --secondmate` launches Pi with one-run `--approve` and `-e .pi/extensions/fm-primary-pi-watch.ts`, already present in the secondmate home's git worktree.
 
 ## grok (VERIFIED 2026-06-29, grok 0.2.73; slash-submit behavior re-verified 2026-07-03, grok 0.2.82)

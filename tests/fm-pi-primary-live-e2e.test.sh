@@ -16,7 +16,8 @@ AUTH_FILE=${FM_PI_LIVE_AUTH_FILE:-}
 TMUX=$(command -v tmux)
 SOCKET="fm-pi-live-e2e-$$"
 SESSION=pi-live-e2e
-LAB="${FM_PI_LIVE_LAB:-$ROOT/.pi-live-e2e.$$}"
+LAB=$(mktemp -d "$ROOT/.pi-live-e2e.XXXXXX")
+LAB_SENTINEL="$LAB/.fm-pi-live-e2e-owned"
 PROJECT="$LAB/project"
 PI_DIR="$LAB/pi-agent"
 PI_VERSION=$(pi --version)
@@ -98,7 +99,7 @@ cleanup() {
   if [ -n "$arm_pid" ] && lab_pid_is_safe "$arm_pid"; then
     kill -TERM "$arm_pid" 2>/dev/null || true
   fi
-  if [ "${FM_PI_LIVE_KEEP_LAB:-0}" != 1 ]; then
+  if [ "${FM_PI_LIVE_KEEP_LAB:-0}" != 1 ] && [ -f "$LAB_SENTINEL" ]; then
     rm -rf "$LAB"
   fi
 }
@@ -132,7 +133,7 @@ wait_for_pi_exit_zero() {
   return 1
 }
 
-mkdir -p "$LAB"
+: > "$LAB_SENTINEL"
 git clone -q "$ROOT" "$PROJECT"
 # Before the candidate commit exists, apply its current product diff to the
 # clone. After commit this is an empty patch and the clone already has it.
@@ -160,7 +161,6 @@ cp "$PROJECT/.pi/extensions/fm-primary-pi-watch.ts" "$PROJECT/state/distinct-wat
 set +e
 negative_output=$(cd "$PROJECT" && PI_CODING_AGENT_DIR="$PI_DIR" PI_OFFLINE=1 FM_HOME="$PROJECT" \
   pi --approve --offline --print --no-session \
-    -e "$PROJECT/.pi/extensions/fm-primary-turnend-guard.ts" \
     -e "$PROJECT/state/distinct-watch-copy.ts" \
     'do not run' 2>&1)
 negative_rc=$?
@@ -169,19 +169,16 @@ set -e
 printf '%s\n' "$negative_output" | grep -Fq 'Tool "fm_watch_arm_pi" conflicts with' || fail "distinct-path watcher control did not report the duplicate tool"
 rm -f "$PROJECT/state/distinct-watch-copy.ts"
 
-TURNEND="$PROJECT/.pi/extensions/fm-primary-turnend-guard.ts"
 WATCH="$PROJECT/.pi/extensions/fm-primary-pi-watch.ts"
 "$TMUX" -L "$SOCKET" new-session -d -s "$SESSION" -c "$PROJECT" \
-  "env PI_CODING_AGENT_DIR='$PI_DIR' FM_HOME='$PROJECT' FM_ROOT_OVERRIDE='$PROJECT' FM_POLL=1 FM_SIGNAL_GRACE=0 FM_HEARTBEAT=600 PI_OFFLINE=1 pi --approve --offline --no-session --verbose -e '$TURNEND' -e '$WATCH' 'Reply exactly CHARTER-ACCEPTED.'"
+  "env PI_CODING_AGENT_DIR='$PI_DIR' FM_HOME='$PROJECT' FM_ROOT_OVERRIDE='$PROJECT' FM_POLL=1 FM_SIGNAL_GRACE=0 FM_HEARTBEAT=600 PI_OFFLINE=1 pi --approve --offline --no-session --verbose -e '$WATCH' 'Reply exactly CHARTER-ACCEPTED.'"
 "$TMUX" -L "$SOCKET" set-window-option -t "$SESSION" remain-on-exit on
 
 wait_for_text "CHARTER-ACCEPTED" 180 || fail "fresh Pi secondmate charter prompt did not complete"
 initial_pane=$(capture)
 printf '%s\n' "$initial_pane" | grep -Fq 'Trust project folder?' && fail "--approve still produced a project trust dialog"
 watch_count=$(printf '%s\n' "$initial_pane" | grep -o 'fm-primary-pi-watch.ts' | wc -l | tr -d ' ')
-turnend_count=$(printf '%s\n' "$initial_pane" | grep -o 'fm-primary-turnend-guard.ts' | wc -l | tr -d ' ')
 [ "$watch_count" -eq 1 ] || fail "same-path explicit+auto loading showed watcher extension $watch_count times"
-[ "$turnend_count" -eq 1 ] || fail "same-path explicit+auto loading showed turn-end extension $turnend_count times"
 printf '%s\n' "$initial_pane" | grep -Fq 'harness-adapters' || fail "--approve did not preserve project Firstmate skills"
 mkdir -p "$LAB/fakebin"
 cat > "$LAB/fakebin/tmux" <<SH
@@ -204,8 +201,9 @@ awk -v pi="$pi_pid" '$1 ~ /^[0-9]+$/ && $2 == pi && $0 ~ /bash/ { found=1 } END 
   || fail "stock Bash was not recorded as a direct Pi child"
 
 : > "$PROJECT/state/pi-e2e.meta"
-send_prompt 'Reply exactly GUARD-TRIGGER with no tools. When the turn-end guard follow-up arrives, use fm_watch_arm_pi and never use bash to arm supervision. After any FIRSTMATE WATCHER WAKE, run bin/fm-wake-drain.sh, read the signaled status, call fm_watch_arm_pi to re-arm, and finish exactly REARMED.'
-wait_for_text "watcher: started Pi extension arm child 1" 180 || fail "secondmate blind-turn guard did not arm through the native Pi tool"
+send_prompt 'Use fm_watch_arm_pi exactly once to start supervision. Never use bash to arm supervision. Reply exactly ARMED. After any FIRSTMATE WATCHER WAKE, run bin/fm-wake-drain.sh, read the signaled status, call fm_watch_arm_pi to re-arm, and finish exactly REARMED.'
+wait_for_text "watcher: started Pi extension arm child 1" 180 || fail "native Pi tool did not arm supervision"
+wait_for_text "ARMED" 120 || fail "Pi did not settle after initial native arm"
 
 printf 'done: pi live e2e watcher fire\n' > "$PROJECT/state/pi-e2e.status"
 wait_for_text "watcher: started Pi extension arm child 2" 240 || fail "watcher wake did not drain and re-arm through the Pi tool"
@@ -214,7 +212,7 @@ wait_for_settled_composer || fail "Pi composer did not settle before reload"
 
 before_reload=$(capture)
 guard_count=$(printf '%s\n' "$before_reload" | grep -Fc "TURN WOULD END BLIND - supervision is off." || true)
-[ "$guard_count" -eq 1 ] || fail "expected one secondmate guard injection, saw $guard_count"
+[ "$guard_count" -eq 0 ] || fail "watcher-only Pi injected $guard_count turn-end guard follow-ups"
 false_failure_count=$(printf '%s\n' "$before_reload" | grep -Fc 'FIRSTMATE WATCHER WAKE: watcher: FAILED' || true)
 [ "$false_failure_count" -eq 0 ] || fail "watcher failure appeared before reload"
 pid_file=$(find "$PROJECT/state" -maxdepth 3 -type f -name pid | head -1)
@@ -249,4 +247,4 @@ wait_for_pi_exit_zero || fail "Pi did not exit cleanly with status 0"
 wait_pid_dead "$new_watcher_pid" || fail "watcher child survived clean Pi exit"
 wait_pid_dead "$new_arm_pid" || fail "arm child survived clean Pi exit"
 
-printf 'ok - Pi %s isolated secondmate loaded canonical extensions once, locked through stock Bash, guarded, woke, reloaded without a false wake, re-armed, and cleaned up\n' "$PI_VERSION"
+printf 'ok - Pi %s isolated secondmate loaded the canonical watcher once, locked through stock Bash, woke, reloaded without a false wake, re-armed, and cleaned up\n' "$PI_VERSION"

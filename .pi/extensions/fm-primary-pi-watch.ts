@@ -182,6 +182,20 @@ function stopArm(coordinator: ArmCoordinator, reason: string): Promise<void> {
   return record.completion;
 }
 
+function runPretoolCheck(command: string): Promise<{ code: number; stderr: string }> {
+  return new Promise((resolveResult) => {
+    const child = spawn(`${root}/bin/fm-arm-pretool-check.sh`, ["--command", command], {
+      stdio: ["ignore", "ignore", "pipe"],
+    });
+    let stderr = "";
+    child.stderr.on("data", (chunk) => {
+      stderr += chunk.toString();
+    });
+    child.on("error", () => resolveResult({ code: 0, stderr: "" }));
+    child.on("close", (code) => resolveResult({ code: code ?? 0, stderr }));
+  });
+}
+
 export default function (pi: ExtensionAPI) {
   const coordinator = coordinatorForHome();
   const client = Symbol("pi-watch-extension-client");
@@ -278,6 +292,15 @@ export default function (pi: ExtensionAPI) {
       process.off("exit", coordinator.exitListener);
       coordinator.exitListener = undefined;
     }
+  });
+
+  pi.on("tool_call", async (event) => {
+    if (event.type !== "tool_call" || event.toolName !== "bash") return {};
+    const command = String((event.input as { command?: unknown })?.command ?? "");
+    if (!command) return {};
+    const result = await runPretoolCheck(command);
+    if (result.code !== 2) return {};
+    return { block: true, reason: result.stderr.trim() || "denied by the watcher-arm PreToolUse seatbelt" };
   });
 
   pi.registerCommand?.("fm-watch-arm-pi", {

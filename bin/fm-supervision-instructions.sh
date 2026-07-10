@@ -97,7 +97,6 @@ shell_quote() {
 }
 
 x_mode_env_sh=$(shell_quote "$x_mode_env")
-pi_ext_sh=$(shell_quote "$pi_ext")
 
 if [ "$X_MODE" -eq 0 ] && [ -f "$x_mode_env" ]; then
   X_MODE=1
@@ -106,12 +105,9 @@ fi
 render_snippet() {
   local line
   while IFS= read -r line || [ -n "$line" ]; do
-    case "$line" in
-      *__FM_PI_EXT_SH__*) line=${line//__FM_PI_EXT_SH__/$pi_ext_sh} ;;
-      *__FM_PI_EXT__*) line=${line//__FM_PI_EXT__/$pi_ext} ;;
-      *__FM_X_MODE_ENV_SH__*) line=${line//__FM_X_MODE_ENV_SH__/$x_mode_env_sh} ;;
-      *__FM_X_MODE_ENV__*) line=${line//__FM_X_MODE_ENV__/$x_mode_env} ;;
-    esac
+    line=${line//__FM_PI_EXT__/$pi_ext}
+    line=${line//__FM_X_MODE_ENV_SH__/$x_mode_env_sh}
+    line=${line//__FM_X_MODE_ENV__/$x_mode_env}
     printf '%s\n' "$line"
   done < "$SNIPPET"
 }
@@ -142,7 +138,7 @@ repair_line() {
       printf '%s%s%s%s\n' "$prefix" 'resume supervision with a foreground checkpoint: bin/fm-watch-checkpoint.sh --seconds ' "$checkpoint_seconds" '.'
       ;;
     pi)
-      printf '%s%s%s%s\n' "$prefix" "resume supervision with the Pi tool fm_watch_arm_pi or restart Pi outside Pi's composer with --approve -e " "$pi_ext_sh" ' if the extension is not loaded.'
+      printf '%s%s%s%s\n' "$prefix" 'resume supervision with the Pi tool fm_watch_arm_pi or restart Pi with -e ' "$pi_ext" ' if the extension is not loaded.'
       ;;
     opencode)
       printf '%s%s\n' "$prefix" 'resume supervision by letting the OpenCode TUI plugin arm after idle; use bin/fm-watch-arm.sh only as a manual recovery probe if the plugin reports failure.'
