@@ -42,6 +42,7 @@ test_tracked_extension_present_and_self_hashing() {
   assert_contains "$text" 'return pidAlive(lockPid) ? "other" : "missing"' "tracked extension does not allow a pre-lock load marker"
   assert_contains "$text" 'if (lockOwnership() !== "owned") await claimSessionLock()' "tracked extension does not delegate every non-owned state to the home lock protocol"
   assert_contains "$text" 'if (lockOwnership() !== "owned") return { ok: false' "tracked extension does not re-check lock ownership after recovery"
+  assert_contains "$text" 'signal: NodeJS.Signals | null' "tracked extension does not retain child close signals"
   assert_contains "$text" "writeFileSync(marker, \`\${extensionVersion}\\n\${process.pid}\\n\`)" "tracked extension does not write the content version and process marker"
   assert_contains "$text" "const config = process.env.FM_CONFIG_OVERRIDE" "tracked extension missing effective config resolution"
   assert_contains "$text" "FM_CONFIG_OVERRIDE: config" "tracked extension does not pass the effective config to the watcher arm"
@@ -334,13 +335,16 @@ EOF
 }
 
 test_pi_live_other_lock_owner_is_refused() {
-  local repo home plugin lock_log arm_log probe out status
+  local repo home plugin lock_log arm_log probe live_pi_entry out status
   repo="$TMP_ROOT/pi-live-other-root"
   home="$TMP_ROOT/pi-live-other-home"
   lock_log="$TMP_ROOT/pi-live-other-lock-protocol.log"
   arm_log="$TMP_ROOT/pi-live-other-arm.log"
   probe="$TMP_ROOT/pi-live-other-probe.mjs"
+  live_pi_entry="$repo/fixture/node_modules/@earendil-works/pi-coding-agent/dist/cli.js"
   mkdir -p "$repo/bin" "$home/state" "$home/config"
+  mkdir -p "$(dirname "$live_pi_entry")"
+  printf 'setInterval(() => {}, 1000);\n' > "$live_pi_entry"
   install_pi_watch_extension_fixture "$repo"
   plugin="$repo/.pi/extensions/fm-primary-pi-watch.ts"
   cat > "$repo/bin/fm-lock.sh" <<'SH'
@@ -358,7 +362,7 @@ import { spawn } from "node:child_process";
 import { existsSync, writeFileSync } from "node:fs";
 import { pathToFileURL } from "node:url";
 
-const other = spawn(process.execPath, ["-e", "setInterval(() => {}, 1000)"], { argv0: "pi", stdio: "ignore" });
+const other = spawn(process.execPath, [process.env.FM_LIVE_PI_ENTRY], { stdio: "ignore" });
 await new Promise((resolve, reject) => {
   other.once("spawn", resolve);
   other.once("error", reject);
@@ -388,12 +392,58 @@ try {
 }
 EOF
   out=$(PLUGIN="$plugin" FM_HOME="$home" FM_ROOT_OVERRIDE="$repo" FM_LOCK_LOG="$lock_log" \
+    FM_LIVE_PI_ENTRY="$live_pi_entry" \
     FM_REAL_LOCK="$ROOT/bin/fm-lock.sh" FM_ARM_LOG="$arm_log" node "$probe" 2>&1)
   status=$?
   expect_code 0 "$status" "Pi watcher must let fm-lock.sh refuse a verified live other session owner"
   [ "$(wc -l < "$lock_log" | tr -d ' ')" -eq 1 ] || fail "Pi live-owner classification did not invoke fm-lock.sh exactly once"
   [ -z "$out" ] || fail "Pi live-other lock test printed output: $out"
   pass "Pi verified live other lock owner remains read-only"
+}
+
+test_session_lock_recognizes_only_verified_pi_processes() {
+  local home state fakebin holder out
+  home="$TMP_ROOT/session-lock-pi-identity-home"
+  state="$home/state"
+  fakebin=$(fm_fakebin "$TMP_ROOT/session-lock-pi-identity-fakebin")
+  mkdir -p "$state"
+  sleep 300 & holder=$!
+  printf '%s\n' "$holder" > "$state/.lock"
+  cat > "$fakebin/ps" <<'SH'
+#!/usr/bin/env bash
+case "$*" in
+  *"comm="*) printf '%s\n' "$FM_TEST_COMM" ;;
+  *"args="*) printf '%s\n' "$FM_TEST_ARGS" ;;
+  *) exit 1 ;;
+esac
+SH
+  chmod +x "$fakebin/ps"
+
+  out=$(PATH="$fakebin:$PATH" FM_HOME="$home" FM_TEST_COMM=/opt/bin/pi \
+    FM_TEST_ARGS='/opt/bin/pi --model test' "$ROOT/bin/fm-lock.sh" status)
+  assert_contains "$out" "held by live harness" "an exact Pi command identity was not recognized as a live lock owner"
+
+  out=$(PATH="$fakebin:$PATH" FM_HOME="$home" FM_TEST_COMM=/usr/bin/node \
+    FM_TEST_ARGS='/usr/bin/node /opt/pi/node_modules/@earendil-works/pi-coding-agent/dist/cli.js --model test' \
+    "$ROOT/bin/fm-lock.sh" status)
+  assert_contains "$out" "held by live harness" "the verified Pi Node entrypoint was not recognized as a live lock owner"
+
+  out=$(PATH="$fakebin:$PATH" FM_HOME="$home" FM_TEST_COMM=/usr/bin/node \
+    FM_TEST_ARGS='/usr/bin/node /opt/pi-helper.js' "$ROOT/bin/fm-lock.sh" status)
+  assert_contains "$out" "stale" "a generic Node process was trusted as a live Pi lock owner"
+
+  out=$(PATH="$fakebin:$PATH" FM_HOME="$home" FM_TEST_COMM=/usr/bin/node \
+    FM_TEST_ARGS='/usr/bin/node /opt/pi/node_modules/@earendil-works/pi-coding-agent/dist/cli.js.evil' \
+    "$ROOT/bin/fm-lock.sh" status)
+  assert_contains "$out" "stale" "a suffixed Pi entrypoint argument was trusted as a live lock owner"
+
+  out=$(PATH="$fakebin:$PATH" FM_HOME="$home" FM_TEST_COMM=/opt/bin/pi \
+    FM_TEST_ARGS='/usr/bin/node server.js' "$ROOT/bin/fm-lock.sh" status)
+  assert_contains "$out" "stale" "a Pi comm without a matching Pi argv identity was trusted as a live lock owner"
+
+  kill "$holder" 2>/dev/null || true
+  wait "$holder" 2>/dev/null || true
+  pass "session lock recognizes only verified Pi process identities"
 }
 
 test_session_lock_reclaim_has_one_atomic_winner() {
@@ -531,7 +581,7 @@ test_pi_session_shutdown_suppresses_intentional_exit() {
   plugin="$repo/.pi/extensions/fm-primary-pi-watch.ts"
   cat > "$repo/bin/fm-watch-arm.sh" <<'SH'
 #!/usr/bin/env bash
-trap 'printf "cleaned\n" > "$FM_CLEANUP_LOG"; exit 143' TERM
+trap 'printf "cleaned\n" > "$FM_CLEANUP_LOG"; trap - TERM; kill -TERM $$' TERM
 printf '%s\n' "$$" > "$FM_CHILD_PID_FILE"
 while :; do sleep 1; done
 SH
@@ -570,7 +620,7 @@ if (prompts !== 0) throw new Error(`intentional shutdown emitted ${prompts} watc
 EOF
 )
   status=$?
-  expect_code 0 "$status" "Pi reload shutdown must await cleanup and suppress the intentional exit-143 wake"
+  expect_code 0 "$status" "Pi reload shutdown must await cleanup and suppress the intentional SIGTERM wake"
   [ -z "$out" ] || fail "Pi intentional-shutdown test printed output: $out"
   pass "Pi session shutdown awaits arm cleanup without a false watcher wake"
 }
@@ -620,6 +670,59 @@ EOF
   expect_code 0 "$status" "Pi actionable arm completion must notify exactly once"
   [ -z "$out" ] || fail "Pi actionable-exit test printed output: $out"
   pass "Pi unexpected actionable arm completion notifies once"
+}
+
+test_pi_unexpected_signaled_exit_notifies_once() {
+  local repo home plugin out status
+  repo="$TMP_ROOT/pi-signaled-root"
+  home="$TMP_ROOT/pi-signaled-home"
+  mkdir -p "$repo/bin" "$home/state" "$home/config"
+  install_pi_watch_extension_fixture "$repo"
+  plugin="$repo/.pi/extensions/fm-primary-pi-watch.ts"
+  cat > "$repo/bin/fm-watch-arm.sh" <<'SH'
+#!/usr/bin/env bash
+exec sleep 300
+SH
+  chmod +x "$repo/bin/fm-watch-arm.sh"
+  out=$(PLUGIN="$plugin" FM_HOME="$home" FM_ROOT_OVERRIDE="$repo" node --input-type=module 2>&1 <<'EOF'
+import { writeFileSync } from "node:fs";
+import { pathToFileURL } from "node:url";
+
+let tool = null;
+const prompts = [];
+const pi = {
+  on() {},
+  registerCommand() {},
+  registerTool(candidate) {
+    if (candidate.name === "fm_watch_arm_pi") tool = candidate;
+  },
+  sendUserMessage: async (message) => {
+    prompts.push(message);
+  },
+};
+writeFileSync(`${process.env.FM_HOME}/state/.lock`, `${process.pid}\n`);
+const mod = await import(pathToFileURL(process.env.PLUGIN).href);
+mod.default(pi);
+await tool.execute("tool-call-signaled", {}, undefined, undefined, {});
+const coordinator = [...globalThis.__firstmatePiWatchCoordinators.values()][0];
+const record = coordinator.current;
+if (!record) throw new Error("signaled arm child did not start");
+record.child.kill("SIGTERM");
+for (let i = 0; i < 50 && prompts.length === 0; i += 1) {
+  await new Promise((resolve) => setTimeout(resolve, 20));
+}
+if (prompts.length !== 1) throw new Error(`expected one signaled-exit follow-up, saw ${prompts.length}`);
+if (!prompts[0].includes("terminated by SIGTERM")) throw new Error(prompts[0]);
+record.child.emit("error", new Error("synthetic post-close error"));
+record.child.emit("close", null, "SIGKILL");
+await new Promise((resolve) => setTimeout(resolve, 80));
+if (prompts.length !== 1) throw new Error(`signaled exit notified ${prompts.length} times after duplicate completion events`);
+EOF
+)
+  status=$?
+  expect_code 0 "$status" "Pi non-intentional signaled arm exit must notify exactly once"
+  [ -z "$out" ] || fail "Pi signaled-exit test printed output: $out"
+  pass "Pi unexpected signaled arm exit notifies once"
 }
 
 test_pi_duplicate_factories_share_one_arm() {
@@ -1340,10 +1443,12 @@ test_pi_tool_returns_agent_tool_result
 test_pi_stale_lock_recovers_through_home_protocol
 test_pi_live_non_harness_lock_is_reclaimed
 test_pi_live_other_lock_owner_is_refused
+test_session_lock_recognizes_only_verified_pi_processes
 test_session_lock_reclaim_has_one_atomic_winner
 test_pi_process_exit_cleanup_listener_lifecycle
 test_pi_session_shutdown_suppresses_intentional_exit
 test_pi_unexpected_actionable_exit_notifies_once
+test_pi_unexpected_signaled_exit_notifies_once
 test_pi_duplicate_factories_share_one_arm
 test_pi_stale_callback_cannot_clear_replacement
 test_pi_process_exit_cleanup_stops_arm_child
