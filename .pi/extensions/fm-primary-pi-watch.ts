@@ -16,6 +16,7 @@ type LockOwnership = "owned" | "missing" | "other";
 type CoordinatorState = "idle" | "starting" | "running" | "stopping";
 type WakeKind = "actionable" | "failure";
 type WatcherStatus = "offline" | "watching" | "handling wake" | "attention";
+type StopDisposition = "offline" | "clear";
 type StatusUi = { setStatus(key: string, text: string | undefined): void };
 
 type WakeDetails = {
@@ -121,8 +122,9 @@ function supervisingHome(): boolean {
 function coordinatorForHome(): ArmCoordinator {
   const existing = coordinators.get(fmHome);
   if (existing) {
-    existing.visibleStatus ??= "offline";
-    existing.shuttingDown ??= false;
+    existing.visibleStatus = "offline";
+    existing.shuttingDown = false;
+    existing.startCancelled = false;
     return existing;
   }
   const coordinator: ArmCoordinator = {
@@ -300,7 +302,7 @@ function settleArm(
     coordinator.lastCompleted = { stdout: record.stdout, stderr: record.stderr };
     coordinator.state = "idle";
   }
-  if (!ownsGeneration || record.intentionalStopReason) return;
+  if (!ownsGeneration || coordinator.shuttingDown || record.intentionalStopReason) return;
 
   const message = error
     ? `watcher: FAILED - Pi extension arm child ${record.generation} failed: ${error.message}`
@@ -324,12 +326,18 @@ function settleArm(
       kind === "actionable" &&
       coordinator.generation === record.generation &&
       !coordinator.shuttingDown &&
-      activeClient.active
+      activeClient.active &&
+      coordinator.clients.get(activeClient.token) === activeClient
     ) {
       publishStatus(coordinator, "handling wake");
     }
   }).catch(() => {
-    if (coordinator.generation === record.generation && !coordinator.shuttingDown) {
+    if (
+      coordinator.generation === record.generation &&
+      !coordinator.shuttingDown &&
+      activeClient.active &&
+      coordinator.clients.get(activeClient.token) === activeClient
+    ) {
       publishStatus(coordinator, "attention");
     }
   });
@@ -382,17 +390,42 @@ function stopsWithin(record: ArmRecord, milliseconds: number): Promise<boolean> 
   });
 }
 
-async function stopArm(coordinator: ArmCoordinator, reason: string): Promise<void> {
+export async function stopArm(
+  coordinator: ArmCoordinator,
+  reason: string,
+  disposition: StopDisposition = "clear",
+): Promise<void> {
   const record = coordinator.current;
-  if (!record) return;
+  if (!record) {
+    if (disposition === "offline" && coordinator.clients.size > 0) {
+      publishStatus(coordinator, "offline");
+    }
+    return;
+  }
   if (!record.intentionalStopReason) record.intentionalStopReason = reason;
   if (coordinator.current === record) coordinator.state = "stopping";
   signalArm(record, "SIGTERM");
-  if (await stopsWithin(record, STOP_GRACE_MS)) return;
-  signalArm(record, "SIGKILL");
-  if (await stopsWithin(record, STOP_KILL_GRACE_MS)) return;
-  if (!record.settled) settleArm(coordinator, record, null, "SIGKILL");
-  if (processGroupAlive(record)) throw new Error(`watcher: FAILED - process group ${record.child.pid} survived SIGKILL`);
+  if (!(await stopsWithin(record, STOP_GRACE_MS))) {
+    signalArm(record, "SIGKILL");
+    if (!(await stopsWithin(record, STOP_KILL_GRACE_MS))) {
+      if (!record.settled) settleArm(coordinator, record, null, "SIGKILL");
+      if (processGroupAlive(record)) {
+        throw new Error(`watcher: FAILED - process group ${record.child.pid} survived SIGKILL`);
+      }
+    }
+  }
+  if (coordinator.current === record) {
+    coordinator.current = null;
+    coordinator.lastCompleted = { stdout: record.stdout, stderr: record.stderr };
+    coordinator.state = "idle";
+  }
+  if (
+    disposition === "offline" &&
+    !coordinator.shuttingDown &&
+    coordinator.clients.size > 0
+  ) {
+    publishStatus(coordinator, "offline");
+  }
 }
 
 function stopArmOnProcessExit(coordinator: ArmCoordinator): void {
@@ -450,6 +483,14 @@ export default function (pi: ExtensionAPI) {
   coordinator.clients.set(client.token, client);
 
   const cleanupOnProcessExit = () => {
+    for (const activeClient of coordinator.clients.values()) {
+      writeClientStatus(activeClient, undefined);
+      activeClient.active = false;
+    }
+    coordinator.clients.clear();
+    coordinator.shuttingDown = true;
+    coordinator.startCancelled = true;
+    coordinator.generation += 1;
     stopArmOnProcessExit(coordinator);
   };
   if (!coordinator.exitListener) {
@@ -459,7 +500,7 @@ export default function (pi: ExtensionAPI) {
 
   async function startArmOnce(): Promise<ArmResult> {
     if (lockOwnership() !== "owned") await claimSessionLock();
-    if (coordinator.startCancelled || coordinator.clients.size === 0) {
+    if (coordinator.startCancelled || coordinator.shuttingDown || coordinator.clients.size === 0) {
       return { ok: false, message: "watcher: not started - Pi extension session shut down" };
     }
     if (lockOwnership() !== "owned") {
@@ -518,7 +559,7 @@ export default function (pi: ExtensionAPI) {
 
   function startArm(): Promise<ArmResult> {
     if (coordinator.startPromise) return coordinator.startPromise;
-    if (coordinator.clients.size === 0) {
+    if (coordinator.shuttingDown || coordinator.clients.size === 0) {
       return Promise.resolve({ ok: false, message: "watcher: not started - Pi extension session shut down" });
     }
     coordinator.startCancelled = false;
@@ -538,18 +579,31 @@ export default function (pi: ExtensionAPI) {
     writeClientStatus(client, coordinator.visibleStatus);
     markLoaded();
   });
-  pi.on?.("session_shutdown", async () => {
+
+  async function shutdownClient(reason: string): Promise<void> {
+    if (!client.active) return;
+    writeClientStatus(client, undefined);
+    client.active = false;
     coordinator.clients.delete(client.token);
     if (coordinator.clients.size > 0) return;
+
+    coordinator.shuttingDown = true;
     coordinator.startCancelled = true;
+    const record = coordinator.current;
+    if (record && !record.intentionalStopReason) record.intentionalStopReason = reason;
+    coordinator.generation += 1;
+
     const pendingStart = coordinator.startPromise;
     if (pendingStart) await pendingStart.catch(() => undefined);
-    if (coordinator.clients.size > 0) return;
-    await stopArm(coordinator, "session-shutdown");
-    if (coordinator.clients.size === 0 && coordinator.exitListener) {
+    await stopArm(coordinator, reason, "clear");
+    if (coordinator.exitListener) {
       process.off("exit", coordinator.exitListener);
       coordinator.exitListener = undefined;
     }
+  }
+
+  pi.on?.("session_shutdown", async (event) => {
+    await shutdownClient(event.reason || "session-shutdown");
   });
 
   pi.on("tool_call", async (event) => {
