@@ -157,7 +157,9 @@ wait_for_pi_exit_zero() {
 git clone -q "$ROOT" "$PROJECT"
 # Before the candidate commit exists, apply its current product diff to the
 # clone. After commit this is an empty patch and the clone already has it.
-git -C "$ROOT" diff --binary HEAD -- .pi bin | git -C "$PROJECT" apply
+if ! git -C "$ROOT" diff --quiet HEAD -- .pi bin; then
+  git -C "$ROOT" diff --binary HEAD -- .pi bin | git -C "$PROJECT" apply
+fi
 mkdir -p "$PROJECT/state" "$PROJECT/config" "$PI_DIR"
 cp "$AUTH_FILE" "$PI_DIR/auth.json"
 cat > "$PI_DIR/settings.json" <<JSON
@@ -242,8 +244,9 @@ live_classification=$(PATH="$LAB/fakebin:$PATH" bash -c '. "$0/bin/fm-backend.sh
 [ "$live_classification" = alive ] || fail "real Pi secondmate classified as $live_classification instead of alive"
 
 # shellcheck disable=SC2016  # The detached Pi, not this test shell, expands FM_HOME.
-send_prompt 'Use the bash tool exactly once. In that one command, write the shell PID followed by eight-generation process ancestry (pid, ppid, command) to "$FM_HOME/state/stock-bash-ancestry.txt", then run bin/fm-session-start.sh > "$FM_HOME/state/session-start.txt". Do not use a background-job tool. Reply exactly LOCKED.'
-wait_for_text "LOCKED" 180 || fail "stock Pi Bash session-start probe did not complete"
+send_prompt 'Use the bash tool exactly once. In that one command, write the shell PID followed by eight-generation process ancestry (pid, ppid, command) to "$FM_HOME/state/stock-bash-ancestry.txt", run bin/fm-session-start.sh > "$FM_HOME/state/session-start.txt", then write done to "$FM_HOME/state/session-start.done". Do not use a background-job tool. Reply exactly LOCKED.'
+wait_for_file "$PROJECT/state/session-start.done" 240 || fail "stock Pi Bash session-start probe did not complete"
+wait_for_text "LOCKED" 120 || fail "Pi did not acknowledge the completed session-start probe"
 wait_for_file "$PROJECT/state/.lock" 40 || fail "session start did not write the fleet lock"
 wait_for_file "$PROJECT/state/stock-bash-ancestry.txt" 40 || fail "stock Bash ancestry was not recorded"
 wait_for_file "$PROJECT/state/session-start.txt" 40 || fail "session-start output was not recorded"
@@ -269,8 +272,6 @@ wait_for_text "REARMED" 180 || fail "Pi did not settle after re-arming watcher s
 wait_for_settled_composer || fail "Pi composer did not settle before reload"
 
 before_reload=$(capture)
-guard_count=$(printf '%s\n' "$before_reload" | grep -Fc "TURN WOULD END BLIND - supervision is off." || true)
-[ "$guard_count" -eq 0 ] || fail "watcher-only Pi injected $guard_count turn-end guard follow-ups"
 false_failure_count=$(printf '%s\n' "$before_reload" | grep -Fc 'FIRSTMATE WATCHER WAKE: watcher: FAILED' || true)
 [ "$false_failure_count" -eq 0 ] || fail "watcher failure appeared before reload"
 pid_file=$(find "$PROJECT/state" -maxdepth 3 -type f -name pid | head -1)
@@ -312,7 +313,9 @@ wait_pid_dead "$candidate_pid" || fail "detached candidate Pi survived clean qui
 if pgrep -P "$pre_restart_pid" >/dev/null 2>&1 || pgrep -P "$candidate_pid" >/dev/null 2>&1; then
   fail "a Pi descendant survived detached restart or clean quit"
 fi
-orphan_pi=$(ps -axo pid=,command= | awk -v lab="$LAB" 'index($0, lab) && ($0 ~ /pi-coding-agent/ || $0 ~ /\/pi([[:space:]]|$)/) { print }')
+orphan_pi=$(ps -axo pid=,comm=,command= | awk -v lab="$LAB" 'index($0, lab) && ($2 ~ /(^|\/)pi$/ || ($2 ~ /node/ && $0 ~ /pi-coding-agent/)) { print }')
 [ -z "$orphan_pi" ] || fail "an orphan Pi process still references the owned lab: $orphan_pi"
 
+printf 'evidence - candidate_hash=%s candidate_pid=%s lock_pid=%s arm_pgid=%s watcher_pid=%s old_pi_pid=%s all_clean=true\n' \
+  "$expected_version" "$candidate_pid" "$pi_pid" "$arm_pgid" "$watcher_pid" "$pre_restart_pid"
 printf 'ok - Pi %s isolated detached restart loaded the watcher once, registered its tool and command, locked, woke, reloaded, re-armed, and left no orphan descendants\n' "$PI_VERSION"

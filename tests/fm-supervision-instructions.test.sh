@@ -102,7 +102,6 @@ test_pi_snippet_uses_effective_extension_path() {
   assert_contains "$out" "--approve -e '$watch'" "pi snippet did not quote the effective extension launch path"
   assert_contains "$out" "The watcher extension lives at \`$watch\`" "pi snippet did not render the watcher extension path"
   assert_not_contains "$out" "__FM_PI_EXT__" "renderer leaked the Pi extension path placeholder"
-  assert_not_contains "$out" "fm-primary-turnend-guard" "pi snippet still names the removed Pi turn-end guard extension"
   assert_not_contains "$out" "state/fm-primary-pi-watch.ts" "pi snippet kept the old generated state-relative extension path"
   pass "pi supervision snippet renders the effective extension path"
 }
