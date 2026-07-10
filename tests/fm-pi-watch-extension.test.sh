@@ -11,6 +11,8 @@ EXT="$ROOT/.pi/extensions/fm-primary-pi-watch.ts"
 install_pi_watch_extension_fixture() {
   local repo=$1
   mkdir -p "$repo/.pi/extensions" "$repo/node_modules/typebox"
+  git -C "$repo" rev-parse --git-dir >/dev/null 2>&1 || git init -q "$repo"
+  : > "$repo/AGENTS.md"
   cp "$EXT" "$repo/.pi/extensions/fm-primary-pi-watch.ts"
   cat > "$repo/node_modules/typebox/package.json" <<'JSON'
 {"name":"typebox","type":"module","exports":"./index.js"}
@@ -57,11 +59,120 @@ test_tracked_extension_present_and_self_hashing() {
   assert_contains "$text" 'details: result' "tracked extension tool is missing structured result details"
   assert_contains "$text" 'ctx.ui.notify' "tracked extension command does not notify through Pi's UI"
   assert_contains "$text" 'process.once("exit", cleanupOnProcessExit)' "tracked extension lacks clean-process-exit cleanup"
+  assert_contains "$text" 'if (!supervisingHome()) return' "tracked extension does not gate setup on a supervising home"
+  assert_contains "$text" '.fm-secondmate-home' "tracked extension does not recognize persistent secondmate homes"
+  assert_contains "$text" 'rev-parse", "--git-dir' "tracked extension does not distinguish linked task worktrees"
   assert_contains "$text" 'pi.on("tool_call"' "tracked watcher extension does not carry the PreToolUse seatbelt"
   assert_not_contains "$text" 'fm-turnend-guard.sh' "tracked watcher extension still invokes the shared turn-end guard"
   assert_not_contains "$text" 'TURN WOULD END BLIND' "tracked watcher extension still injects a blind-turn follow-up"
   assert_not_contains "$text" "[ -f config/x-mode.env ]" "tracked extension kept a repo-relative x-mode config path"
   pass "Pi primary watcher extension is tracked, self-hashing, and self-locating"
+}
+
+test_pi_extension_supervises_only_primary_or_secondmate_homes() {
+  local base worktree home plugin lock_log arm_log out status
+  base="$TMP_ROOT/pi-scope-base"
+  worktree="$TMP_ROOT/pi-scope-worktree"
+  home="$TMP_ROOT/pi-scope-home"
+  lock_log="$TMP_ROOT/pi-scope-lock.log"
+  arm_log="$TMP_ROOT/pi-scope-arm.log"
+  fm_git_worktree "$base" "$worktree" fm/pi-scope
+  install_pi_watch_extension_fixture "$worktree"
+  plugin="$worktree/.pi/extensions/fm-primary-pi-watch.ts"
+  mkdir -p "$worktree/bin" "$home/state" "$home/config"
+  printf 'secondmate-home\n' > "$home/.fm-secondmate-home"
+  printf '999999\n' > "$home/state/.lock"
+  cat > "$worktree/bin/fm-lock.sh" <<'SH'
+#!/usr/bin/env bash
+printf 'lock\n' >> "${FM_LOCK_LOG:?}"
+SH
+  cat > "$worktree/bin/fm-watch-arm.sh" <<'SH'
+#!/usr/bin/env bash
+printf 'arm\n' >> "${FM_ARM_LOG:?}"
+SH
+  chmod +x "$worktree/bin/fm-lock.sh" "$worktree/bin/fm-watch-arm.sh"
+  out=$(PLUGIN="$plugin" FM_HOME="$home" FM_ROOT_OVERRIDE="$worktree" FM_LOCK_LOG="$lock_log" FM_ARM_LOG="$arm_log" node --input-type=module 2>&1 <<'EOF'
+import { existsSync } from "node:fs";
+import { pathToFileURL } from "node:url";
+
+let registrations = 0;
+const pi = {
+  on() { registrations += 1; },
+  registerCommand() { registrations += 1; },
+  registerTool() { registrations += 1; },
+  sendUserMessage: async () => {},
+};
+const mod = await import(pathToFileURL(process.env.PLUGIN).href);
+mod.default(pi);
+if (registrations !== 0) throw new Error(`linked worktree registered ${registrations} watcher callbacks`);
+if (existsSync(`${process.env.FM_HOME}/state/.pi-watch-extension-loaded`)) throw new Error("linked worktree wrote the loaded marker");
+if (existsSync(process.env.FM_LOCK_LOG)) throw new Error("linked worktree attempted lock recovery");
+if (existsSync(process.env.FM_ARM_LOG)) throw new Error("linked worktree armed the watcher");
+EOF
+)
+  status=$?
+  expect_code 0 "$status" "ordinary linked task worktrees must keep the Pi watcher extension inert"
+  [ -z "$out" ] || fail "Pi linked-worktree scope test printed output: $out"
+
+  mkdir -p "$base/bin" "$base/state" "$base/config"
+  : > "$base/AGENTS.md"
+  printf '999999\n' > "$base/state/.lock"
+  cat > "$base/bin/fm-lock.sh" <<'SH'
+#!/usr/bin/env bash
+printf 'lock\n' >> "${FM_LOCK_LOG:?}"
+SH
+  cat > "$base/bin/fm-watch-arm.sh" <<'SH'
+#!/usr/bin/env bash
+printf 'arm\n' >> "${FM_ARM_LOG:?}"
+SH
+  chmod +x "$base/bin/fm-lock.sh" "$base/bin/fm-watch-arm.sh"
+  rm -f "$lock_log" "$arm_log"
+  out=$(PLUGIN="$plugin" FM_HOME="$base" FM_ROOT_OVERRIDE="$base" FM_LOCK_LOG="$lock_log" FM_ARM_LOG="$arm_log" node --input-type=module 2>&1 <<'EOF'
+import { existsSync } from "node:fs";
+import { pathToFileURL } from "node:url";
+
+let registrations = 0;
+const pi = {
+  on() { registrations += 1; },
+  registerCommand() { registrations += 1; },
+  registerTool() { registrations += 1; },
+  sendUserMessage: async () => {},
+};
+const mod = await import(pathToFileURL(process.env.PLUGIN).href);
+mod.default(pi);
+if (registrations !== 0) throw new Error(`override escape registered ${registrations} watcher callbacks`);
+if (existsSync(`${process.env.FM_HOME}/state/.pi-watch-extension-loaded`)) throw new Error("override escape wrote the loaded marker");
+if (existsSync(process.env.FM_LOCK_LOG)) throw new Error("override escape attempted lock recovery");
+if (existsSync(process.env.FM_ARM_LOG)) throw new Error("override escape armed the watcher");
+EOF
+)
+  status=$?
+  expect_code 0 "$status" "a primary FM_ROOT_OVERRIDE must not let a linked-worktree extension supervise"
+  [ -z "$out" ] || fail "Pi FM_ROOT_OVERRIDE scope test printed output: $out"
+
+  printf 'secondmate-scope\n' > "$worktree/.fm-secondmate-home"
+  out=$(PLUGIN="$plugin" FM_HOME="$home" FM_ROOT_OVERRIDE="$worktree" node --input-type=module 2>&1 <<'EOF'
+import { existsSync, writeFileSync } from "node:fs";
+import { pathToFileURL } from "node:url";
+
+let tool = null;
+const pi = {
+  on() {},
+  registerCommand() {},
+  registerTool(candidate) { if (candidate.name === "fm_watch_arm_pi") tool = candidate; },
+  sendUserMessage: async () => {},
+};
+writeFileSync(`${process.env.FM_HOME}/state/.lock`, `${process.pid}\n`);
+const mod = await import(pathToFileURL(process.env.PLUGIN).href);
+mod.default(pi);
+if (!tool) throw new Error("marked secondmate did not register the watcher tool");
+if (!existsSync(`${process.env.FM_HOME}/state/.pi-watch-extension-loaded`)) throw new Error("marked secondmate did not write the loaded marker");
+EOF
+)
+  status=$?
+  expect_code 0 "$status" "marked persistent secondmate homes must retain Pi watcher supervision"
+  [ -z "$out" ] || fail "Pi secondmate scope test printed output: $out"
+  pass "Pi watcher scope admits primary and marked secondmate homes while linked task worktrees stay inert"
 }
 
 test_pi_live_lab_cleanup_is_owned() {
@@ -451,6 +562,11 @@ SH
     FM_TEST_ARGS='/usr/bin/node /opt/pi/node_modules/@earendil-works/pi-coding-agent/dist/cli.js.evil' \
     "$ROOT/bin/fm-lock.sh" status)
   assert_contains "$out" "stale" "a suffixed Pi entrypoint argument was trusted as a live lock owner"
+
+  out=$(PATH="$fakebin:$PATH" FM_HOME="$home" FM_TEST_COMM=/usr/bin/node \
+    FM_TEST_ARGS='/usr/bin/node /opt/innocent.js /opt/pi/node_modules/@earendil-works/pi-coding-agent/dist/cli.js' \
+    "$ROOT/bin/fm-lock.sh" status)
+  assert_contains "$out" "stale" "a later-argument Pi entrypoint spoof was trusted as a live lock owner"
 
   out=$(PATH="$fakebin:$PATH" FM_HOME="$home" FM_TEST_COMM=/opt/bin/pi \
     FM_TEST_ARGS='/usr/bin/node server.js' "$ROOT/bin/fm-lock.sh" status)
@@ -1493,6 +1609,7 @@ EOF
 }
 
 test_tracked_extension_present_and_self_hashing
+test_pi_extension_supervises_only_primary_or_secondmate_homes
 test_pi_live_lab_cleanup_is_owned
 test_spawn_template_mentions_pi_watch_placeholder
 test_pi_extension_reports_external_healthy_watcher

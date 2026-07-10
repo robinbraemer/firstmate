@@ -1,7 +1,7 @@
 // Firstmate primary watcher bridge for Pi.
 import { spawn, spawnSync, type ChildProcess } from "node:child_process";
 import { createHash } from "node:crypto";
-import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, realpathSync, writeFileSync } from "node:fs";
 import { dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
@@ -44,7 +44,7 @@ type CoordinatorHost = typeof globalThis & {
 
 const extensionFile = fileURLToPath(import.meta.url);
 const extensionDir = dirname(extensionFile);
-const root = resolve(extensionDir, "../..");
+const root = realpathSync(resolve(extensionDir, "../.."));
 const fmHome = resolve(process.env.FM_HOME || process.env.FM_ROOT_OVERRIDE || root);
 const fmRoot = resolve(process.env.FM_ROOT_OVERRIDE || root);
 const state = process.env.FM_STATE_OVERRIDE || `${fmHome}/state`;
@@ -55,6 +55,15 @@ const marker = `${state}/.pi-watch-extension-loaded`;
 const extensionVersion = `sha256:${createHash("sha256").update(readFileSync(extensionFile)).digest("hex")}`;
 const coordinatorHost = globalThis as CoordinatorHost;
 const coordinators = coordinatorHost.__firstmatePiWatchCoordinators ??= new Map<string, ArmCoordinator>();
+
+function supervisingHome(): boolean {
+  if (existsSync(`${root}/.fm-secondmate-home`)) return true;
+  if (!existsSync(`${root}/AGENTS.md`) || !existsSync(`${root}/bin`)) return false;
+  const gitDir = spawnSync("git", ["-C", root, "rev-parse", "--git-dir"], { encoding: "utf8" });
+  const commonDir = spawnSync("git", ["-C", root, "rev-parse", "--git-common-dir"], { encoding: "utf8" });
+  if (gitDir.status !== 0 || commonDir.status !== 0) return false;
+  return gitDir.stdout.trim() === commonDir.stdout.trim();
+}
 
 function coordinatorForHome(): ArmCoordinator {
   const existing = coordinators.get(fmHome);
@@ -193,7 +202,7 @@ function stopArm(coordinator: ArmCoordinator, reason: string): Promise<void> {
 
 function runPretoolCheck(command: string): Promise<{ code: number; stderr: string }> {
   return new Promise((resolveResult) => {
-    const child = spawn(`${root}/bin/fm-arm-pretool-check.sh`, ["--command", command], {
+    const child = spawn(`${fmRoot}/bin/fm-arm-pretool-check.sh`, ["--command", command], {
       stdio: ["ignore", "ignore", "pipe"],
     });
     let stderr = "";
@@ -206,6 +215,7 @@ function runPretoolCheck(command: string): Promise<{ code: number; stderr: strin
 }
 
 export default function (pi: ExtensionAPI) {
+  if (!supervisingHome()) return;
   const coordinator = coordinatorForHome();
   const client = Symbol("pi-watch-extension-client");
   coordinator.clients.add(client);
