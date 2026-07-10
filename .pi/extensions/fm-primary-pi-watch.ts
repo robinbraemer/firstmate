@@ -39,8 +39,6 @@ type ArmRecord = {
   generation: number;
   intentionalStopReason: string;
   settled: boolean;
-  completion: Promise<void>;
-  resolveCompletion: () => void;
   stdout: string;
   stderr: string;
   stdoutPending: string;
@@ -89,10 +87,12 @@ const coordinators = coordinatorHost.__firstmatePiWatchCoordinators ??= new Map<
 function supervisingHome(): boolean {
   if (existsSync(`${root}/.fm-secondmate-home`)) return true;
   if (!existsSync(`${root}/AGENTS.md`) || !existsSync(`${root}/bin`)) return false;
-  try {
-    if (realpathSync(fmHome) === root) return true;
-  } catch {
-    return false;
+  if (process.env.FM_HOME || process.env.FM_ROOT_OVERRIDE) {
+    try {
+      if (realpathSync(fmHome) === root) return true;
+    } catch {
+      return false;
+    }
   }
   const gitDir = spawnSync("git", ["-C", root, "rev-parse", "--git-dir"], { encoding: "utf8" });
   const commonDir = spawnSync("git", ["-C", root, "rev-parse", "--git-common-dir"], { encoding: "utf8" });
@@ -262,7 +262,6 @@ function settleArm(
     coordinator.lastCompleted = { stdout: record.stdout, stderr: record.stderr };
     coordinator.state = "idle";
   }
-  record.resolveCompletion();
   if (!ownsGeneration || record.intentionalStopReason) return;
 
   const message = error
@@ -303,18 +302,33 @@ function signalArm(record: ArmRecord, signal: NodeJS.Signals): void {
   }
 }
 
-function settlesWithin(record: ArmRecord, milliseconds: number): Promise<boolean> {
+function processGroupAlive(record: ArmRecord): boolean {
+  const pid = record.child.pid;
+  if (!pid) return false;
+  try {
+    process.kill(-pid, 0);
+    return true;
+  } catch (error) {
+    return (error as NodeJS.ErrnoException).code !== "ESRCH";
+  }
+}
+
+function stopsWithin(record: ArmRecord, milliseconds: number): Promise<boolean> {
   return new Promise<boolean>((resolvePromise) => {
-    let settled = false;
-    const finish = (result: boolean) => {
-      if (settled) return;
-      settled = true;
-      clearTimeout(timer);
-      resolvePromise(result);
+    const deadline = Date.now() + milliseconds;
+    const check = () => {
+      if (record.settled && !processGroupAlive(record)) {
+        resolvePromise(true);
+        return;
+      }
+      const remaining = deadline - Date.now();
+      if (remaining <= 0) {
+        resolvePromise(false);
+        return;
+      }
+      setTimeout(check, Math.min(10, remaining));
     };
-    const timer = setTimeout(() => finish(false), milliseconds);
-    timer.unref();
-    void record.completion.then(() => finish(true));
+    check();
   });
 }
 
@@ -324,10 +338,11 @@ async function stopArm(coordinator: ArmCoordinator, reason: string): Promise<voi
   if (!record.intentionalStopReason) record.intentionalStopReason = reason;
   if (coordinator.current === record) coordinator.state = "stopping";
   signalArm(record, "SIGTERM");
-  if (await settlesWithin(record, STOP_GRACE_MS)) return;
+  if (await stopsWithin(record, STOP_GRACE_MS)) return;
   signalArm(record, "SIGKILL");
-  if (await settlesWithin(record, STOP_KILL_GRACE_MS)) return;
-  settleArm(coordinator, record, null, "SIGKILL");
+  if (await stopsWithin(record, STOP_KILL_GRACE_MS)) return;
+  if (!record.settled) settleArm(coordinator, record, null, "SIGKILL");
+  if (processGroupAlive(record)) throw new Error(`watcher: FAILED - process group ${record.child.pid} survived SIGKILL`);
 }
 
 function stopArmOnProcessExit(coordinator: ArmCoordinator): void {
@@ -411,17 +426,11 @@ export default function (pi: ExtensionAPI) {
       detached: true,
       stdio: ["ignore", "pipe", "pipe"],
     });
-    let resolveCompletion = () => {};
-    const completion = new Promise<void>((resolvePromise) => {
-      resolveCompletion = resolvePromise;
-    });
     const record: ArmRecord = {
       child,
       generation,
       intentionalStopReason: "",
       settled: false,
-      completion,
-      resolveCompletion,
       stdout: "",
       stderr: "",
       stdoutPending: "",
