@@ -107,10 +107,10 @@ test_pi_snippet_uses_effective_extension_path() {
 }
 
 test_pi_snippet_preserves_hostile_extension_path_as_one_argument() {
-  local home injected_name hostile_root watch out launch_args argv_out
+  local home injected_name hostile_root watch out launch_args argv_out argv_status
   home="$TMP_ROOT/pi-hostile-home"
   injected_name="pi-render-injected.$$"
-  hostile_root="$TMP_ROOT/pi'; touch $injected_name; printf '"
+  hostile_root="$TMP_ROOT/__FM_PI_EXT__'; touch $injected_name; printf '"
   watch="$hostile_root/.pi/extensions/fm-primary-pi-watch.ts"
   mkdir -p "$home/state" "$home/config"
   out=$(FM_HOME="$home" FM_ROOT_OVERRIDE="$hostile_root" "$RENDER" --harness pi)
@@ -123,8 +123,10 @@ test_pi_snippet_preserves_hostile_extension_path_as_one_argument() {
     [ "$1" = --approve ] || { printf "arg1=%s\n" "$1"; exit 1; }
     [ "$2" = -e ] || { printf "arg2=%s\n" "$2"; exit 1; }
     [ "$3" = "$EXPECTED" ] || { printf "arg3=%s\n" "$3"; exit 1; }
-  ' 2>&1) || fail "pi snippet did not preserve the extension path as exact argv: $argv_out"
+  ' 2>&1)
+  argv_status=$?
   [ ! -e "$TMP_ROOT/$injected_name" ] || fail "pi snippet path quoting allowed command injection"
+  [ "$argv_status" -eq 0 ] || fail "pi snippet did not preserve the extension path as exact argv: $argv_out"
   pass "pi supervision snippet preserves hostile extension paths as one inert argument"
 }
 
