@@ -3,8 +3,6 @@
 # Writes the harness (agent) process PID found by walking the shell's ancestry,
 # which lives as long as the firstmate session - unlike the transient subshell
 # PID of any one tool call, which is dead moments after it is written.
-# Competing acquisitions are serialized, stale holders are reclaimed, and the
-# winning PID is published atomically without overwriting a live owner.
 # Usage: fm-lock.sh           acquire; exit 1 if another live session holds it
 #        fm-lock.sh status    print holder and liveness; always exits 0
 set -u
@@ -15,34 +13,23 @@ FM_HOME="${FM_HOME:-${FM_ROOT_OVERRIDE:-$FM_ROOT}}"
 STATE="${FM_STATE_OVERRIDE:-$FM_HOME/state}"
 LOCK="$STATE/.lock"
 LOCK_MUTEX="$STATE/.lock.acquire"
-LOCK_MUTEX_STALE_AFTER=10
 mkdir -p "$STATE"
 
 # shellcheck source=bin/fm-wake-lib.sh
 . "$SCRIPT_DIR/fm-wake-lib.sh"
-# shellcheck source=bin/fm-process-lib.sh
-. "$SCRIPT_DIR/fm-process-lib.sh"
 
 # Known harness command names; extend when a new adapter is verified.
 HARNESS_RE='claude|codex|opencode|grok|^pi$'
 
 process_is_harness() {
-  local pid=$1 comm args comm_base
+  local pid=$1 comm args
   comm=$(ps -o comm= -p "$pid" 2>/dev/null) || return 1
-  args=$(ps -o args= -p "$pid" 2>/dev/null) || return 1
-  comm=${comm#-}
-  comm_base=${comm##*/}
-  if printf '%s' "$comm_base" | grep -qE "$HARNESS_RE"; then
+  args=$(ps -o args= -p "$pid" 2>/dev/null)
+  if printf '%s' "$(basename "$comm")" | grep -qE "$HARNESS_RE"; then
     return 0
   fi
-  if fm_process_is_pi "$pid" "$comm" "$args"; then
-    return 0
-  fi
-  case "$comm_base" in
-    node*)
-      printf '%s' "$args" | grep -qE "$HARNESS_RE"
-      ;;
-    python*) printf '%s' "$args" | grep -qE "$HARNESS_RE" ;;
+  case "$comm" in
+    *node*|*python*) printf '%s' "$args" | grep -qE "$HARNESS_RE" ;;
     *) return 1 ;;
   esac
 }
@@ -73,12 +60,11 @@ if [ "${1:-}" = "status" ]; then
 fi
 
 me=$(harness_pid) || { echo "error: cannot locate harness process in ancestry" >&2; exit 1; }
-if ! fm_lock_try_acquire "$LOCK_MUTEX" "$LOCK_MUTEX_STALE_AFTER"; then
+if ! fm_lock_try_acquire "$LOCK_MUTEX"; then
   echo "error: another session lock acquisition is in progress; retry before mutating fleet state" >&2
   exit 1
 fi
 lock_mutex_held=1
-lock_mutex_owner=${FM_LOCK_OWNER_DIR:-}
 lock_tmp=
 cleanup_lock_claim() {
   [ -n "$lock_tmp" ] && rm -f "$lock_tmp" 2>/dev/null || true
@@ -101,8 +87,6 @@ if [ -f "$LOCK" ]; then
 fi
 lock_tmp=$(mktemp "$STATE/.lock.write.XXXXXX") || { echo "error: cannot prepare session lock record" >&2; exit 1; }
 printf '%s\n' "$me" > "$lock_tmp" || { echo "error: cannot write session lock record" >&2; exit 1; }
-fm_lock_owned_by_current_process "$LOCK_MUTEX" "$lock_mutex_owner" \
-  || { echo "error: session lock acquisition ownership was lost before publication" >&2; exit 1; }
 mv "$lock_tmp" "$LOCK" || { echo "error: cannot publish session lock record" >&2; exit 1; }
 lock_tmp=
 [ "$(cat "$LOCK" 2>/dev/null || true)" = "$me" ] || { echo "error: session lock ownership could not be confirmed" >&2; exit 1; }
