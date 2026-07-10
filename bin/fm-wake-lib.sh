@@ -104,11 +104,17 @@ fm_lock_owner_dir() {
 }
 
 fm_lock_prepare_owner() {
-  local ownerdir=$1 mypid back
+  local ownerdir=$1 require_identity=${2:-} mypid identity back
   mypid=${BASHPID:-$$}
   printf '%s\n' "$mypid" > "$ownerdir/pid" 2>/dev/null || return 1
   back=$(cat "$ownerdir/pid" 2>/dev/null || true)
-  [ "$back" = "$mypid" ]
+  [ "$back" = "$mypid" ] || return 1
+  identity=$(fm_pid_identity "$mypid" 2>/dev/null || true)
+  if [ -n "$identity" ]; then
+    printf '%s\n' "$identity" > "$ownerdir/pid-identity" 2>/dev/null || return 1
+  elif [ -n "$require_identity" ]; then
+    return 2
+  fi
 }
 
 fm_lock_link_owner() {
@@ -179,16 +185,18 @@ fm_lock_claim() {
 }
 
 fm_lock_try_create() {
-  local lockdir=$1 allowed_steal_owner=${2:-} ownerdir
+  local lockdir=$1 allowed_steal_owner=${2:-} require_identity=${3:-} ownerdir rc
   FM_LOCK_OWNER_DIR=
   ownerdir=$(fm_lock_owner_dir "$lockdir") || return 1
   if [ -e "$lockdir" ] || [ -L "$lockdir" ]; then
     fm_lock_discard_owner "$ownerdir"
     return 1
   fi
-  if ! fm_lock_prepare_owner "$ownerdir"; then
+  fm_lock_prepare_owner "$ownerdir" "$require_identity"
+  rc=$?
+  if [ "$rc" -ne 0 ]; then
     fm_lock_discard_owner "$ownerdir"
-    return 1
+    return "$rc"
   fi
   if ln -s "$ownerdir" "$lockdir" 2>/dev/null && fm_lock_points_to_owner "$lockdir" "$ownerdir"; then
     if fm_lock_claim "$lockdir" "$ownerdir" "$allowed_steal_owner"; then
@@ -231,10 +239,37 @@ fm_lock_mid_acquire_is_fresh() {
 }
 
 fm_lock_live_owner_is_fresh() {
-  local lockdir=$1 pid=$2 live_stale_after=${3:-}
+  local lockdir=$1 pid=$2 live_stale_after=${3:-} recorded_identity current_identity
   fm_pid_alive "$pid" || return 1
+  recorded_identity=$(cat "$lockdir/pid-identity" 2>/dev/null || true)
+  if [ -n "$recorded_identity" ]; then
+    current_identity=$(fm_pid_identity "$pid" 2>/dev/null || true)
+    [ -n "$current_identity" ] || return 0
+    [ "$current_identity" = "$recorded_identity" ]
+    return
+  fi
   [ -n "$live_stale_after" ] || return 0
   [ "$(fm_path_age "$lockdir")" -lt "$live_stale_after" ]
+}
+
+fm_lock_owned_by_current_process() {
+  local lockdir=$1 expected_owner=${2:-} ownerdir pid recorded_identity current_identity current
+  current=${BASHPID:-$$}
+  if [ -L "$lockdir" ]; then
+    ownerdir=$(fm_lock_link_owner "$lockdir" 2>/dev/null || true)
+    [ -n "$ownerdir" ] || return 1
+    [ -z "$expected_owner" ] || [ "$ownerdir" = "$expected_owner" ] || return 1
+    fm_lock_points_to_owner "$lockdir" "$ownerdir" || return 1
+  else
+    [ -z "$expected_owner" ] || return 1
+    ownerdir=$lockdir
+  fi
+  pid=$(cat "$ownerdir/pid" 2>/dev/null || true)
+  [ "$pid" = "$current" ] || return 1
+  recorded_identity=$(cat "$ownerdir/pid-identity" 2>/dev/null || true)
+  [ -n "$recorded_identity" ] || return 1
+  current_identity=$(fm_pid_identity "$current" 2>/dev/null || true)
+  [ -n "$current_identity" ] && [ "$current_identity" = "$recorded_identity" ]
 }
 
 fm_lock_recheck_stale_owner() {
@@ -260,9 +295,10 @@ fm_lock_try_acquire() {
   FM_LOCK_HELD_PID=
   FM_LOCK_OWNER_DIR=
 
-  if fm_lock_try_create "$lockdir"; then
-    return 0
-  fi
+  fm_lock_try_create "$lockdir" "" "$live_stale_after"
+  rc=$?
+  [ "$rc" -eq 0 ] && return 0
+  [ "$rc" -eq 2 ] && return 1
 
   pid=$(cat "$lockdir/pid" 2>/dev/null || true)
   if fm_lock_live_owner_is_fresh "$lockdir" "$pid" "$live_stale_after"; then
@@ -275,7 +311,7 @@ fm_lock_try_acquire() {
   fi
 
   steal="$lockdir.steal"
-  if ! fm_lock_try_acquire "$steal"; then
+  if ! fm_lock_try_acquire "$steal" "$live_stale_after"; then
     FM_LOCK_HELD_PID=$(cat "$lockdir/pid" 2>/dev/null || true)
     FM_LOCK_OWNER_DIR=
     return 1
@@ -316,7 +352,7 @@ fm_lock_try_acquire() {
 
   fm_lock_remove_path "$lockdir" || true
   rc=1
-  if fm_lock_try_create "$lockdir" "$steal_owner"; then
+  if fm_lock_try_create "$lockdir" "$steal_owner" "$live_stale_after"; then
     rc=0
   fi
   if [ "$rc" -ne 0 ]; then
