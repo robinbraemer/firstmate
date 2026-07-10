@@ -162,6 +162,8 @@ For grok, `fm-spawn.sh` installs one firstmate-owned global turn-end hook under 
 For Pi secondmate launches, `fm-spawn.sh` uses one-run `--approve` plus `-e` pointed at the secondmate home's own tracked `.pi/extensions/fm-primary-pi-watch.ts`, already present from the secondmate home's git worktree.
 Bare `-e` does not suppress Pi's project-trust dialog, while `--approve` keeps project skills and settings available without requiring a saved trust decision.
 Trusted auto-discovery plus explicit `-e` of that same canonical path loads the extension once, but a globally installed or otherwise copied extension at a distinct path conflicts and must not be used.
+`FM_PI_WATCH_STOP_GRACE_MS` controls how long the Pi watcher extension waits after sending `SIGTERM` to its owned arm process group during reload or shutdown; it defaults to 1000 milliseconds, and an invalid or negative value also falls back to 1000.
+If the group remains alive after that grace, the extension sends `SIGKILL` and allows a final fixed 500-millisecond cleanup window.
 
 ## Crew dispatch profiles (config/crew-dispatch.json)
 
@@ -304,6 +306,7 @@ FM_STATE_OVERRIDE=       # alternate state dir, mainly for tests
 FM_DATA_OVERRIDE=        # alternate data dir, mainly for tests
 FM_PROJECTS_OVERRIDE=    # alternate projects dir, mainly for tests
 FM_CONFIG_OVERRIDE=      # alternate config dir, mainly for tests
+FM_PI_WATCH_STOP_GRACE_MS=1000  # Pi watcher-owned process-group TERM grace in milliseconds; see Harness support above
 FM_BACKEND=             # optional runtime backend override for new spawns; tmux/herdr/zellij/orca/cmux support ship/scout spawns, codex-app is not accepted
 HERDR_SESSION=default  # herdr-only: named session for normal backend ops; not enough for destructive cleanup (docs/herdr-backend.md)
 FM_BACKEND_HERDR_COMPOSER_LINES=20  # herdr-only: tail lines scanned by composer-state guard/fallback paths; idle-baseline submit confirmation uses agent-state
