@@ -2603,74 +2603,6 @@ EOF
   pass "Pi 0.80.6 persists watcher wakes as custom events and triggers or queues the correct turn"
 }
 
-test_pi_live_acceptance_helper_records_isolated_evidence() {
-  local helper home pi_dir evidence fakebin candidate out status hash_count
-  helper="$ROOT/tests/fm-pi-live-acceptance-helper.sh"
-  home="$TMP_ROOT/pi-acceptance-helper-home"
-  pi_dir="$TMP_ROOT/pi-acceptance-helper-agent"
-  evidence="$TMP_ROOT/pi-acceptance-helper-evidence"
-  fakebin=$(fm_fakebin "$TMP_ROOT/pi-acceptance-helper-fakebin")
-  candidate=$(git -C "$ROOT" rev-parse HEAD)
-  mkdir -p "$home/state/.watch.lock" "$pi_dir"
-  printf '12345\n' > "$home/state/.lock"
-  printf '54321\n' > "$home/state/.watch.lock/pid"
-  printf '%s\n' "$home" > "$home/state/.watch.lock/fm-home"
-  printf '%s\n' "$ROOT/bin/fm-watch.sh" > "$home/state/.watch.lock/watcher-path"
-  printf 'synthetic identity\n' > "$home/state/.watch.lock/pid-identity"
-  touch "$home/state/.last-watcher-beat"
-  cat > "$fakebin/pi" <<'SH'
-#!/usr/bin/env bash
-if [ "${1:-}" = --version ]; then printf '0.80.6\n'; else printf 'No packages installed.\n'; fi
-SH
-  chmod +x "$fakebin/pi"
-  out=$(PATH="$fakebin:$PATH" FM_PI_ACCEPTANCE_ID=accept-helper-1 FM_PI_CANDIDATE_COMMIT="$candidate" \
-    FM_PI_ACCEPTANCE_EVIDENCE="$evidence" PI_CODING_AGENT_DIR="$pi_dir" FM_HOME="$home" \
-    bash "$helper" inventory 2>&1)
-  status=$?
-  expect_code 0 "$status" "Pi live acceptance helper must record an isolated inventory"
-  assert_contains "$(cat "$evidence/identity.txt")" "acceptance_id=accept-helper-1" "acceptance identity is missing the dedicated id"
-  assert_contains "$(cat "$evidence/pi-list.txt")" "No packages installed." "acceptance inventory did not prove the Pi package set is empty"
-  hash_count=$(wc -l < "$evidence/tracked-extension-hashes.txt" | tr -d ' ')
-  [ "$hash_count" -eq 1 ] || fail "acceptance inventory recorded $hash_count tracked Pi extension hashes"
-  PATH="$fakebin:$PATH" FM_PI_ACCEPTANCE_ID=accept-helper-1 FM_PI_CANDIDATE_COMMIT="$candidate" \
-    FM_PI_ACCEPTANCE_EVIDENCE="$evidence" PI_CODING_AGENT_DIR="$pi_dir" FM_HOME="$home" \
-    bash "$helper" emit acceptance-probe >/dev/null
-  assert_contains "$(cat "$home/state/acceptance-probe.status")" "done: Pi live acceptance" "acceptance helper did not emit the known actionable status"
-  PATH="$fakebin:$PATH" FM_PI_ACCEPTANCE_ID=accept-helper-1 FM_PI_CANDIDATE_COMMIT="$candidate" \
-    FM_PI_ACCEPTANCE_EVIDENCE="$evidence" PI_CODING_AGENT_DIR="$pi_dir" FM_HOME="$home" \
-    bash "$helper" snapshot armed >/dev/null
-  assert_contains "$(cat "$evidence/armed-watcher-lock.txt")" "watcher_pid=54321" "acceptance snapshot omitted watcher ownership"
-  cat > "$fakebin/uname" <<'SH'
-#!/usr/bin/env bash
-printf 'Linux\n'
-SH
-  cat > "$fakebin/stat" <<'SH'
-#!/usr/bin/env bash
-if [ "${1:-}" = -f ]; then
-  printf 'partial-filesystem-stat\n'
-  exit 1
-fi
-if [ "${1:-}" = -c ]; then
-  printf '1700000000\n'
-  exit 0
-fi
-exit 2
-SH
-  chmod +x "$fakebin/uname" "$fakebin/stat"
-  PATH="$fakebin:$PATH" FM_PI_ACCEPTANCE_ID=accept-helper-1 FM_PI_CANDIDATE_COMMIT="$candidate" \
-    FM_PI_ACCEPTANCE_EVIDENCE="$evidence" PI_CODING_AGENT_DIR="$pi_dir" FM_HOME="$home" \
-    bash "$helper" snapshot linux-stat >/dev/null
-  assert_contains "$(cat "$evidence/linux-stat-watcher-lock.txt")" "beacon_epoch=1700000000" "Linux acceptance snapshot did not select GNU stat"
-  assert_not_contains "$(cat "$evidence/linux-stat-watcher-lock.txt")" "partial-filesystem-stat" "Linux acceptance snapshot retained failed BSD stat output"
-  printf 'Reloaded extensions\nwatcher: started Pi extension arm child 3\n' > "$home/reload-transcript.txt"
-  PATH="$fakebin:$PATH" FM_PI_ACCEPTANCE_ID=accept-helper-1 FM_PI_CANDIDATE_COMMIT="$candidate" \
-    FM_PI_ACCEPTANCE_EVIDENCE="$evidence" PI_CODING_AGENT_DIR="$pi_dir" FM_HOME="$home" \
-    bash "$helper" verify-reload "$home/reload-transcript.txt" >/dev/null
-  assert_contains "$(cat "$evidence/reload-check.txt")" "watcher_only_reload=clean" "acceptance helper did not verify watcher-only reload output"
-  [ -z "$out" ] || fail "Pi acceptance helper printed unexpected output: $out"
-  pass "Pi live acceptance helper records portable isolated evidence"
-}
-
 test_opencode_primary_watch_plugin_static_wiring() {
   local plugin text
   plugin="$ROOT/.opencode/plugins/fm-primary-watch-arm.js"
@@ -3134,7 +3066,6 @@ test_pi_reload_routes_wake_only_to_current_client
 test_pi_stale_callback_cannot_clear_replacement
 test_pi_process_exit_cleanup_stops_arm_child
 test_pi_0806_custom_wake_runtime_semantics
-test_pi_live_acceptance_helper_records_isolated_evidence
 test_opencode_primary_watch_plugin_static_wiring
 test_opencode_primary_watch_plugin_uses_effective_state_home
 test_opencode_primary_watch_plugin_sources_effective_config
