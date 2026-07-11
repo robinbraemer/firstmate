@@ -139,7 +139,9 @@ if [ "$mode" = restart ]; then
   # Home-scoped stop: only the watcher pid recorded in THIS home's lock.
   lock_pid=$(cat "$WATCH_LOCK/pid" 2>/dev/null || true)
   if fm_pid_alive "$lock_pid"; then
-    if fm_watcher_lock_matches_pid "$STATE" "$WATCH" "$lock_pid" "$FM_HOME"; then
+    fm_watcher_lock_matches_pid "$STATE" "$WATCH" "$lock_pid" "$FM_HOME"
+    lock_match_rc=$?
+    if [ "$lock_match_rc" -eq 0 ]; then
       kill -TERM "$lock_pid" 2>/dev/null || true
       # Wait for it to actually exit before relaunching, so the fresh watcher
       # either takes a released lock or reclaims a now-dead-pid stale lock instead
@@ -149,7 +151,7 @@ if [ "$mode" = restart ]; then
         sleep 0.1
         i=$((i + 1))
       done
-    else
+    elif [ "$lock_match_rc" -eq 1 ]; then
       clear_stale_recorded_watcher_lock
     fi
   fi

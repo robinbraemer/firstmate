@@ -376,7 +376,7 @@ test_lock_live_tagged_identity_probe_failure_fails_closed() {
   touch -t 202001010000 "$lockdir"
   out=$(FM_STATE_OVERRIDE="$state" bash -c '
     . "$1"
-    fm_pid_identity() { return 1; }
+    fm_pid_identity_from_proc() { return 1; }
     if fm_lock_live_owner_is_fresh "$2" "$3" 1; then rc=0; else rc=1; fi
     printf "rc=%s\n" "$rc"
   ' _ "$LIB" "$lockdir" "$live")
@@ -665,6 +665,36 @@ test_watch_restart_rejects_reused_pid() {
   wait "$pid" 2>/dev/null || true
   wait "$live" 2>/dev/null || true
   pass "watch restart refuses to signal a reused pid"
+}
+
+test_watch_restart_preserves_live_lock_when_identity_probe_is_unavailable() {
+  local dir state fakebin out live status lock_pid
+  dir=$(make_case restart-identity-unavailable)
+  state="$dir/state"
+  fakebin="$dir/fakebin"
+  out="$dir/restart.out"
+  sleep 300 &
+  live=$!
+  cat > "$fakebin/ps" <<'SH'
+#!/usr/bin/env bash
+exit 1
+SH
+  chmod +x "$fakebin/ps"
+  mkdir "$state/.watch.lock"
+  printf '%s\n' "$live" > "$state/.watch.lock/pid"
+  printf '%s\n' "$dir" > "$state/.watch.lock/fm-home"
+  printf '%s\n' "$WATCH" > "$state/.watch.lock/watcher-path"
+  printf '%s\n' 'ps:recorded watcher identity' > "$state/.watch.lock/pid-identity"
+  status=0
+  PATH="$fakebin:$PATH" FM_HOME="$dir" FM_ARM_CONFIRM_TIMEOUT=1 FM_POLL=5 FM_SIGNAL_GRACE=1 \
+    FM_CHECK_INTERVAL=999999 FM_HEARTBEAT=999999 "$WATCH_ARM" --restart > "$out" || status=$?
+  lock_pid=$(cat "$state/.watch.lock/pid" 2>/dev/null || true)
+  is_live_non_zombie "$live" || fail "restart killed a live pid while its identity probe was unavailable"
+  [ "$lock_pid" = "$live" ] || fail "restart cleared a live watcher lock while identity probing was unavailable (got '$lock_pid')"
+  [ "$status" -ne 0 ] || fail "restart reported success without confirming the live watcher identity: $(cat "$out")"
+  kill "$live" 2>/dev/null || true
+  wait "$live" 2>/dev/null || true
+  pass "watch restart preserves a live lock when identity probing is unavailable"
 }
 
 test_watch_restart_reports_healthy_peer_without_attaching() {
@@ -1012,6 +1042,7 @@ test_lock_empty_pid_uses_minimum_grace
 test_lock_late_claim_loses_after_recreate
 test_lock_paused_mid_acquire_claim_fails_during_steal
 test_watch_restart_rejects_reused_pid
+test_watch_restart_preserves_live_lock_when_identity_probe_is_unavailable
 test_watch_restart_reports_healthy_peer_without_attaching
 test_watcher_self_evicts_on_lock_takeover
 test_arm_attaches_and_waits_for_live_fresh_watcher
