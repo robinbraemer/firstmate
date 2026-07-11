@@ -34,6 +34,17 @@ fm_pid_identity_from_proc_stat() {
   printf '%s\n' "$out"
 }
 
+fm_pid_identity_from_proc() {
+  local pid=$1 stat
+  case "$pid" in
+    ''|*[!0-9]*) return 1 ;;
+  esac
+  [ -r "/proc/$pid/stat" ] || return 1
+  stat=
+  IFS= read -r stat < "/proc/$pid/stat" || return 1
+  fm_pid_identity_from_proc_stat "$stat"
+}
+
 # Return the pre-tag process identity format used on platforms without /proc.
 fm_pid_legacy_identity() {
   local pid=$1 out
@@ -48,18 +59,14 @@ fm_pid_legacy_identity() {
 # Return a tagged process identity: stable monotonic start ticks on Linux/WSL2,
 # or locale-pinned wall-clock start plus command on other platforms.
 fm_pid_identity() {
-  local pid=$1 stat identity
+  local pid=$1 identity
   case "$pid" in
     ''|*[!0-9]*) return 1 ;;
   esac
-  if [ -r "/proc/$pid/stat" ]; then
-    stat=
-    IFS= read -r stat < "/proc/$pid/stat" || true
-    identity=$(fm_pid_identity_from_proc_stat "$stat" 2>/dev/null || true)
-    if [ -n "$identity" ]; then
-      printf '%s\n' "$identity"
-      return 0
-    fi
+  identity=$(fm_pid_identity_from_proc "$pid" 2>/dev/null || true)
+  if [ -n "$identity" ]; then
+    printf '%s\n' "$identity"
+    return 0
   fi
   identity=$(fm_pid_legacy_identity "$pid") || return 1
   printf 'ps:%s\n' "$identity"
@@ -72,7 +79,7 @@ fm_pid_identity_matches() {
   [ -n "$recorded_identity" ] || return 1
   case "$recorded_identity" in
     proc:*)
-      current_identity=$(fm_pid_identity "$pid" 2>/dev/null || true)
+      current_identity=$(fm_pid_identity_from_proc "$pid" 2>/dev/null || true)
       ;;
     ps:*)
       current_identity=$(fm_pid_legacy_identity "$pid" 2>/dev/null || true)
