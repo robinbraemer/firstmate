@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # Shared durable wake queue and portable lock helpers.
-# Lock identity prefers Linux /proc start ticks, falls back to locale-stable
-# ps output elsewhere, and reads the earlier untagged ps format compatibly.
+# Lock identity pairs Linux /proc start ticks with the kernel boot ID, falls back
+# to locale-stable ps output elsewhere, and reads earlier tagged or untagged
+# formats fail-closed when a live owner's identity cannot be disproved.
 
 FM_WAKE_LIB_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 FM_WAKE_DEFAULT_ROOT="$(cd "$FM_WAKE_LIB_DIR/.." && pwd)"
