@@ -114,6 +114,7 @@ test_pi_snippet_preserves_hostile_extension_path_as_one_argument() {
   watch="$hostile_root/.pi/extensions/fm-primary-pi-watch.ts"
   mkdir -p "$home/state" "$home/config"
   out=$(FM_HOME="$home" FM_ROOT_OVERRIDE="$hostile_root" "$RENDER" --harness pi)
+  # shellcheck disable=SC2016  # The sed program must preserve its literal backticks.
   launch_args=$(printf '%s\n' "$out" | sed -n 's/.*use `\([^`]*\)` so.*/\1/p')
   [ -n "$launch_args" ] || fail "pi snippet did not expose the unattended launch argv"
   argv_out=$(cd "$TMP_ROOT" && LAUNCH_ARGS="$launch_args" EXPECTED="$watch" bash -c '
