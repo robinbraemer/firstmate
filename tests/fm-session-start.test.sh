@@ -97,6 +97,7 @@ make_fake_ps_harness() {
 set -u
 harness=${FM_FAKE_HARNESS:-claude}
 case "$*" in
+  *"lstart="*) printf 'Sat Jul 11 12:00:00 2026 %s\n' "$harness"; exit 0 ;;
   *"comm="*) printf '/usr/local/bin/%s\n' "$harness"; exit 0 ;;
   *"args="*) printf '%s\n' "$harness"; exit 0 ;;
 esac
@@ -118,6 +119,7 @@ for arg in "\$@"; do
   prev="\$arg"
 done
 case "\$*" in
+  *"lstart="*) printf 'Sat Jul 11 12:00:00 2026 pi\n'; exit 0 ;;
   *"comm="*)
     if [ "\$pid" = "$holder_pid" ]; then
       printf '/usr/local/bin/pi\n'
