@@ -38,6 +38,10 @@ That block owns the live wait shape for the running primary harness: Claude and 
 `bin/fm-watch-arm.sh` remains the verified arm wrapper for protocols that call it; it forks the watcher as a tracked child, verifies it is genuinely alive with a fresh liveness beacon, and prints exactly one honest status line (`started` / `attached` / restart-only `healthy` / `FAILED`, the last exiting non-zero).
 On `attached` it stays live until that existing cycle ends so background-notify harnesses do not get an empty false wake from a healthy no-op exit.
 Its `--restart` mode signals only the watcher recorded in the current home's `state/.watch.lock`, so restarting one home cannot kill sibling secondmate watchers.
+Portable singleton locks pair each PID with a process-start identity so PID reuse cannot transfer ownership to an unrelated process.
+On Linux and WSL2, `bin/fm-wake-lib.sh` records `/proc/<pid>/stat` field 22 as `proc:<start-ticks>`; monotonic start ticks remain stable across host suspend and resume, unlike wall-clock `ps lstart` output that can drift on WSL2.
+Platforms without a readable proc identity use locale-pinned `ps lstart` plus the command under a `ps:` tag, while exact untagged records from earlier Firstmate versions remain readable.
+If a live PID's untagged legacy identity no longer matches, portable lock acquisition conservatively preserves that owner instead of risking lock theft; tagged identity mismatches are authoritative evidence of PID reuse.
 A pull-based guard (`bin/fm-guard.sh`) warns through supervision tool output if the primary checkout is tangled, or if tasks are in flight and that watcher stops running or queued wakes are waiting to be drained.
 The drain script calls that guard after emptying the queue, which avoids repeating the queued-wakes warning for records it just consumed while still warning on stale watcher liveness.
 It leads with prominent bordered banners for the tangle and no-watcher cases so they cannot be skimmed past.
