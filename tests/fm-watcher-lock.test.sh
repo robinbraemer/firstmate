@@ -372,7 +372,7 @@ test_lock_live_tagged_identity_probe_failure_fails_closed() {
   live=$!
   mkdir "$lockdir"
   printf '%s\n' "$live" > "$lockdir/pid"
-  printf '%s\n' 'proc:424242' > "$lockdir/pid-identity"
+  printf '%s\n' 'proc:00000000-0000-0000-0000-000000000000:424242' > "$lockdir/pid-identity"
   touch -t 202001010000 "$lockdir"
   out=$(FM_STATE_OVERRIDE="$state" bash -c '
     . "$1"
@@ -390,9 +390,9 @@ test_proc_identity_probe_does_not_fall_back_to_ps() {
   local out
   out=$(bash -c '
     . "$1"
-    fm_pid_identity_from_proc_stat() { return 1; }
+    fm_pid_identity_from_proc() { return 1; }
     fm_pid_legacy_identity() { printf "%s\n" "legacy identity"; }
-    fm_pid_identity_matches "$2" proc:424242
+    fm_pid_identity_matches "$2" proc:00000000-0000-0000-0000-000000000000:424242
     printf "rc=%s\n" "$?"
   ' _ "$LIB" "$$")
   [ "$out" = "rc=2" ] || fail "unavailable proc identity was replaced by a ps mismatch: $out"
@@ -1052,7 +1052,7 @@ test_pid_identity_is_locale_invariant() {
 }
 
 test_pid_identity_prefers_linux_start_ticks() {
-  local dir fakebin count live expected first second
+  local dir fakebin count live expected boot_id first second
   dir=$(make_case pid-identity-proc)
   fakebin="$dir/fakebin"
   count="$dir/ps-count"
@@ -1065,6 +1065,13 @@ test_pid_identity_prefers_linux_start_ticks() {
     return
   fi
   expected=$(sed 's/^[^)]*) //' "/proc/$live/stat" | awk '{ print $20 }')
+  boot_id=$(cat /proc/sys/kernel/random/boot_id 2>/dev/null || true)
+  [ -n "$boot_id" ] || {
+    kill "$live" 2>/dev/null || true
+    wait "$live" 2>/dev/null || true
+    pass "fm_pid_identity Linux boot identity is not applicable"
+    return
+  }
   cat > "$fakebin/ps" <<'SH'
 #!/usr/bin/env bash
 count=$(cat "$FM_FAKE_PS_COUNT" 2>/dev/null || printf '0')
@@ -1077,17 +1084,38 @@ SH
   second=$(PATH="$fakebin:$PATH" FM_FAKE_PS_COUNT="$count" bash -c '. "$1"; fm_pid_identity "$2"' _ "$LIB" "$live")
   kill "$live" 2>/dev/null || true
   wait "$live" 2>/dev/null || true
-  [ "$first" = "proc:$expected" ] || fail "fm_pid_identity did not use Linux start ticks (got '$first')"
+  [ "$first" = "proc:$boot_id:$expected" ] || fail "fm_pid_identity did not bind Linux start ticks to the boot id (got '$first')"
   [ "$second" = "$first" ] || fail "fm_pid_identity changed with ps lstart (got '$first' then '$second')"
   pass "fm_pid_identity prefers stable Linux start ticks"
 }
 
 test_pid_identity_parses_linux_start_ticks() {
-  local stat identity
+  local stat start_ticks
   stat='123 (clock worker) S 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 424242 20'
-  identity=$(bash -c '. "$1"; fm_pid_identity_from_proc_stat "$2"' _ "$LIB" "$stat" 2>/dev/null || true)
-  [ "$identity" = "proc:424242" ] || fail "Linux proc identity parser did not return field 22 (got '$identity')"
+  start_ticks=$(bash -c '. "$1"; fm_pid_start_ticks_from_proc_stat "$2"' _ "$LIB" "$stat" 2>/dev/null || true)
+  [ "$start_ticks" = "424242" ] || fail "Linux proc identity parser did not return field 22 (got '$start_ticks')"
   pass "Linux proc identity parser returns field 22"
+}
+
+test_proc_identity_distinguishes_boots_and_fails_closed_for_legacy() {
+  local out
+  out=$(bash -c '
+    . "$1"
+    fm_pid_start_ticks_from_proc() { printf "%s\n" 424242; }
+    fm_linux_boot_id() { printf "%s\n" aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa; }
+    identity=$(fm_pid_identity_from_proc 123)
+    printf "identity=%s\n" "$identity"
+    fm_pid_identity_matches 123 "$identity"; printf "exact=%s\n" "$?"
+    fm_pid_identity_matches 123 proc:bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb:424242; printf "cross=%s\n" "$?"
+    fm_pid_identity_matches 123 proc:424242; printf "legacy-exact=%s\n" "$?"
+    fm_pid_identity_matches 123 proc:515151; printf "legacy-mismatch=%s\n" "$?"
+  ' _ "$LIB")
+  [ "$out" = "identity=proc:aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa:424242
+exact=0
+cross=1
+legacy-exact=2
+legacy-mismatch=1" ] || fail "Linux process identity did not distinguish boots conservatively: $out"
+  pass "Linux process identity includes boot id and treats legacy collisions as inconclusive"
 }
 
 test_singleton_start
@@ -1107,6 +1135,7 @@ test_proc_identity_probe_does_not_fall_back_to_ps
 test_path_age_feature_detects_gnu_stat_on_darwin
 test_pid_identity_parses_linux_start_ticks
 test_pid_identity_prefers_linux_start_ticks
+test_proc_identity_distinguishes_boots_and_fails_closed_for_legacy
 test_pid_identity_is_locale_invariant
 test_bounded_lock_identity_failure_returns_without_recursing
 test_session_lock_publication_is_fenced_by_mutex_ownership
