@@ -310,6 +310,59 @@ test_lock_aged_live_owner_keeps_ownership_after_resume() {
   pass "aged live lock owner remains authoritative across pause and resume"
 }
 
+test_lock_live_legacy_identity_mismatch_fails_closed() {
+  local dir state lockdir live out lockpid
+  dir=$(make_case lock-live-legacy-identity-mismatch)
+  state="$dir/state"
+  lockdir="$state/.contend.lock"
+  sleep 300 &
+  live=$!
+  mkdir "$lockdir"
+  printf '%s\n' "$live" > "$lockdir/pid"
+  printf '%s\n' 'legacy wall-clock identity changed' > "$lockdir/pid-identity"
+  touch -t 202001010000 "$lockdir"
+  out=$(FM_STATE_OVERRIDE="$state" bash -c '
+    . "$1"
+    if fm_lock_try_acquire "$2" 1; then rc=0; else rc=1; fi
+    printf "rc=%s held=%s\n" "$rc" "${FM_LOCK_HELD_PID:-}"
+  ' _ "$LIB" "$lockdir")
+  kill "$live" 2>/dev/null || true
+  wait "$live" 2>/dev/null || true
+  case "$out" in
+    *"rc=1"*"held=$live"*) ;;
+    *) fail "live legacy identity mismatch did not fail closed: $out" ;;
+  esac
+  lockpid=$(cat "$lockdir/pid" 2>/dev/null || true)
+  [ "$lockpid" = "$live" ] || fail "live legacy identity mismatch allowed lock theft (got '$lockpid')"
+  pass "live legacy identity mismatch fails closed"
+}
+
+test_lock_accepts_exact_legacy_identity() {
+  local dir state lockdir live identity out
+  dir=$(make_case lock-live-exact-legacy-identity)
+  state="$dir/state"
+  lockdir="$state/.contend.lock"
+  sleep 300 &
+  live=$!
+  identity=$(LC_ALL=C ps -p "$live" -o lstart= -o command= 2>/dev/null | sed 's/^[[:space:]]*//')
+  [ -n "$identity" ] || fail "could not capture legacy process identity"
+  mkdir "$lockdir"
+  printf '%s\n' "$live" > "$lockdir/pid"
+  printf '%s\n' "$identity" > "$lockdir/pid-identity"
+  out=$(FM_STATE_OVERRIDE="$state" bash -c '
+    . "$1"
+    if fm_lock_try_acquire "$2" 1; then rc=0; else rc=1; fi
+    printf "rc=%s held=%s\n" "$rc" "${FM_LOCK_HELD_PID:-}"
+  ' _ "$LIB" "$lockdir")
+  kill "$live" 2>/dev/null || true
+  wait "$live" 2>/dev/null || true
+  case "$out" in
+    *"rc=1"*"held=$live"*) ;;
+    *) fail "exact legacy identity was not accepted: $out" ;;
+  esac
+  pass "exact legacy identity remains compatible"
+}
+
 test_lock_reclaims_aged_reused_pid_steal_mutex() {
   local dir state lockdir dead reused out rc
   dir=$(make_case lock-aged-reused-steal)
@@ -860,8 +913,46 @@ test_pid_identity_is_locale_invariant() {
   pass "fm_pid_identity is locale-invariant across LC_ALL/LC_TIME"
 }
 
+test_pid_identity_prefers_linux_start_ticks() {
+  local dir fakebin count live expected first second
+  dir=$(make_case pid-identity-proc)
+  fakebin="$dir/fakebin"
+  count="$dir/ps-count"
+  sleep 300 &
+  live=$!
+  if [ ! -r "/proc/$live/stat" ]; then
+    kill "$live" 2>/dev/null || true
+    wait "$live" 2>/dev/null || true
+    pass "fm_pid_identity Linux start-tick preference is not applicable"
+    return
+  fi
+  expected=$(sed 's/^[^)]*) //' "/proc/$live/stat" | awk '{ print $20 }')
+  cat > "$fakebin/ps" <<'SH'
+#!/usr/bin/env bash
+count=$(cat "$FM_FAKE_PS_COUNT" 2>/dev/null || printf '0')
+count=$((count + 1))
+printf '%s\n' "$count" > "$FM_FAKE_PS_COUNT"
+printf 'Sat Jul 11 12:00:0%s 2026 sleep 300\n' "$count"
+SH
+  chmod +x "$fakebin/ps"
+  first=$(PATH="$fakebin:$PATH" FM_FAKE_PS_COUNT="$count" bash -c '. "$1"; fm_pid_identity "$2"' _ "$LIB" "$live")
+  second=$(PATH="$fakebin:$PATH" FM_FAKE_PS_COUNT="$count" bash -c '. "$1"; fm_pid_identity "$2"' _ "$LIB" "$live")
+  kill "$live" 2>/dev/null || true
+  wait "$live" 2>/dev/null || true
+  [ "$first" = "proc:$expected" ] || fail "fm_pid_identity did not use Linux start ticks (got '$first')"
+  [ "$second" = "$first" ] || fail "fm_pid_identity changed with ps lstart (got '$first' then '$second')"
+  pass "fm_pid_identity prefers stable Linux start ticks"
+}
+
+test_pid_identity_parses_linux_start_ticks() {
+  local stat identity
+  stat='123 (clock worker) S 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 424242 20'
+  identity=$(bash -c '. "$1"; fm_pid_identity_from_proc_stat "$2"' _ "$LIB" "$stat" 2>/dev/null || true)
+  [ "$identity" = "proc:424242" ] || fail "Linux proc identity parser did not return field 22 (got '$identity')"
+  pass "Linux proc identity parser returns field 22"
+}
+
 test_singleton_start
-test_pid_identity_is_locale_invariant
 test_stale_watch_lock_reclaimed
 test_live_stale_watch_lock_is_actionable
 test_guard_warnings
@@ -871,6 +962,11 @@ test_lock_stale_steal_single_winner_under_concurrency
 test_lock_live_steal_mutex_is_not_reclaimed
 test_lock_reclaims_aged_reused_pid_steal_mutex
 test_lock_aged_live_owner_keeps_ownership_after_resume
+test_lock_live_legacy_identity_mismatch_fails_closed
+test_lock_accepts_exact_legacy_identity
+test_pid_identity_parses_linux_start_ticks
+test_pid_identity_prefers_linux_start_ticks
+test_pid_identity_is_locale_invariant
 test_bounded_lock_identity_failure_returns_without_recursing
 test_session_lock_publication_is_fenced_by_mutex_ownership
 test_lock_does_not_steal_live_lock
