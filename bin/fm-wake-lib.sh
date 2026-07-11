@@ -1,5 +1,7 @@
 #!/usr/bin/env bash
 # Shared durable wake queue and portable lock helpers.
+# Lock identity prefers Linux /proc start ticks, falls back to locale-stable
+# ps output elsewhere, and reads the earlier untagged ps format compatibly.
 
 FM_WAKE_LIB_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 FM_WAKE_DEFAULT_ROOT="$(cd "$FM_WAKE_LIB_DIR/.." && pwd)"
@@ -23,6 +25,8 @@ fm_pid_alive() {
   kill -0 "$pid" 2>/dev/null
 }
 
+# Parse Linux /proc/<pid>/stat field 22 (process start ticks since boot).
+# Removing through the final ") " keeps spaces and parentheses in comm safe.
 fm_pid_identity_from_proc_stat() {
   local stat=$1 out
   out=$(printf '%s\n' "$stat" | sed 's/^.*) //' | awk '$20 ~ /^[0-9]+$/ { print "proc:" $20; exit }')
@@ -30,6 +34,7 @@ fm_pid_identity_from_proc_stat() {
   printf '%s\n' "$out"
 }
 
+# Return the pre-tag process identity format used on platforms without /proc.
 fm_pid_legacy_identity() {
   local pid=$1 out
   case "$pid" in
@@ -40,6 +45,8 @@ fm_pid_legacy_identity() {
   printf '%s\n' "$out" | sed 's/^[[:space:]]*//'
 }
 
+# Return a tagged process identity: stable monotonic start ticks on Linux/WSL2,
+# or locale-pinned wall-clock start plus command on other platforms.
 fm_pid_identity() {
   local pid=$1 stat identity
   case "$pid" in
@@ -58,6 +65,8 @@ fm_pid_identity() {
   printf 'ps:%s\n' "$identity"
 }
 
+# Match current tagged identities strictly while accepting exact records from
+# the earlier untagged ps format during upgrades.
 fm_pid_identity_matches() {
   local pid=$1 recorded_identity=$2 current_identity
   [ -n "$recorded_identity" ] || return 1
