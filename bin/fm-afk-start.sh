@@ -53,11 +53,12 @@ daemon_lock_owner() {
 }
 
 daemon_pid_matches() {
-  local pid=$1 owner=$2 identity current command
+  local pid=$1 owner=$2 identity identity_rc command
   identity=$(cat "$owner/pid-identity" 2>/dev/null || true)
   if [ -n "$identity" ]; then
-    current=$(fm_pid_identity "$pid") || return 1
-    [ "$current" = "$identity" ]
+    fm_pid_identity_matches "$pid" "$identity" && return 0
+    identity_rc=$?
+    [ "$identity_rc" -eq 2 ]
     return
   fi
   command=$(ps -p "$pid" -o command= 2>/dev/null || true)
