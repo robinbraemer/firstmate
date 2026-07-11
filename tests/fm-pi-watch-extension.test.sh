@@ -1205,9 +1205,13 @@ test_pi_live_lab_cleanup_is_owned() {
   assert_contains "$helper_text" 'exec env' "live Pi candidate launch retains an avoidable wrapper process"
   assert_contains "$text" 'registration-probe.ts' "live Pi test does not prove tool and command registration after detached restart"
   assert_contains "$text" 'wait_for_text_count_after()' "live Pi test lacks an order-aware completion wait"
+  # shellcheck disable=SC2016  # These are literal source-code assertions.
   assert_contains "$text" 'wake_handled_before=$(text_count "WAKE-HANDLED")' "live Pi test does not establish the pre-wake completion count"
+  # shellcheck disable=SC2016
   assert_contains "$text" 'wait_for_text_count_after "WAKE-HANDLED" "$wake_handled_before"' "live Pi test can accept WAKE-HANDLED from the earlier prompt"
+  # shellcheck disable=SC2016
   assert_contains "$text" 'ROLE=${FM_PI_LIVE_ROLE:-primary}' "live Pi test cannot select a primary or secondmate home"
+  # shellcheck disable=SC2016
   assert_contains "$text" ': > "$PROJECT/.fm-secondmate-home"' "live Pi test does not mark its isolated secondmate home"
   assert_contains "$text" 'role=%s' "live Pi evidence does not identify the exercised home role"
   assert_present "$helper" "detached Pi launch helper is missing"
