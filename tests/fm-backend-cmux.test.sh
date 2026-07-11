@@ -52,6 +52,18 @@ if [ "${1:-}" = ping ]; then
   exit "${FM_CMUX_FAKE_PING_EXIT:-0}"
 fi
 
+if [ "${FM_CMUX_DYNAMIC_CWD:-0}" = 1 ] && [ "${1:-}" = read-screen ]; then
+  marker_begin=$(sed -n "s/.*'\(__FM_CMUX_CWD_BEGIN[^']*__\)'.*/\1/p" "$LOG" | tail -1)
+  marker_end=$(sed -n "s/.*'\(__FM_CMUX_CWD_END[^']*__\)'.*/\1/p" "$LOG" | tail -1)
+  jq -n --arg t "__FM_CMUX_CWD_BEGIN__
+/tmp/stale-project-root
+__FM_CMUX_CWD_END__
+$marker_begin
+/Users/kunchen/.treehouse/fresh-worktree
+$marker_end" '{text:$t}'
+  exit 0
+fi
+
 next=$(( $(cat "$COUNT_FILE" 2>/dev/null || echo 0) + 1 ))
 n=$next
 echo "$n" > "$COUNT_FILE"
@@ -652,21 +664,35 @@ test_current_path_probes_with_marker() {
   # 4: list-panes (target_ready, called by send_text_line->send_key)
   # 5: send-key enter
   # 6: list-panes (target_ready, called by capture)
-  # 7: read-screen --scrollback --lines 200 --json (actual fetch)
+  # 7: read-screen --scrollback --lines 200 --json (dynamic marked response)
   cmux_panes_response "$dir" 1 "bbbbbbbb-1111-1111-1111-111111111111"
   cmux_panes_response "$dir" 2 "bbbbbbbb-1111-1111-1111-111111111111"
   cmux_panes_response "$dir" 4 "bbbbbbbb-1111-1111-1111-111111111111"
   cmux_panes_response "$dir" 6 "bbbbbbbb-1111-1111-1111-111111111111"
-  cmux_read_screen_response "$dir" 7 $'/tmp/proj\n❯ printf marker\n__FM_CMUX_CWD_BEGIN__\n/Users/kunchen/.treehouse/fake-worktree\n__FM_CMUX_CWD_END__\n/Users/kunchen/.treehouse/fake-worktree ❯'
   fb=$(make_cmux_fakebin "$dir")
-  out=$( PATH="$fb:$PATH" FM_CMUX_LOG="$dir/log" FM_CMUX_RESPONSES="$dir/responses" \
+  out=$( PATH="$fb:$PATH" FM_CMUX_LOG="$dir/log" FM_CMUX_RESPONSES="$dir/responses" FM_CMUX_DYNAMIC_CWD=1 \
     bash -c '. "$0/bin/backends/cmux.sh"; fm_backend_cmux_current_path "aaaaaaaa-0000-0000-0000-000000000000:bbbbbbbb-1111-1111-1111-111111111111"' "$ROOT" )
-  [ "$out" = "/Users/kunchen/.treehouse/fake-worktree" ] || fail "current_path should read only the marked cwd line, got '$out'"
-  assert_contains "$(cat "$dir/log")" "__FM_CMUX_CWD_BEGIN__" "current_path did not send the cwd begin marker"
+  [ "$out" = "/Users/kunchen/.treehouse/fresh-worktree" ] || fail "current_path should read only the marked cwd line, got '$out'"
+  assert_contains "$(cat "$dir/log")" "__FM_CMUX_CWD_BEGIN_" "current_path did not send the cwd begin marker"
   assert_contains "$(cat "$dir/log")" "pwd;" "current_path did not send the pwd probe"
   assert_contains "$(cat "$dir/log")" $'\x1f''send-key'$'\x1f''--workspace'$'\x1f''aaaaaaaa-0000-0000-0000-000000000000'$'\x1f''--surface'$'\x1f''bbbbbbbb-1111-1111-1111-111111111111'$'\x1f''enter' \
     "current_path did not submit the cwd probe with Enter"
   pass "fm_backend_cmux_current_path: actively probes with marked begin/end lines (zellij-shape frozen cwd)"
+}
+
+test_current_path_ignores_stale_probe_blocks() {
+  local dir fb out
+  dir="$TMP_ROOT/cwd-stale-probe"; mkdir -p "$dir/responses"
+  cmux_panes_response "$dir" 1 "bbbbbbbb-1111-1111-1111-111111111111"
+  cmux_panes_response "$dir" 2 "bbbbbbbb-1111-1111-1111-111111111111"
+  cmux_panes_response "$dir" 4 "bbbbbbbb-1111-1111-1111-111111111111"
+  cmux_panes_response "$dir" 6 "bbbbbbbb-1111-1111-1111-111111111111"
+  fb=$(make_cmux_fakebin "$dir")
+  out=$( PATH="$fb:$PATH" FM_CMUX_LOG="$dir/log" FM_CMUX_RESPONSES="$dir/responses" FM_CMUX_DYNAMIC_CWD=1 \
+    bash -c '. "$0/bin/backends/cmux.sh"; fm_backend_cmux_current_path "aaaaaaaa-0000-0000-0000-000000000000:bbbbbbbb-1111-1111-1111-111111111111"' "$ROOT" )
+  [ "$out" = "/Users/kunchen/.treehouse/fresh-worktree" ] \
+    || fail "current_path should ignore a complete stale probe block, got '$out'"
+  pass "fm_backend_cmux_current_path: ignores complete stale probe blocks from earlier scrollback"
 }
 
 # --- composer_state: structural border-row classification (adapted from herdr) ----
@@ -1043,6 +1069,7 @@ test_send_key_normalizes_and_targets
 test_send_key_recovers_stale_target_by_label
 test_send_literal_uses_separator_for_option_shaped_text
 test_current_path_probes_with_marker
+test_current_path_ignores_stale_probe_blocks
 test_composer_state_bare_prompt_is_empty
 test_composer_state_ghost_placeholder_is_empty
 test_composer_state_real_text_is_pending

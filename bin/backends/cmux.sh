@@ -445,7 +445,10 @@ fm_backend_cmux_target_ready() {  # <target> [expected-label]
 # submitted via send_text_line), briefly settle, then capture and read only
 # that marker line. Scoped to fm-spawn.sh's own worktree-discovery poll loop.
 fm_backend_cmux_current_path() {  # <target> [expected-label]
-  local target=$1 expected_label=${2:-} out line marker_begin="__FM_CMUX_CWD_BEGIN__" marker_end="__FM_CMUX_CWD_END__" in_block=0 chunk="" last="" tries=0 max_tries=6
+  local target=$1 expected_label=${2:-} out line probe_id marker_begin marker_end in_block=0 chunk="" last="" tries=0 max_tries=6
+  probe_id="$$_${RANDOM}_${RANDOM}"
+  marker_begin="__FM_CMUX_CWD_BEGIN_${probe_id}__"
+  marker_end="__FM_CMUX_CWD_END_${probe_id}__"
   fm_backend_cmux_target_ready "$target" "$expected_label" || return 0
   fm_backend_cmux_send_text_line "$target" "printf '%s\n' '$marker_begin'; pwd; printf '%s\n' '$marker_end'" "$expected_label" || return 0
   while [ "$tries" -lt "$max_tries" ]; do
