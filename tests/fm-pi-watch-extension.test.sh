@@ -1228,7 +1228,13 @@ test_pi_live_lab_cleanup_is_owned() {
   text=$(cat "$script")
   helper_text=$(cat "$helper")
   # shellcheck disable=SC2016  # These are literal source-code assertions.
-  assert_contains "$text" 'mktemp -d "$ROOT/.pi-live-e2e.XXXXXX"' "live Pi test does not allocate a fresh worktree-local lab"
+  assert_contains "$text" 'TMP_BASE=$(cd "${TMPDIR:-/tmp}" && pwd -P)' "live Pi test does not resolve its temporary base"
+  # shellcheck disable=SC2016
+  assert_contains "$text" 'LAB=$(umask 077; mktemp -d "$TMP_BASE/fm-pi-live-e2e.XXXXXX")' "live Pi test does not allocate a private temporary lab"
+  # shellcheck disable=SC2016
+  assert_contains "$text" '"$ROOT"|"$ROOT"/*)' "live Pi test does not reject a worktree-local temporary base"
+  # shellcheck disable=SC2016
+  assert_not_contains "$text" 'mktemp -d "$ROOT/' "live Pi test can persist credentials inside the worktree"
   # shellcheck disable=SC2016
   assert_contains "$text" 'LAB_SENTINEL="$LAB/.fm-pi-live-e2e-owned"' "live Pi test does not mark ownership of its lab"
   # shellcheck disable=SC2016
