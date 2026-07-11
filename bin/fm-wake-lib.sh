@@ -27,14 +27,14 @@ fm_pid_alive() {
 
 # Parse Linux /proc/<pid>/stat field 22 (process start ticks since boot).
 # Removing through the final ") " keeps spaces and parentheses in comm safe.
-fm_pid_start_ticks_from_proc_stat() {
+fm_pid_identity_from_proc_stat() {
   local stat=$1 out
-  out=$(printf '%s\n' "$stat" | sed 's/^.*) //' | awk '$20 ~ /^[0-9]+$/ { print $20; exit }')
+  out=$(printf '%s\n' "$stat" | sed 's/^.*) //' | awk '$20 ~ /^[0-9]+$/ { print "proc:" $20; exit }')
   [ -n "$out" ] || return 1
   printf '%s\n' "$out"
 }
 
-fm_pid_start_ticks_from_proc() {
+fm_pid_identity_from_proc() {
   local pid=$1 stat
   case "$pid" in
     ''|*[!0-9]*) return 1 ;;
@@ -42,24 +42,7 @@ fm_pid_start_ticks_from_proc() {
   [ -r "/proc/$pid/stat" ] || return 1
   stat=
   IFS= read -r stat < "/proc/$pid/stat" || return 1
-  fm_pid_start_ticks_from_proc_stat "$stat"
-}
-
-fm_linux_boot_id() {
-  local boot_id=
-  [ -r /proc/sys/kernel/random/boot_id ] || return 1
-  IFS= read -r boot_id < /proc/sys/kernel/random/boot_id || return 1
-  case "$boot_id" in
-    ''|*[!0-9A-Fa-f-]*) return 1 ;;
-  esac
-  printf '%s\n' "$boot_id"
-}
-
-fm_pid_identity_from_proc() {
-  local pid=$1 start_ticks boot_id
-  start_ticks=$(fm_pid_start_ticks_from_proc "$pid") || return 1
-  boot_id=$(fm_linux_boot_id) || return 1
-  printf 'proc:%s:%s\n' "$boot_id" "$start_ticks"
+  fm_pid_identity_from_proc_stat "$stat"
 }
 
 # Return the pre-tag process identity format used on platforms without /proc.
@@ -89,28 +72,16 @@ fm_pid_identity() {
   printf 'ps:%s\n' "$identity"
 }
 
-# Return 0 for a match, 1 for an authoritative tagged mismatch, and 2 when a
-# legacy mismatch or unavailable probe cannot safely disprove live ownership.
+# Match current tagged identities strictly while accepting exact records from
+# the earlier untagged ps format during upgrades.
 fm_pid_identity_matches() {
-  local pid=$1 recorded_identity=$2 current_identity current_ticks recorded_ticks tagged=
-  [ -n "$recorded_identity" ] || return 2
+  local pid=$1 recorded_identity=$2 current_identity
+  [ -n "$recorded_identity" ] || return 1
   case "$recorded_identity" in
-    proc:*:*)
-      tagged=1
+    proc:*)
       current_identity=$(fm_pid_identity_from_proc "$pid" 2>/dev/null || true)
       ;;
-    proc:*)
-      recorded_ticks=${recorded_identity#proc:}
-      case "$recorded_ticks" in
-        ''|*[!0-9]*) return 2 ;;
-      esac
-      current_ticks=$(fm_pid_start_ticks_from_proc "$pid" 2>/dev/null || true)
-      [ -n "$current_ticks" ] || return 2
-      [ "$current_ticks" = "$recorded_ticks" ] && return 2
-      return 1
-      ;;
     ps:*)
-      tagged=1
       current_identity=$(fm_pid_legacy_identity "$pid" 2>/dev/null || true)
       [ -n "$current_identity" ] && current_identity="ps:$current_identity"
       ;;
@@ -119,23 +90,15 @@ fm_pid_identity_matches() {
       ;;
   esac
   [ -n "$current_identity" ] || return 2
-  [ "$current_identity" = "$recorded_identity" ] && return 0
-  [ -n "$tagged" ] && return 1
-  return 2
+  [ "$current_identity" = "$recorded_identity" ]
 }
 
 fm_path_mtime() {
-  local mtime
-  mtime=$(stat -c %Y "$1" 2>/dev/null || true)
-  case "$mtime" in
-    ''|*[!0-9]*) ;;
-    *) printf '%s\n' "$mtime"; return 0 ;;
-  esac
-  mtime=$(stat -f %m "$1" 2>/dev/null || true)
-  case "$mtime" in
-    ''|*[!0-9]*) return 1 ;;
-    *) printf '%s\n' "$mtime" ;;
-  esac
+  if [ "$(uname)" = Darwin ]; then
+    stat -f %m "$1" 2>/dev/null
+  else
+    stat -c %Y "$1" 2>/dev/null
+  fi
 }
 
 fm_path_age() {
@@ -339,7 +302,10 @@ fm_lock_live_owner_is_fresh() {
     fm_pid_identity_matches "$pid" "$recorded_identity" && return 0
     identity_rc=$?
     [ "$identity_rc" -eq 2 ] && return 0
-    return 1
+    case "$recorded_identity" in
+      proc:*|ps:*) return 1 ;;
+      *) return 0 ;;
+    esac
   fi
   [ -n "$live_stale_after" ] || return 0
   [ "$(fm_path_age "$lockdir")" -lt "$live_stale_after" ]

@@ -386,6 +386,19 @@ test_lock_live_tagged_identity_probe_failure_fails_closed() {
   pass "unavailable tagged identity probe preserves the live lock owner"
 }
 
+test_proc_identity_probe_does_not_fall_back_to_ps() {
+  local out
+  out=$(bash -c '
+    . "$1"
+    fm_pid_identity_from_proc_stat() { return 1; }
+    fm_pid_legacy_identity() { printf "%s\n" "legacy identity"; }
+    fm_pid_identity_matches "$2" proc:424242
+    printf "rc=%s\n" "$?"
+  ' _ "$LIB" "$$")
+  [ "$out" = "rc=2" ] || fail "unavailable proc identity was replaced by a ps mismatch: $out"
+  pass "proc identity probe stays unavailable when proc cannot be read"
+}
+
 test_lock_reclaims_aged_reused_pid_steal_mutex() {
   local dir state lockdir dead reused out rc
   dir=$(make_case lock-aged-reused-steal)
@@ -988,6 +1001,7 @@ test_lock_aged_live_owner_keeps_ownership_after_resume
 test_lock_live_legacy_identity_mismatch_fails_closed
 test_lock_accepts_exact_legacy_identity
 test_lock_live_tagged_identity_probe_failure_fails_closed
+test_proc_identity_probe_does_not_fall_back_to_ps
 test_pid_identity_parses_linux_start_ticks
 test_pid_identity_prefers_linux_start_ticks
 test_pid_identity_is_locale_invariant
