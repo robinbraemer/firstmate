@@ -19,7 +19,7 @@ The existing child, lock, generation, startup-cancellation, and intentional-stop
 - An ordinary linked task worktree performs no status write and leaves the key absent.
 - Status changes are coordinator-event driven only.
 - No status polling, filesystem polling, `setInterval`, or status-refresh `setTimeout` is allowed.
-- A one-shot bounded child-cleanup deadline may use `setTimeout`; it must not read or refresh status.
+- The bounded child-cleanup wait may use one `setTimeout` source behind an absolute deadline; it must not read or refresh status.
 - Pi wake injection uses `pi.sendMessage(...)` with `customType: "firstmate-watcher-wake"`, `deliverAs: "followUp"`, and `triggerTurn: true`.
 - The watcher extension must not call `pi.sendUserMessage(...)`.
 - Pi 0.80.6 declares `ExtensionAPI.sendMessage(...)` as returning `void`, so delivery acceptance means the call returned normally and delivery failure means it threw synchronously.
@@ -66,8 +66,6 @@ type ArmRecord = {
   generation: number;
   intentionalStopReason: string;
   settled: boolean;
-  completion: Promise<void>;
-  resolveCompletion: () => void;
   stdout: string;
   stderr: string;
   stdoutPending: string;
@@ -502,7 +500,7 @@ git commit -m "feat(pi): publish watcher outcome status"
 
 **Interfaces:**
 
-- Extends the existing bounded `stopArm(coordinator, reason): Promise<void>` with a status disposition without replacing `signalArm`, `settlesWithin`, `STOP_GRACE_MS`, or `STOP_KILL_GRACE_MS`.
+- Extends the existing bounded `stopArm(coordinator, reason): Promise<void>` with a status disposition without replacing `signalArm`, `stopsWithin`, `STOP_GRACE_MS`, or `STOP_KILL_GRACE_MS`.
 - Produces `shutdownClient(reason): Promise<void>` for last-client invalidation, clear, cancellation, bounded process-group settlement, and listener removal.
 - Keeps the existing `startPromise` cancellation and monotonic generation contracts.
 - Keeps the per-home coordinator across reload so sequence/generation ownership remains monotonic; a replacement client explicitly resets shutdown state and publishes fresh `offline`.
@@ -582,9 +580,9 @@ export async function stopArm(
   if (!record.intentionalStopReason) record.intentionalStopReason = reason;
   if (coordinator.current === record) coordinator.state = "stopping";
   signalArm(record, "SIGTERM");
-  if (!(await settlesWithin(record, STOP_GRACE_MS))) {
+  if (!(await stopsWithin(record, STOP_GRACE_MS))) {
     signalArm(record, "SIGKILL");
-    if (!(await settlesWithin(record, STOP_KILL_GRACE_MS))) {
+    if (!(await stopsWithin(record, STOP_KILL_GRACE_MS))) {
       settleArm(coordinator, record, null, "SIGKILL");
     }
   }
@@ -600,7 +598,7 @@ export async function stopArm(
 ```
 
 The status slice adds no polling or status timer.
-The existing one-shot TERM and KILL deadlines remain cleanup mechanics only; never replace them with an unbounded `await record.completion` or direct-child-only `record.child.kill(...)`.
+The existing deadline-bounded TERM and KILL waits remain cleanup mechanics only; never replace them with an unbounded wait for child settlement or direct-child-only `record.child.kill(...)`.
 
 - [ ] **Step 4: Clear before awaiting last-client shutdown**
 
@@ -748,13 +746,20 @@ for forbidden in 'setInterval(' 'setWidget(' 'setFooter(' 'gh pr' 'backlog.md' '
 done
 timer_lines=$(grep -n 'setTimeout(' "$EXT" || true)
 [ "$(printf '%s\n' "$timer_lines" | grep -c .)" -eq 1 ] \
-  || fail "Pi watcher must keep exactly one generic bounded cleanup timer"
-assert_contains "$timer_lines" 'setTimeout(() => finish(false), milliseconds)' \
+  || fail "Pi watcher must keep exactly one bounded cleanup timer source"
+assert_contains "$timer_lines" 'setTimeout(check, Math.min(10, remaining))' \
   "Pi watcher contains a non-cleanup timer"
-assert_contains "$text" 'timer.unref()' "Pi watcher cleanup timer can keep Pi alive"
+timer_block=$(sed -n '/function stopsWithin/,/^}/p' "$EXT")
+assert_contains "$timer_block" 'const deadline = Date.now() + milliseconds' \
+  "Pi watcher cleanup timer lost its absolute bound"
+assert_contains "$timer_block" 'if (remaining <= 0)' \
+  "Pi watcher cleanup timer lost its deadline exit"
+assert_not_contains "$timer_block" 'publishStatus' "Pi watcher cleanup timer refreshes status"
+assert_not_contains "$timer_block" 'writeClientStatus' "Pi watcher cleanup timer writes client status"
+assert_not_contains "$timer_block" 'visibleStatus' "Pi watcher cleanup timer reads visible status"
 ```
 
-The timer allow-list permits only the one-shot timer inside `settlesWithin`; callers bind it to `STOP_GRACE_MS` or `STOP_KILL_GRACE_MS`.
+The timer allow-list permits only the deadline-bounded polling source inside `stopsWithin`; callers bind it to `STOP_GRACE_MS` or `STOP_KILL_GRACE_MS`.
 It does not permit a polling or status-refresh timer.
 
 - [ ] **Step 3: Record the exact 11-test mapping at the top of the existing test file**
@@ -958,7 +963,7 @@ git commit -m "test(pi): verify live watcher status sequence"
 Apply callback precedence in this exact order:
 
 1. Return if the record is already settled.
-2. Return after resolving completion if the record is not both `coordinator.current` and the current `generation`.
+2. Return if the record is not both `coordinator.current` and the current `generation`.
 3. Clear current ownership for the valid record.
 4. Return without wake or status if shutdown has begun or the record has an intentional-stop reason.
 5. Classify an actionable watcher line and call `sendMessage`.
@@ -978,7 +983,7 @@ No callback, promise finalizer, or cleanup deadline may publish after that point
 - [ ] Confirm cancelled pending startup and ordinary task-worktree absence are both covered.
 - [ ] Search for key drift with `rg -n 'firstmate[.-]pi[.-]watcher' .pi tests docs/superpowers/plans/2026-07-10-pi-watcher-status-implementation.md` and require every status-key occurrence to be `firstmate-pi-watcher`.
 - [ ] Search for the obsolete wake API with `rg -n 'sendUserMessage' .pi/extensions/fm-primary-pi-watch.ts tests/fm-pi-watch-extension.test.sh` and require no matches.
-- [ ] Search for forbidden status timers with `rg -n 'setInterval|setTimeout' .pi/extensions/fm-primary-pi-watch.ts`; allow only the existing one-shot bounded cleanup timers behind `settlesWithin`, `STOP_GRACE_MS`, and `STOP_KILL_GRACE_MS`.
+- [ ] Search for forbidden status timers with `rg -n 'setInterval|setTimeout' .pi/extensions/fm-primary-pi-watch.ts`; allow only the deadline-bounded cleanup polling source behind `stopsWithin`, `STOP_GRACE_MS`, and `STOP_KILL_GRACE_MS`.
 - [ ] Run the writing-plans placeholder scan and remove every unresolved marker or deferred instruction.
 - [ ] Confirm `ArmRecord` owns no Pi runtime closure, every active client owns one `WakeSender`, and settlement routes through only the newest active client.
 - [ ] Confirm `StatusUi.setStatus(key, text)` accepts `string | undefined` and every clear passes `undefined`.

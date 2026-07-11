@@ -12,7 +12,7 @@ When this session owns supervision and away mode is not active:
    Never run `bin/fm-watch-arm.sh` through Pi's bash tool because that foreground arm can wedge the agent and bypass extension-owned cleanup.
 7. The extension starts `bin/fm-watch-arm.sh --restart` as an owned detached process group and sends an actionable exit through Pi's custom `firstmate-watcher-wake` message with follow-up delivery and turn triggering.
    The wake is an extension-authored background event with structured details, never a user-role or captain-authored message.
-8. One process-wide coordinator per effective `FM_HOME` owns the attached arm generation.
+8. One process-wide coordinator per effective `FM_HOME` owns the current arm generation.
    Duplicate factories share that coordinator, stale generation callbacks cannot clear a replacement, output capture stays bounded, and every unexpected terminal outcome delivers exactly once.
    Intentional session shutdown suppresses false wakes, terminates the whole arm/watcher process group with bounded TERM-to-KILL escalation, and waits for cleanup before reload or quit completes.
    The Pi footer status key `firstmate-pi-watcher` reads `offline` before an arm, `watching` while the current arm owns supervision, `handling wake` after an actionable custom wake is accepted, and `attention` when ownership, startup, delivery, or an unexpected arm exit fails.

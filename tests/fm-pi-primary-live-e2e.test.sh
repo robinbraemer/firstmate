@@ -26,11 +26,17 @@ PI_VERSION=$(pi --version)
 PROVIDER=${FM_PI_LIVE_PROVIDER:-openai-codex}
 MODEL=${FM_PI_LIVE_MODEL:-gpt-5.6-sol}
 THINKING=${FM_PI_LIVE_THINKING:-minimal}
+ROLE=${FM_PI_LIVE_ROLE:-primary}
 
 fail() {
   printf 'not ok - %s\n' "$1" >&2
   exit 1
 }
+
+case "$ROLE" in
+  primary|secondmate) ;;
+  *) fail "FM_PI_LIVE_ROLE must be primary or secondmate" ;;
+esac
 
 shell_quote() {
   printf "'"
@@ -94,6 +100,23 @@ wait_for_text() {
     if capture | grep -Fq "$expected"; then
       return 0
     fi
+    sleep 0.5
+    i=$((i + 1))
+  done
+  capture >&2
+  return 1
+}
+
+text_count() {
+  local expected=$1
+  capture | grep -Fo "$expected" | wc -l | tr -d ' '
+}
+
+wait_for_text_count_after() {
+  local expected=$1 previous=$2 attempts=${3:-120} i=0 count
+  while [ "$i" -lt "$attempts" ]; do
+    count=$(text_count "$expected")
+    [ "$count" -gt "$previous" ] && return 0
     sleep 0.5
     i=$((i + 1))
   done
@@ -194,6 +217,7 @@ git clone -q "$ROOT" "$PROJECT"
 if ! git -C "$ROOT" diff --quiet HEAD -- .pi bin; then
   git -C "$ROOT" diff --binary HEAD -- .pi bin | git -C "$PROJECT" apply
 fi
+[ "$ROLE" != secondmate ] || : > "$PROJECT/.fm-secondmate-home"
 mkdir -p "$PROJECT/state" "$PROJECT/config" "$PI_DIR"
 cp "$AUTH_FILE" "$PI_DIR/auth.json"
 cat > "$PI_DIR/settings.json" <<JSON
@@ -301,10 +325,11 @@ send_prompt 'Use fm_watch_arm_pi exactly once to start supervision. Never use ba
 wait_for_text "watcher: started Pi extension arm child 1" 180 || fail "native Pi tool did not arm supervision"
 wait_for_text "ARMED" 120 || fail "Pi did not settle after initial native arm"
 wait_for_status watching || fail "owned arm did not show watching"
+wake_handled_before=$(text_count "WAKE-HANDLED")
 
 printf 'done: pi live e2e watcher fire\n' > "$PROJECT/state/pi-e2e.status"
 wait_for_status "handling wake" 240 || fail "delivered actionable wake did not show handling wake"
-wait_for_text "WAKE-HANDLED" 180 || fail "Pi did not settle after handling the watcher wake"
+wait_for_text_count_after "WAKE-HANDLED" "$wake_handled_before" 180 || fail "Pi did not settle after handling the watcher wake"
 
 send_prompt 'Use fm_watch_arm_pi exactly once to resume supervision after the handled wake. Do not use bash. Reply exactly REARMED.'
 wait_for_text "watcher: started Pi extension arm child 2" 180 || fail "separate native re-arm did not start a new coordinator generation"
@@ -361,6 +386,6 @@ fi
 orphan_pi=$(ps -axo pid=,comm=,command= | awk -v lab="$LAB" 'index($0, lab) && ($2 ~ /(^|\/)pi$/ || ($2 ~ /node/ && $0 ~ /pi-coding-agent/)) { print }')
 [ -z "$orphan_pi" ] || fail "an orphan Pi process still references the owned lab: $orphan_pi"
 
-printf 'evidence - candidate_hash=%s candidate_pid=%s lock_pid=%s arm_pgid=%s watcher_pid=%s old_pi_pid=%s all_clean=true\n' \
-  "$expected_version" "$candidate_pid" "$pi_pid" "$arm_pgid" "$watcher_pid" "$pre_restart_pid"
-printf 'ok - Pi %s watcher status moved offline -> watching -> handling wake -> watching, reloaded to offline, and cleared with clean process shutdown\n' "$PI_VERSION"
+printf 'evidence - role=%s candidate_hash=%s candidate_pid=%s lock_pid=%s arm_pgid=%s watcher_pid=%s old_pi_pid=%s all_clean=true\n' \
+  "$ROLE" "$expected_version" "$candidate_pid" "$pi_pid" "$arm_pgid" "$watcher_pid" "$pre_restart_pid"
+printf 'ok - Pi %s %s watcher status moved offline -> watching -> handling wake -> watching, reloaded to offline, and cleared with clean process shutdown\n' "$PI_VERSION" "$ROLE"
