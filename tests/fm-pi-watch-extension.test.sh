@@ -1204,6 +1204,12 @@ test_pi_live_lab_cleanup_is_owned() {
   assert_contains "$text" 'LAUNCH_HELPER=' "live Pi candidate launch does not route through the argv-preserving helper"
   assert_contains "$helper_text" 'exec env' "live Pi candidate launch retains an avoidable wrapper process"
   assert_contains "$text" 'registration-probe.ts' "live Pi test does not prove tool and command registration after detached restart"
+  assert_contains "$text" 'wait_for_text_count_after()' "live Pi test lacks an order-aware completion wait"
+  assert_contains "$text" 'wake_handled_before=$(text_count "WAKE-HANDLED")' "live Pi test does not establish the pre-wake completion count"
+  assert_contains "$text" 'wait_for_text_count_after "WAKE-HANDLED" "$wake_handled_before"' "live Pi test can accept WAKE-HANDLED from the earlier prompt"
+  assert_contains "$text" 'ROLE=${FM_PI_LIVE_ROLE:-primary}' "live Pi test cannot select a primary or secondmate home"
+  assert_contains "$text" ': > "$PROJECT/.fm-secondmate-home"' "live Pi test does not mark its isolated secondmate home"
+  assert_contains "$text" 'role=%s' "live Pi evidence does not identify the exercised home role"
   assert_present "$helper" "detached Pi launch helper is missing"
   pass "Pi live regression cleanup is confined to its fresh owned lab"
 }

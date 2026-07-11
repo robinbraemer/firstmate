@@ -10,9 +10,9 @@ Ordinary Pi crewmates keep their existing per-task turn-end marker extension gen
 ## Runtime ownership
 
 The existing bash watcher remains authoritative for polling, singleton ownership, durable wake queueing, and liveness beacons.
-The Pi extension starts `bin/fm-watch-arm.sh --restart` as an attached child and never implements watcher mechanics in TypeScript.
+The Pi extension starts `bin/fm-watch-arm.sh --restart` as an owned detached process group and never implements watcher mechanics in TypeScript.
 It uses one process-wide coordinator per resolved `FM_HOME` so same-path duplicate factories share one arm generation.
-Each arm generation retains its own child, captured output, completion promise, and intentional-stop reason.
+Each arm generation retains its own child, captured output, settlement state, and intentional-stop reason.
 Only the current generation can clear coordinator state or inject an actionable wake.
 
 The extension delegates every non-owned session-lock state to `bin/fm-lock.sh`, then re-checks ownership before spawning an arm.
