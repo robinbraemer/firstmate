@@ -363,6 +363,29 @@ test_lock_accepts_exact_legacy_identity() {
   pass "exact legacy identity remains compatible"
 }
 
+test_lock_live_tagged_identity_probe_failure_fails_closed() {
+  local dir state lockdir live out
+  dir=$(make_case lock-live-tagged-identity-unavailable)
+  state="$dir/state"
+  lockdir="$state/.contend.lock"
+  sleep 300 &
+  live=$!
+  mkdir "$lockdir"
+  printf '%s\n' "$live" > "$lockdir/pid"
+  printf '%s\n' 'proc:424242' > "$lockdir/pid-identity"
+  touch -t 202001010000 "$lockdir"
+  out=$(FM_STATE_OVERRIDE="$state" bash -c '
+    . "$1"
+    fm_pid_identity() { return 1; }
+    if fm_lock_live_owner_is_fresh "$2" "$3" 1; then rc=0; else rc=1; fi
+    printf "rc=%s\n" "$rc"
+  ' _ "$LIB" "$lockdir" "$live")
+  kill "$live" 2>/dev/null || true
+  wait "$live" 2>/dev/null || true
+  [ "$out" = "rc=0" ] || fail "unavailable tagged identity probe marked the live owner stale: $out"
+  pass "unavailable tagged identity probe preserves the live lock owner"
+}
+
 test_lock_reclaims_aged_reused_pid_steal_mutex() {
   local dir state lockdir dead reused out rc
   dir=$(make_case lock-aged-reused-steal)
@@ -964,6 +987,7 @@ test_lock_reclaims_aged_reused_pid_steal_mutex
 test_lock_aged_live_owner_keeps_ownership_after_resume
 test_lock_live_legacy_identity_mismatch_fails_closed
 test_lock_accepts_exact_legacy_identity
+test_lock_live_tagged_identity_probe_failure_fails_closed
 test_pid_identity_parses_linux_start_ticks
 test_pid_identity_prefers_linux_start_ticks
 test_pid_identity_is_locale_invariant

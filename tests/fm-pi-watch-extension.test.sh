@@ -892,6 +892,41 @@ EOF
   pass "A cancelled pending Pi watcher start clears before release and never rewrites or spawns"
 }
 
+test_pi_status_render_failure_does_not_skip_shutdown() {
+  local repo plugin out status
+  repo="$TMP_ROOT/pi-status-render-failure-root"
+  mkdir -p "$repo/bin" "$repo/config" "$repo/state"
+  install_pi_watch_extension_fixture "$repo"
+  plugin="$repo/.pi/extensions/fm-primary-pi-watch.ts"
+  out=$(PLUGIN="$plugin" FM_HOME="$repo" FM_ROOT_OVERRIDE="$repo" node --input-type=module 2>&1 <<'EOF'
+import assert from "node:assert/strict";
+import { pathToFileURL } from "node:url";
+
+const handlers = new Map();
+const pi = {
+  on(event, handler) { handlers.set(event, handler); },
+  registerCommand() {},
+  registerTool() {},
+  sendMessage() {},
+};
+const ctx = {
+  ui: {
+    setStatus() { throw new Error("status renderer unavailable"); },
+  },
+};
+const mod = await import(pathToFileURL(process.env.PLUGIN).href);
+mod.default(pi);
+await handlers.get("session_start")?.({ type: "session_start" }, ctx);
+await handlers.get("session_shutdown")?.({ type: "session_shutdown", reason: "quit" }, ctx);
+assert.equal(process.listenerCount("exit"), 0);
+EOF
+  )
+  status=$?
+  expect_code 0 "$status" "Pi status rendering failures must not interrupt shutdown cleanup"
+  [ -z "$out" ] || fail "Pi status render-failure test printed output: $out"
+  pass "Pi status rendering failures do not interrupt shutdown cleanup"
+}
+
 test_pi_status_absent_in_task_worktree() {
   local base worktree plugin out status
   base="$TMP_ROOT/pi-status-absent-base"
@@ -3121,6 +3156,7 @@ test_pi_status_reload_and_quit_clear
 test_pi_status_reload_overlap_preserves_replacement_ownership
 test_pi_status_stale_generation_cannot_overwrite
 test_pi_status_cancelled_start_stays_cleared
+test_pi_status_render_failure_does_not_skip_shutdown
 test_pi_status_absent_in_task_worktree
 test_pi_status_static_non_goals
 test_pi_extension_supervises_only_primary_or_secondmate_homes
