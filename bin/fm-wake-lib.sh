@@ -82,7 +82,8 @@ fm_pid_identity_matches() {
       current_identity=$(fm_pid_legacy_identity "$pid" 2>/dev/null || true)
       ;;
   esac
-  [ -n "$current_identity" ] && [ "$current_identity" = "$recorded_identity" ]
+  [ -n "$current_identity" ] || return 2
+  [ "$current_identity" = "$recorded_identity" ]
 }
 
 fm_path_mtime() {
@@ -287,11 +288,13 @@ fm_lock_mid_acquire_is_fresh() {
 }
 
 fm_lock_live_owner_is_fresh() {
-  local lockdir=$1 pid=$2 live_stale_after=${3:-} recorded_identity
+  local lockdir=$1 pid=$2 live_stale_after=${3:-} recorded_identity identity_rc
   fm_pid_alive "$pid" || return 1
   recorded_identity=$(cat "$lockdir/pid-identity" 2>/dev/null || true)
   if [ -n "$recorded_identity" ]; then
     fm_pid_identity_matches "$pid" "$recorded_identity" && return 0
+    identity_rc=$?
+    [ "$identity_rc" -eq 2 ] && return 0
     case "$recorded_identity" in
       proc:*|ps:*) return 1 ;;
       *) return 0 ;;

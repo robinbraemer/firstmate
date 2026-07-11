@@ -35,7 +35,7 @@ process_is_harness() {
   if printf '%s' "$comm_base" | grep -qE "$HARNESS_RE"; then
     return 0
   fi
-  if fm_process_is_pi "$comm" "$args"; then
+  if fm_process_is_pi "$pid" "$comm" "$args"; then
     return 0
   fi
   case "$comm_base" in

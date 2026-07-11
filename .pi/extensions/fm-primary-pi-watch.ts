@@ -117,6 +117,24 @@ function coordinatorForHome(): ArmCoordinator {
   return coordinator;
 }
 
+function writeClientStatus(client: StatusClient, status: WatcherStatus | undefined): void {
+  if (!client.active || !client.ui) return;
+  try {
+    client.ui.setStatus(
+      FIRSTMATE_PI_WATCHER_STATUS_KEY,
+      status === undefined ? undefined : WATCHER_STATUS_TEXT[status],
+    );
+  } catch {
+    return;
+  }
+}
+
+function publishStatus(coordinator: ArmCoordinator, status: WatcherStatus): void {
+  if (coordinator.shuttingDown) return;
+  coordinator.visibleStatus = status;
+  for (const client of coordinator.clients.values()) writeClientStatus(client, status);
+}
+
 function parentPid(pid: string): string {
   const result = spawnSync("ps", ["-o", "ppid=", "-p", pid], { encoding: "utf8" });
   if (result.status !== 0) return "";
