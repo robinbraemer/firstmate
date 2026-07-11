@@ -27,6 +27,26 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 fail() { printf 'not ok - %s\n' "$1" >&2; cleanup_all; exit 1; }
 pass() { printf 'ok - %s\n' "$1"; }
 
+marker_line_count() {
+  local marker=$1
+  if [ -f "$marker" ]; then
+    wc -l < "$marker" | tr -d '[:space:]'
+  else
+    printf '0\n'
+  fi
+}
+
+wait_for_marker_growth() {
+  local marker=$1 baseline=$2 attempts=0 count
+  while [ "$attempts" -lt 100 ]; do
+    count=$(marker_line_count "$marker")
+    [ "$count" -gt "$baseline" ] && return 0
+    sleep 0.1
+    attempts=$(( attempts + 1 ))
+  done
+  return 1
+}
+
 command -v herdr >/dev/null 2>&1 || { echo "skip: herdr not found"; exit 0; }
 command -v jq >/dev/null 2>&1 || { echo "skip: jq not found (required by the herdr adapter)"; exit 0; }
 
@@ -80,9 +100,9 @@ MARKER="$SCRATCH/heartbeat.log"
 fm_backend_herdr_cli "$SESSION" pane run "$LIVE_PANE_ID" \
   "sh -c 'while true; do date +%s >> $MARKER; sleep 1; done'" >/dev/null 2>&1 \
   || fail "could not start the live heartbeat process in the startup workspace's pane"
-sleep 2
-[ -s "$MARKER" ] || fail "the live heartbeat process did not start writing its marker file"
-BEFORE_COUNT=$(wc -l < "$MARKER" | tr -d '[:space:]')
+wait_for_marker_growth "$MARKER" 0 \
+  || fail "the live heartbeat process did not start writing its marker file"
+BEFORE_COUNT=$(marker_line_count "$MARKER")
 pass "repro setup: a live long-running process is running in the startup workspace's single tab (label '1'), heartbeating to a marker file"
 
 # --- 2. run the real spawn-time path: container_ensure adopts the startup --
@@ -109,9 +129,7 @@ fi
 if ! herdr pane get "$LIVE_PANE_ID" --session "$SESSION" >/dev/null 2>&1; then
   fail "REGRESSION (2026-07-02 self-kill): the live startup-workspace pane was CLOSED by create_task"
 fi
-sleep 2
-AFTER_COUNT=$(wc -l < "$MARKER" | tr -d '[:space:]')
-[ "$AFTER_COUNT" -gt "$BEFORE_COUNT" ] \
+wait_for_marker_growth "$MARKER" "$BEFORE_COUNT" \
   || fail "REGRESSION: the live heartbeat process stopped writing after create_task ran - it was killed even though its pane object survived"
 pass "fixed: the live pane (and its live process) survived create_task untouched - the exact 2026-07-02 self-kill incident does not reproduce"
 
