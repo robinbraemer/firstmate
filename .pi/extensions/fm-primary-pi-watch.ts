@@ -45,6 +45,7 @@ type PendingWake = {
 
 type ArmRecord = {
   child: ChildProcess;
+  cadence: string;
   generation: number;
   intentionalStopReason: string;
   settled: boolean;
@@ -236,6 +237,14 @@ function markLoaded(): void {
   writeFileSync(marker, `${extensionVersion}\n${process.pid}\n`);
 }
 
+function awayModeActive(): boolean {
+  return existsSync(`${state}/.afk`);
+}
+
+function cadenceFingerprint(): string {
+  return existsSync(`${config}/x-mode.env`) ? "x-mode" : "default";
+}
+
 function actionableLine(line: string): string {
   return /^(signal:|stale:|check:|heartbeat($|:))/.test(line) ? line : "";
 }
@@ -319,10 +328,14 @@ function settleArm(
     stderrTruncated: record.stderrTruncated,
   };
   if (record.intentionalStopReason && kind === "actionable") {
-    coordinator.pendingWake = { message, details };
+    if (record.intentionalStopReason !== "away-mode") coordinator.pendingWake = { message, details };
     return;
   }
   if (!ownsGeneration || coordinator.shuttingDown || record.intentionalStopReason) return;
+  if (awayModeActive()) {
+    publishStatus(coordinator, "offline");
+    return;
+  }
   if (kind === "failure") publishStatus(coordinator, "attention");
   const activeClient = [...coordinator.clients.values()].reverse().find((candidate) => candidate.active);
   if (!activeClient) return;
@@ -489,6 +502,13 @@ export default function (pi: ExtensionAPI) {
   }
 
   async function startArmOnce(): Promise<ArmResult> {
+    if (awayModeActive()) {
+      const record = coordinator.current;
+      if (record) await stopArmRecord(coordinator, record, "away-mode");
+      coordinator.pendingWake = null;
+      publishStatus(coordinator, "offline");
+      return { ok: true, message: "watcher: paused - away mode owns supervision" };
+    }
     if (lockOwnership() !== "owned") await claimSessionLock();
     if (coordinator.startCancelled || coordinator.shuttingDown || coordinator.clients.size === 0) {
       return { ok: false, message: "watcher: not started - Pi extension session shut down" };
@@ -498,7 +518,20 @@ export default function (pi: ExtensionAPI) {
       return { ok: false, message: "watcher: read-only - session lock is held by another firstmate session" };
     }
     markLoaded();
-    if (coordinator.current) return { ok: true, message: "watcher: healthy - Pi extension already has an arm child" };
+    const cadence = cadenceFingerprint();
+    if (coordinator.current?.cadence === cadence) {
+      return { ok: true, message: "watcher: healthy - Pi extension already has an arm child" };
+    }
+    if (coordinator.current) await stopArmRecord(coordinator, coordinator.current, "cadence-change");
+    const pendingWake = coordinator.pendingWake;
+    if (pendingWake) {
+      const activeClient = [...coordinator.clients.values()].reverse().find((candidate) => candidate.active);
+      if (activeClient) {
+        await activeClient.sendWake(pendingWake.message, pendingWake.details);
+        if (coordinator.pendingWake === pendingWake) coordinator.pendingWake = null;
+        publishStatus(coordinator, "handling wake");
+      }
+    }
 
     const id = ++coordinator.sequence;
     const generation = ++coordinator.generation;
@@ -517,6 +550,7 @@ export default function (pi: ExtensionAPI) {
     });
     const record: ArmRecord = {
       child,
+      cadence,
       generation,
       intentionalStopReason: "",
       settled: false,
@@ -586,13 +620,18 @@ export default function (pi: ExtensionAPI) {
     markLoaded();
     const pendingWake = coordinator.pendingWake;
     if (pendingWake) {
-      try {
-        await client.sendWake(pendingWake.message, pendingWake.details);
-        if (coordinator.pendingWake === pendingWake) coordinator.pendingWake = null;
-        publishStatus(coordinator, "handling wake");
-      } catch {
-        publishStatus(coordinator, "attention");
-        return;
+      if (awayModeActive()) {
+        coordinator.pendingWake = null;
+        publishStatus(coordinator, "offline");
+      } else {
+        try {
+          await client.sendWake(pendingWake.message, pendingWake.details);
+          if (coordinator.pendingWake === pendingWake) coordinator.pendingWake = null;
+          publishStatus(coordinator, "handling wake");
+        } catch {
+          publishStatus(coordinator, "attention");
+          return;
+        }
       }
     }
     await startArm();
@@ -660,6 +699,10 @@ export default function (pi: ExtensionAPI) {
     const result = await runPretoolCheck(command);
     if (result.code !== 2) return {};
     return { block: true, reason: result.stderr.trim() || "denied by the watcher-arm PreToolUse seatbelt" };
+  });
+
+  pi.on("tool_execution_end", async () => {
+    await startArm();
   });
 
   pi.registerCommand?.("fm-watch-arm-pi", {
