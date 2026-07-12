@@ -15,6 +15,9 @@ LOCK="$STATE/.lock"
 CLAIM="$STATE/.lock.claim"
 mkdir -p "$STATE"
 
+# shellcheck source=bin/fm-wake-lib.sh
+. "$SCRIPT_DIR/fm-wake-lib.sh"
+
 # Known harness command names; extend when a new adapter is verified.
 HARNESS_NAME_RE='^(claude|codex|opencode|grok|pi)$'
 HARNESS_ARG_RE='(^|[/ ])(claude|codex|opencode|grok|pi)([-/ ]|$)'
@@ -51,32 +54,11 @@ holder_alive() {  # true if $1 is a live process that looks like a harness
 }
 
 release_claim() {
-  rm -f "$CLAIM/pid"
-  rmdir "$CLAIM" 2>/dev/null || true
+  fm_lock_release "$CLAIM"
 }
 
 acquire_claim() {
-  local owner attempts=0
-  while ! mkdir "$CLAIM" 2>/dev/null; do
-    owner=$(cat "$CLAIM/pid" 2>/dev/null || true)
-    case "$owner" in
-      ''|*[!0-9]*)
-        attempts=$((attempts + 1))
-        [ "$attempts" -lt 5 ] || return 1
-        sleep 0.01
-        continue
-        ;;
-    esac
-    if kill -0 "$owner" 2>/dev/null; then
-      attempts=$((attempts + 1))
-      [ "$attempts" -lt 200 ] || return 1
-      sleep 0.01
-      continue
-    fi
-    rm -f "$CLAIM/pid"
-    rmdir "$CLAIM" 2>/dev/null || return 1
-  done
-  printf '%s\n' "$$" > "$CLAIM/pid"
+  fm_lock_try_acquire "$CLAIM" || return 1
   trap release_claim EXIT
 }
 

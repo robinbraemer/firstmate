@@ -49,9 +49,9 @@ Use that value for interrupt, exit, resume, and skill-invocation facts.
 
 ## Primary turn-end guard
 
-Every verified primary harness has a hook path for the "no turn ends blind" guard.
+Claude, Codex, OpenCode, and Grok have hook paths for the "no turn ends blind" guard.
 `claude` and `codex` block directly through Stop hooks that preserve exit status 2 and stderr from `bin/fm-turnend-guard.sh`.
-`opencode`, `pi`, and `grok` expose passive lifecycle callbacks for this purpose, so their tracked primary adapters force one bounded follow-up or resume when the shared predicate blocks.
+`opencode` and `grok` expose passive lifecycle callbacks for this purpose, so their tracked primary adapters force one bounded follow-up or resume when the shared predicate blocks.
 The exact hook files, commands, validation transcripts, scoping rules, and fail-open tradeoffs are owned by `docs/turnend-guard.md`.
 When changing any primary turn-end hook, validate the real harness behavior in a scratch project or throwaway home before trusting it, then update that doc and the relevant concise fact below.
 
@@ -202,8 +202,8 @@ The extension must listen for pi's `turn_end` event, not `agent_end`, so the wat
 Pi sets `PI_CODING_AGENT=true` for its children; this is its harness-detection env marker.
 
 **Primary-session watcher fact (verified 2026-07-10, Pi 0.80.6).**
-The firstmate PRIMARY's own `.pi/extensions/fm-primary-pi-watch.ts` owns actionable watcher wake delivery, re-arm, shutdown, and the PreToolUse watcher-arm seatbelt.
-The model arms through `fm_watch_arm_pi`, never a foreground bash arm; the watcher tool result and clean-exit fallback are owned by `docs/supervision-protocols/pi.md`.
+The firstmate PRIMARY's own `.pi/extensions/fm-primary-pi-watch.ts` automatically owns startup arm, actionable watcher wake delivery, re-arm, shutdown, and the PreToolUse watcher-arm seatbelt without a turn-end hook or user-role injection.
+The model uses `fm_watch_arm_pi` only for manual recovery, never a foreground bash arm; the watcher tool result and clean-exit fallback are owned by `docs/supervision-protocols/pi.md`.
 `bin/fm-session-start.sh` reports when the live Pi session has not loaded the watcher extension, and points at an outside-the-composer restart with one-run `--approve -e <canonical-watcher-path>` so the extension loads without a saved trust decision.
 When a secondmate is launched on Pi, `fm-spawn.sh --secondmate` launches Pi with one-run `--approve` and `-e .pi/extensions/fm-primary-pi-watch.ts`, already present in the secondmate home's git worktree.
 

@@ -35,6 +35,7 @@ type StatusClient = WakeSender & {
   ui: StatusUi | null;
   active: boolean;
   sendWake: WakeSender;
+  rearm: () => Promise<ArmResult>;
 };
 
 type PendingWake = {
@@ -325,7 +326,7 @@ function settleArm(
   if (kind === "failure") publishStatus(coordinator, "attention");
   const activeClient = [...coordinator.clients.values()].reverse().find((candidate) => candidate.active);
   if (!activeClient) return;
-  void activeClient.sendWake(message, details).then(() => {
+  void activeClient.sendWake(message, details).then(async () => {
     if (
       kind === "actionable" &&
       coordinator.generation === record.generation &&
@@ -334,6 +335,7 @@ function settleArm(
       coordinator.clients.get(activeClient.token) === activeClient
     ) {
       publishStatus(coordinator, "handling wake");
+      await activeClient.rearm();
     }
   }).catch(() => {
     if (
@@ -445,25 +447,9 @@ function runCdCheck(command: string): Promise<{ code: number; stderr: string }> 
   return runChecker("fm-cd-pretool-check.sh", command);
 }
 
-function runTurnendGuard(): Promise<{ code: number; stderr: string }> {
-  return new Promise((resolveResult) => {
-    const child = spawn(`${fmRoot}/bin/fm-turnend-guard.sh`, {
-      stdio: ["pipe", "ignore", "pipe"],
-    });
-    let stderr = "";
-    child.stderr.on("data", (chunk) => {
-      stderr += chunk.toString();
-    });
-    child.on("error", () => resolveResult({ code: 0, stderr: "" }));
-    child.on("close", (code) => resolveResult({ code: code ?? 0, stderr }));
-    child.stdin.end('{"stop_hook_active":false}');
-  });
-}
-
 export default function (pi: ExtensionAPI) {
   if (!supervisingHome()) return;
   const coordinator = coordinatorForHome();
-  let guardFollowupActive = false;
 
   async function sendWake(message: string, details: WakeDetails): Promise<void> {
     pi.sendMessage(
@@ -482,17 +468,9 @@ export default function (pi: ExtensionAPI) {
     ui: null as StatusUi | null,
     active: true,
     sendWake,
+    rearm: startArm,
   });
   coordinator.clients.set(client.token, client);
-  const pendingWake = coordinator.pendingWake;
-  if (pendingWake) {
-    coordinator.pendingWake = null;
-    void client.sendWake(pendingWake.message, pendingWake.details).catch(() => {
-      if (client.active && coordinator.clients.get(client.token) === client) {
-        publishStatus(coordinator, "attention");
-      }
-    });
-  }
 
   const cleanupOnProcessExit = () => {
     for (const activeClient of coordinator.clients.values()) {
@@ -602,10 +580,22 @@ export default function (pi: ExtensionAPI) {
     return startPromise;
   }
 
-  pi.on?.("session_start", (_event, ctx) => {
+  pi.on?.("session_start", async (_event, ctx) => {
     client.ui = ctx.ui;
     writeClientStatus(client, coordinator.visibleStatus);
     markLoaded();
+    const pendingWake = coordinator.pendingWake;
+    if (pendingWake) {
+      try {
+        await client.sendWake(pendingWake.message, pendingWake.details);
+        if (coordinator.pendingWake === pendingWake) coordinator.pendingWake = null;
+        publishStatus(coordinator, "handling wake");
+      } catch {
+        publishStatus(coordinator, "attention");
+        return;
+      }
+    }
+    await startArm();
   });
 
   async function shutdownClient(reason: string): Promise<void> {
@@ -670,24 +660,6 @@ export default function (pi: ExtensionAPI) {
     const result = await runPretoolCheck(command);
     if (result.code !== 2) return {};
     return { block: true, reason: result.stderr.trim() || "denied by the watcher-arm PreToolUse seatbelt" };
-  });
-
-  pi.on("agent_settled", async () => {
-    if (guardFollowupActive) {
-      guardFollowupActive = false;
-      return;
-    }
-    const result = await runTurnendGuard();
-    if (result.code !== 2) return;
-    guardFollowupActive = true;
-    try {
-      await pi.sendUserMessage(
-        `TURN WOULD END BLIND - supervision is off. Resume supervision according to the session-start operating block before ending the turn.\n\n${result.stderr}`,
-        { deliverAs: "followUp" },
-      );
-    } catch {
-      guardFollowupActive = false;
-    }
   });
 
   pi.registerCommand?.("fm-watch-arm-pi", {

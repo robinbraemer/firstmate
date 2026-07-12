@@ -294,9 +294,38 @@ JS
   pass "fm-lock refuses an uninitialized live claim"
 }
 
+test_fm_lock_recovers_stale_uninitialized_claims() {
+  local home fakebin out kind
+  home="$TMP_ROOT/pi-lock-stale-uninitialized"
+  fakebin=$(fm_fakebin "$TMP_ROOT/pi-lock-stale-uninitialized-fake")
+  mkdir -p "$home/state" "$fakebin"
+  cat > "$fakebin/ps" <<'SH'
+#!/usr/bin/env bash
+case "$*" in
+  *"comm="*) printf '%s\n' '/usr/local/bin/pi'; exit 0 ;;
+  *"args="*) printf '%s\n' 'pi --approve'; exit 0 ;;
+  *"ppid="*) printf '%s\n' '1'; exit 0 ;;
+esac
+exit 1
+SH
+  chmod +x "$fakebin/ps"
+  for kind in ownerless malformed; do
+    rm -rf "$home/state/.lock.claim" "$home/state/.lock.claim".owner.*
+    mkdir "$home/state/.lock.claim"
+    [ "$kind" = ownerless ] || printf 'not-a-pid\n' > "$home/state/.lock.claim/pid"
+    touch -t 200001010000 "$home/state/.lock.claim"
+    out=$(FM_HOME="$home" PATH="$fakebin:$PATH" "$ROOT/bin/fm-lock.sh" 2>&1) \
+      || fail "fm-lock did not recover a stale $kind claim: $out"
+    assert_contains "$out" "lock acquired" "fm-lock did not acquire after stale $kind recovery"
+    assert_present "$home/state/.lock" "stale $kind recovery did not write the session lock"
+  done
+  pass "fm-lock recovers stale ownerless and malformed claims"
+}
+
 test_grok_hook_requires_registered_token
 test_grok_teardown_removes_pointer_and_token
 test_fm_lock_recognizes_grok_holder
 test_fm_lock_recognizes_pi_holder
 test_fm_lock_serializes_claims
 test_fm_lock_refuses_uninitialized_live_claim
+test_fm_lock_recovers_stale_uninitialized_claims
