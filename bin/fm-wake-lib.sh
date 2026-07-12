@@ -1,5 +1,8 @@
 #!/usr/bin/env bash
 # Shared durable wake queue and portable lock helpers.
+# Lock identity pairs Linux /proc start ticks with the kernel boot ID, falls back
+# to locale-stable ps output elsewhere, and reads earlier tagged or untagged
+# formats fail-closed when a live owner's identity cannot be disproved.
 
 FM_WAKE_LIB_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 FM_WAKE_DEFAULT_ROOT="$(cd "$FM_WAKE_LIB_DIR/.." && pwd)"
@@ -23,25 +26,117 @@ fm_pid_alive() {
   kill -0 "$pid" 2>/dev/null
 }
 
-fm_pid_identity() {
+# Parse Linux /proc/<pid>/stat field 22 (process start ticks since boot).
+# Removing through the final ") " keeps spaces and parentheses in comm safe.
+fm_pid_start_ticks_from_proc_stat() {
+  local stat=$1 out
+  out=$(printf '%s\n' "$stat" | sed 's/^.*) //' | awk '$20 ~ /^[0-9]+$/ { print $20; exit }')
+  [ -n "$out" ] || return 1
+  printf '%s\n' "$out"
+}
+
+fm_pid_start_ticks_from_proc() {
+  local pid=$1 stat
+  case "$pid" in
+    ''|*[!0-9]*) return 1 ;;
+  esac
+  [ -r "/proc/$pid/stat" ] || return 1
+  stat=
+  IFS= read -r stat < "/proc/$pid/stat" || return 1
+  fm_pid_start_ticks_from_proc_stat "$stat"
+}
+
+fm_linux_boot_id() {
+  local boot_id=
+  [ -r /proc/sys/kernel/random/boot_id ] || return 1
+  IFS= read -r boot_id < /proc/sys/kernel/random/boot_id || return 1
+  case "$boot_id" in
+    ''|*[!0-9A-Fa-f-]*) return 1 ;;
+  esac
+  printf '%s\n' "$boot_id"
+}
+
+fm_pid_identity_from_proc() {
+  local pid=$1 start_ticks boot_id
+  start_ticks=$(fm_pid_start_ticks_from_proc "$pid") || return 1
+  boot_id=$(fm_linux_boot_id) || return 1
+  printf 'proc:%s:%s\n' "$boot_id" "$start_ticks"
+}
+
+# Return the pre-tag process identity format used on platforms without /proc.
+fm_pid_legacy_identity() {
   local pid=$1 out
   case "$pid" in
     ''|*[!0-9]*) return 1 ;;
   esac
-  # Pin LC_ALL=C so lstart's date format is locale-invariant: the identity is
-  # written under one locale but re-read under the machine's ambient locale, which
-  # would otherwise mismatch on a non-C locale (e.g. ko_KR) and reject a live watcher.
   out=$(LC_ALL=C ps -p "$pid" -o lstart= -o command= 2>/dev/null) || return 1
   [ -n "$out" ] || return 1
   printf '%s\n' "$out" | sed 's/^[[:space:]]*//'
 }
 
-fm_path_mtime() {
-  if [ "$(uname)" = Darwin ]; then
-    stat -f %m "$1" 2>/dev/null
-  else
-    stat -c %Y "$1" 2>/dev/null
+# Return a tagged process identity: stable monotonic start ticks on Linux/WSL2,
+# or locale-pinned wall-clock start plus command on other platforms.
+fm_pid_identity() {
+  local pid=$1 identity
+  case "$pid" in
+    ''|*[!0-9]*) return 1 ;;
+  esac
+  identity=$(fm_pid_identity_from_proc "$pid" 2>/dev/null || true)
+  if [ -n "$identity" ]; then
+    printf '%s\n' "$identity"
+    return 0
   fi
+  identity=$(fm_pid_legacy_identity "$pid") || return 1
+  printf 'ps:%s\n' "$identity"
+}
+
+# Return 0 for a match, 1 for an authoritative tagged mismatch, and 2 when a
+# legacy mismatch or unavailable probe cannot safely disprove live ownership.
+fm_pid_identity_matches() {
+  local pid=$1 recorded_identity=$2 current_identity current_ticks recorded_ticks tagged=
+  [ -n "$recorded_identity" ] || return 2
+  case "$recorded_identity" in
+    proc:*:*)
+      tagged=1
+      current_identity=$(fm_pid_identity_from_proc "$pid" 2>/dev/null || true)
+      ;;
+    proc:*)
+      recorded_ticks=${recorded_identity#proc:}
+      case "$recorded_ticks" in
+        ''|*[!0-9]*) return 2 ;;
+      esac
+      current_ticks=$(fm_pid_start_ticks_from_proc "$pid" 2>/dev/null || true)
+      [ -n "$current_ticks" ] || return 2
+      [ "$current_ticks" = "$recorded_ticks" ] && return 2
+      return 1
+      ;;
+    ps:*)
+      tagged=1
+      current_identity=$(fm_pid_legacy_identity "$pid" 2>/dev/null || true)
+      [ -n "$current_identity" ] && current_identity="ps:$current_identity"
+      ;;
+    *)
+      current_identity=$(fm_pid_legacy_identity "$pid" 2>/dev/null || true)
+      ;;
+  esac
+  [ -n "$current_identity" ] || return 2
+  [ "$current_identity" = "$recorded_identity" ] && return 0
+  [ -n "$tagged" ] && return 1
+  return 2
+}
+
+fm_path_mtime() {
+  local mtime
+  mtime=$(stat -c %Y "$1" 2>/dev/null || true)
+  case "$mtime" in
+    ''|*[!0-9]*) ;;
+    *) printf '%s\n' "$mtime"; return 0 ;;
+  esac
+  mtime=$(stat -f %m "$1" 2>/dev/null || true)
+  case "$mtime" in
+    ''|*[!0-9]*) return 1 ;;
+    *) printf '%s\n' "$mtime" ;;
+  esac
 }
 
 fm_path_age() {
@@ -51,7 +146,7 @@ fm_path_age() {
 }
 
 fm_watcher_lock_matches_pid() {
-  local state=$1 watch_path=$2 pid=$3 home=${4:-$FM_HOME} lockdir lock_home lock_path lock_identity current_identity
+  local state=$1 watch_path=$2 pid=$3 home=${4:-$FM_HOME} lockdir lock_home lock_path lock_identity
   lockdir="$state/.watch.lock"
   lock_home=$(cat "$lockdir/fm-home" 2>/dev/null || true)
   lock_path=$(cat "$lockdir/watcher-path" 2>/dev/null || true)
@@ -59,8 +154,7 @@ fm_watcher_lock_matches_pid() {
   [ "$lock_home" = "$home" ] || return 1
   [ "$lock_path" = "$watch_path" ] || return 1
   [ -n "$lock_identity" ] || return 1
-  current_identity=$(fm_pid_identity "$pid") || return 1
-  [ "$current_identity" = "$lock_identity" ]
+  fm_pid_identity_matches "$pid" "$lock_identity"
 }
 
 FM_WATCHER_HEALTHY_PID=
@@ -104,11 +198,17 @@ fm_lock_owner_dir() {
 }
 
 fm_lock_prepare_owner() {
-  local ownerdir=$1 mypid back
+  local ownerdir=$1 require_identity=${2:-} mypid identity back
   mypid=${BASHPID:-$$}
   printf '%s\n' "$mypid" > "$ownerdir/pid" 2>/dev/null || return 1
   back=$(cat "$ownerdir/pid" 2>/dev/null || true)
-  [ "$back" = "$mypid" ]
+  [ "$back" = "$mypid" ] || return 1
+  identity=$(fm_pid_identity "$mypid" 2>/dev/null || true)
+  if [ -n "$identity" ]; then
+    printf '%s\n' "$identity" > "$ownerdir/pid-identity" 2>/dev/null || return 1
+  elif [ -n "$require_identity" ]; then
+    return 2
+  fi
 }
 
 fm_lock_link_owner() {
@@ -179,16 +279,18 @@ fm_lock_claim() {
 }
 
 fm_lock_try_create() {
-  local lockdir=$1 allowed_steal_owner=${2:-} ownerdir
+  local lockdir=$1 allowed_steal_owner=${2:-} require_identity=${3:-} ownerdir rc
   FM_LOCK_OWNER_DIR=
   ownerdir=$(fm_lock_owner_dir "$lockdir") || return 1
   if [ -e "$lockdir" ] || [ -L "$lockdir" ]; then
     fm_lock_discard_owner "$ownerdir"
     return 1
   fi
-  if ! fm_lock_prepare_owner "$ownerdir"; then
+  fm_lock_prepare_owner "$ownerdir" "$require_identity"
+  rc=$?
+  if [ "$rc" -ne 0 ]; then
     fm_lock_discard_owner "$ownerdir"
-    return 1
+    return "$rc"
   fi
   if ln -s "$ownerdir" "$lockdir" 2>/dev/null && fm_lock_points_to_owner "$lockdir" "$ownerdir"; then
     if fm_lock_claim "$lockdir" "$ownerdir" "$allowed_steal_owner"; then
@@ -230,8 +332,41 @@ fm_lock_mid_acquire_is_fresh() {
   return 1
 }
 
+fm_lock_live_owner_is_fresh() {
+  local lockdir=$1 pid=$2 live_stale_after=${3:-} recorded_identity identity_rc
+  fm_pid_alive "$pid" || return 1
+  recorded_identity=$(cat "$lockdir/pid-identity" 2>/dev/null || true)
+  if [ -n "$recorded_identity" ]; then
+    fm_pid_identity_matches "$pid" "$recorded_identity" && return 0
+    identity_rc=$?
+    [ "$identity_rc" -eq 2 ] && return 0
+    return 1
+  fi
+  [ -n "$live_stale_after" ] || return 0
+  [ "$(fm_path_age "$lockdir")" -lt "$live_stale_after" ]
+}
+
+fm_lock_owned_by_current_process() {
+  local lockdir=$1 expected_owner=${2:-} ownerdir pid recorded_identity current
+  current=${BASHPID:-$$}
+  if [ -L "$lockdir" ]; then
+    ownerdir=$(fm_lock_link_owner "$lockdir" 2>/dev/null || true)
+    [ -n "$ownerdir" ] || return 1
+    [ -z "$expected_owner" ] || [ "$ownerdir" = "$expected_owner" ] || return 1
+    fm_lock_points_to_owner "$lockdir" "$ownerdir" || return 1
+  else
+    [ -z "$expected_owner" ] || return 1
+    ownerdir=$lockdir
+  fi
+  pid=$(cat "$ownerdir/pid" 2>/dev/null || true)
+  [ "$pid" = "$current" ] || return 1
+  recorded_identity=$(cat "$ownerdir/pid-identity" 2>/dev/null || true)
+  [ -n "$recorded_identity" ] || return 1
+  fm_pid_identity_matches "$current" "$recorded_identity"
+}
+
 fm_lock_recheck_stale_owner() {
-  local lockdir=$1 expected_owner=$2 expected_pid=$3 actual_pid
+  local lockdir=$1 expected_owner=$2 expected_pid=$3 live_stale_after=${4:-} actual_pid
   if [ -n "$expected_owner" ]; then
     fm_lock_points_to_owner "$lockdir" "$expected_owner" || return 1
   elif [ -e "$lockdir" ] || [ -L "$lockdir" ]; then
@@ -239,7 +374,7 @@ fm_lock_recheck_stale_owner() {
   fi
   actual_pid=$(cat "$lockdir/pid" 2>/dev/null || true)
   [ "$actual_pid" = "$expected_pid" ] || return 1
-  if fm_pid_alive "$actual_pid"; then
+  if fm_lock_live_owner_is_fresh "$lockdir" "$actual_pid" "$live_stale_after"; then
     return 1
   fi
   if fm_lock_mid_acquire_is_fresh "$lockdir" "$actual_pid"; then
@@ -249,16 +384,17 @@ fm_lock_recheck_stale_owner() {
 }
 
 fm_lock_try_acquire() {
-  local lockdir=$1 pid steal cur rc steal_owner primary_owner
+  local lockdir=$1 live_stale_after=${2:-} pid steal cur rc steal_owner primary_owner
   FM_LOCK_HELD_PID=
   FM_LOCK_OWNER_DIR=
 
-  if fm_lock_try_create "$lockdir"; then
-    return 0
-  fi
+  fm_lock_try_create "$lockdir" "" "$live_stale_after"
+  rc=$?
+  [ "$rc" -eq 0 ] && return 0
+  [ "$rc" -eq 2 ] && return 1
 
   pid=$(cat "$lockdir/pid" 2>/dev/null || true)
-  if fm_pid_alive "$pid"; then
+  if fm_lock_live_owner_is_fresh "$lockdir" "$pid" "$live_stale_after"; then
     FM_LOCK_HELD_PID=$pid
     return 1
   fi
@@ -268,7 +404,7 @@ fm_lock_try_acquire() {
   fi
 
   steal="$lockdir.steal"
-  if ! fm_lock_try_acquire "$steal"; then
+  if ! fm_lock_try_acquire "$steal" "$live_stale_after"; then
     FM_LOCK_HELD_PID=$(cat "$lockdir/pid" 2>/dev/null || true)
     FM_LOCK_OWNER_DIR=
     return 1
@@ -276,7 +412,7 @@ fm_lock_try_acquire() {
   steal_owner=${FM_LOCK_OWNER_DIR:-}
 
   cur=$(cat "$lockdir/pid" 2>/dev/null || true)
-  if fm_pid_alive "$cur"; then
+  if fm_lock_live_owner_is_fresh "$lockdir" "$cur" "$live_stale_after"; then
     fm_lock_release "$steal"
     FM_LOCK_HELD_PID=$cur
     FM_LOCK_OWNER_DIR=
@@ -300,7 +436,7 @@ fm_lock_try_acquire() {
     primary_owner=$(fm_lock_link_owner "$lockdir" 2>/dev/null || true)
   fi
   cur=$(cat "$lockdir/pid" 2>/dev/null || true)
-  if ! fm_lock_recheck_stale_owner "$lockdir" "$primary_owner" "$cur"; then
+  if ! fm_lock_recheck_stale_owner "$lockdir" "$primary_owner" "$cur" "$live_stale_after"; then
     fm_lock_release "$steal"
     FM_LOCK_HELD_PID=$(cat "$lockdir/pid" 2>/dev/null || true)
     FM_LOCK_OWNER_DIR=
@@ -309,7 +445,7 @@ fm_lock_try_acquire() {
 
   fm_lock_remove_path "$lockdir" || true
   rc=1
-  if fm_lock_try_create "$lockdir" "$steal_owner"; then
+  if fm_lock_try_create "$lockdir" "$steal_owner" "$live_stale_after"; then
     rc=0
   fi
   if [ "$rc" -ne 0 ]; then
