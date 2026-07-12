@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Opt-in interactive Pi primary regression on a private tmux socket and isolated homes.
+# Opt-in clean-stock Pi watcher lifecycle regression on an isolated tmux socket.
 set -u
 
 if [ "${FM_PI_LIVE_E2E:-0}" != 1 ]; then
@@ -8,33 +8,39 @@ if [ "${FM_PI_LIVE_E2E:-0}" != 1 ]; then
 fi
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-command -v pi >/dev/null 2>&1 || { echo "skip: pi not found"; exit 0; }
-command -v tmux >/dev/null 2>&1 || { echo "skip: tmux not found"; exit 0; }
+command -v pi >/dev/null 2>&1 || { echo "not ok - pi is required" >&2; exit 1; }
+command -v tmux >/dev/null 2>&1 || { echo "not ok - tmux is required" >&2; exit 1; }
+AUTH_FILE=${FM_PI_LIVE_AUTH_FILE:-}
+[ -n "$AUTH_FILE" ] && [ -f "$AUTH_FILE" ] || { echo "not ok - set FM_PI_LIVE_AUTH_FILE" >&2; exit 1; }
 
 TMUX=$(command -v tmux)
+PI_BIN=$(command -v pi)
 SOCKET="fm-pi-live-e2e-$$"
 SESSION=pi-live-e2e
-LAB="$ROOT/.pi-live-e2e.$$"
+LAB=$(mktemp -d "$ROOT/.pi-live-e2e.XXXXXX")
 PROJECT="$LAB/project"
-HOME_DIR="$LAB/fmhome"
 PI_DIR="$LAB/pi-agent"
-PI_VERSION=$(pi --version)
+ROLE=${FM_PI_LIVE_ROLE:-primary}
+MODEL=${FM_PI_LIVE_MODEL:-gpt-5.6-sol}
+PROVIDER=${FM_PI_LIVE_PROVIDER:-openai-codex}
+THINKING=${FM_PI_LIVE_THINKING:-minimal}
 
-fail() {
-  printf 'not ok - %s\n' "$1" >&2
-  exit 1
+fail() { printf 'not ok - %s\n' "$1" >&2; exit 1; }
+case "$ROLE" in primary|secondmate) ;; *) fail "FM_PI_LIVE_ROLE must be primary or secondmate" ;; esac
+
+shell_quote() {
+  printf "'"
+  printf '%s' "$1" | sed "s/'/'\\\\''/g"
+  printf "'"
 }
 
-capture() {
-  "$TMUX" -L "$SOCKET" capture-pane -p -t "$SESSION" -S -600 2>/dev/null || true
-}
+capture() { "$TMUX" -L "$SOCKET" capture-pane -p -t "$SESSION" -S -1000 2>/dev/null || true; }
+current_lines() { "$TMUX" -L "$SOCKET" capture-pane -p -t "$SESSION" 2>/dev/null | sed 's/^[[:space:]]*//; s/[[:space:]]*$//' || true; }
 
 wait_for_text() {
   local expected=$1 attempts=${2:-120} i=0
   while [ "$i" -lt "$attempts" ]; do
-    if capture | grep -Fq "$expected"; then
-      return 0
-    fi
+    capture | grep -Fq "$expected" && return 0
     sleep 0.5
     i=$((i + 1))
   done
@@ -42,58 +48,45 @@ wait_for_text() {
   return 1
 }
 
-wait_for_exact_line() {
+wait_for_status() {
   local expected=$1 attempts=${2:-120} i=0
   while [ "$i" -lt "$attempts" ]; do
-    if capture | grep -Fxq " $expected"; then
-      return 0
-    fi
-    sleep 0.5
+    current_lines | grep -Fxq "$expected" && return 0
+    sleep 0.25
     i=$((i + 1))
   done
-  capture >&2
+  current_lines >&2
   return 1
 }
 
-lab_pid_is_safe() {
-  local pid=$1 command
-  command=$(ps -p "$pid" -o command= 2>/dev/null || true)
-  case "$command" in
-    *"$LAB"*) return 0 ;;
-    *) return 1 ;;
-  esac
+wait_for_status_absent() {
+  local attempts=${1:-120} i=0 pane_dead
+  while [ "$i" -lt "$attempts" ]; do
+    pane_dead=$("$TMUX" -L "$SOCKET" display-message -p -t "$SESSION" '#{pane_dead}' 2>/dev/null || true)
+    [ "$pane_dead" = 1 ] && return 0
+    current_lines | grep -Eq '^(offline|watching|handling wake|attention)$' || return 0
+    sleep 0.1
+    i=$((i + 1))
+  done
+  return 1
 }
 
-cleanup() {
-  local pid_file watcher_pid arm_pid
-  pid_file=$(find "$HOME_DIR/state" -maxdepth 3 -type f -name pid 2>/dev/null | head -1 || true)
-  watcher_pid=
-  arm_pid=
-  if [ -n "$pid_file" ]; then
-    watcher_pid=$(sed -n '1p' "$pid_file" 2>/dev/null || true)
-    arm_pid=$(ps -p "$watcher_pid" -o ppid= 2>/dev/null | tr -d ' ' || true)
-  fi
-  "$TMUX" -L "$SOCKET" kill-server 2>/dev/null || true
-  sleep 0.1
-  if [ -n "$watcher_pid" ] && lab_pid_is_safe "$watcher_pid"; then
-    kill -TERM "$watcher_pid" 2>/dev/null || true
-  fi
-  if [ -n "$arm_pid" ] && lab_pid_is_safe "$arm_pid"; then
-    kill -TERM "$arm_pid" 2>/dev/null || true
-  fi
-  rm -rf "$LAB"
-}
-trap cleanup EXIT
+text_count() { capture | grep -Fo "$1" | wc -l | tr -d ' '; }
 
-send_prompt() {
-  local prompt=$1
-  "$TMUX" -L "$SOCKET" send-keys -t "$SESSION" -l "$prompt"
-  "$TMUX" -L "$SOCKET" send-keys -t "$SESSION" Enter
+wait_for_text_count_after() {
+  local expected=$1 previous=$2 attempts=${3:-120} i=0 count
+  while [ "$i" -lt "$attempts" ]; do
+    count=$(text_count "$expected")
+    [ "$count" -gt "$previous" ] && return 0
+    sleep 0.5
+    i=$((i + 1))
+  done
+  return 1
 }
 
 wait_pid_dead() {
   local pid=$1 i=0
-  while [ "$i" -lt 50 ]; do
+  while [ "$i" -lt 100 ]; do
     kill -0 "$pid" 2>/dev/null || return 0
     sleep 0.1
     i=$((i + 1))
@@ -101,54 +94,91 @@ wait_pid_dead() {
   return 1
 }
 
-mkdir -p "$LAB"
+wait_for_clean_exit() {
+  local i=0 state
+  while [ "$i" -lt 120 ]; do
+    state=$("$TMUX" -L "$SOCKET" display-message -p -t "$SESSION" '#{pane_dead} #{pane_dead_status}' 2>/dev/null || true)
+    [ "$state" = '1 0' ] && return 0
+    sleep 0.25
+    i=$((i + 1))
+  done
+  return 1
+}
+
+send_prompt() {
+  "$TMUX" -L "$SOCKET" send-keys -t "$SESSION" -l "$1"
+  "$TMUX" -L "$SOCKET" send-keys -t "$SESSION" Enter
+}
+
+cleanup() {
+  "$TMUX" -L "$SOCKET" kill-server 2>/dev/null || true
+  rm -rf "$LAB"
+}
+trap cleanup EXIT
+
 git clone -q "$ROOT" "$PROJECT"
-cp "$ROOT/.pi/extensions/fm-primary-pi-watch.ts" "$PROJECT/.pi/extensions/fm-primary-pi-watch.ts"
-cp "$ROOT/.pi/extensions/fm-primary-turnend-guard.ts" "$PROJECT/.pi/extensions/fm-primary-turnend-guard.ts"
-cp "$ROOT/bin/fm-supervision-instructions.sh" "$PROJECT/bin/fm-supervision-instructions.sh"
-mkdir -p "$HOME_DIR/state" "$HOME_DIR/config" "$PI_DIR"
-
-"$TMUX" -L "$SOCKET" new-session -d -s "$SESSION" -c "$PROJECT" \
-  "env PI_CODING_AGENT_DIR='$PI_DIR' FM_HOME='$HOME_DIR' FM_ROOT_OVERRIDE='$PROJECT' FM_POLL=1 FM_SIGNAL_GRACE=0 FM_HEARTBEAT=600 PI_OFFLINE=1 bash -lc 'printf \"%s\\n\" \"\$\$\" > \"\$FM_HOME/state/.lock\"; pi; rc=\$?; printf \"PI_EXIT=%s\\n\" \"\$rc\"; sleep 300'"
-
-wait_for_text "Trust project folder?" 40 || fail "Pi trust prompt did not appear"
-"$TMUX" -L "$SOCKET" send-keys -t "$SESSION" Enter
-wait_for_text "fm-primary-turnend-guard.ts" 60 || fail "Pi primary extensions did not load"
-
-send_prompt "Use the bash tool to run printf PI_E2E_BASH_ONE. Then reply exactly BASH-ONE."
-wait_for_exact_line "BASH-ONE" || fail "first bash turn did not complete"
-send_prompt "Use the read tool to read the first five lines of README.md. Then reply exactly READ-ONE."
-wait_for_exact_line "READ-ONE" || fail "read turn did not complete"
-send_prompt "Use the bash tool to run printf PI_E2E_BASH_TWO. Then reply exactly BASH-TWO."
-wait_for_exact_line "BASH-TWO" || fail "second bash turn did not complete"
-
-: > "$HOME_DIR/state/pi-e2e.meta"
-send_prompt "Reply exactly GUARD-TRIGGER with no tools. When the guard follow-up arrives, use fm_watch_arm_pi and never use bash to arm supervision. After any FIRSTMATE WATCHER WAKE, run bin/fm-wake-drain.sh, read the signaled status, call fm_watch_arm_pi to re-arm, and finish exactly REARMED."
-wait_for_text "watcher: started Pi extension arm child 1" || fail "guard follow-up did not render the Pi watcher tool result"
-
-printf 'done: pi live e2e watcher fire\n' > "$HOME_DIR/state/pi-e2e.status"
-wait_for_text "watcher: started Pi extension arm child 2" 180 || fail "watcher wake did not drain and re-arm through the Pi tool"
-wait_for_exact_line "REARMED" 120 || fail "Pi did not settle after re-arming watcher supervision"
-
-pane=$(capture)
-guard_count=$(printf '%s\n' "$pane" | grep -Fc "TURN WOULD END BLIND - supervision is off." || true)
-[ "$guard_count" -eq 1 ] || fail "expected one guard injection, saw $guard_count"
-foreground_arm='$ bin/fm-watch-arm.sh'
-if printf '%s\n' "$pane" | grep -Fq "$foreground_arm"; then
-  fail "Pi used a foreground bash watcher arm"
+if ! git -C "$ROOT" diff --quiet HEAD -- .pi bin; then
+  git -C "$ROOT" diff --binary HEAD -- .pi bin | git -C "$PROJECT" apply
 fi
+[ "$ROLE" != secondmate ] || : > "$PROJECT/.fm-secondmate-home"
+mkdir -p "$PROJECT/state" "$PROJECT/config" "$PI_DIR"
+cp "$AUTH_FILE" "$PI_DIR/auth.json"
+cat > "$PI_DIR/settings.json" <<JSON
+{"defaultProvider":"$PROVIDER","defaultModel":"$MODEL","defaultThinkingLevel":"$THINKING","enableInstallTelemetry":false,"packages":[]}
+JSON
+PI_CODING_AGENT_DIR="$PI_DIR" PI_OFFLINE=1 pi list 2>&1 | grep -Fq 'No packages installed.' \
+  || fail "isolated Pi home is not clean stock"
 
-pid_file=$(find "$HOME_DIR/state" -maxdepth 3 -type f -name pid | head -1)
-[ -n "$pid_file" ] || fail "re-armed watcher pid was not recorded"
+WATCH="$PROJECT/.pi/extensions/fm-primary-pi-watch.ts"
+launch="exec env PI_CODING_AGENT_DIR=$(shell_quote "$PI_DIR") FM_HOME=$(shell_quote "$PROJECT") FM_ROOT_OVERRIDE=$(shell_quote "$PROJECT") FM_POLL=1 FM_SIGNAL_GRACE=0 FM_HEARTBEAT=600 PI_OFFLINE=1 $(shell_quote "$PI_BIN") --approve --offline --no-session --verbose -e $(shell_quote "$WATCH") 'Reply exactly READY.'"
+"$TMUX" -L "$SOCKET" new-session -d -s "$SESSION" -c "$PROJECT" "$launch"
+"$TMUX" -L "$SOCKET" set-window-option -t "$SESSION" remain-on-exit on
+wait_for_text READY 180 || fail "Pi did not start with the watcher extension"
+wait_for_status offline || fail "fresh watcher status was not offline"
+capture | grep -Fq 'Trust project folder?' && fail "--approve produced a trust dialog"
+
+: > "$PROJECT/state/pi-e2e.meta"
+send_prompt 'Use fm_watch_arm_pi exactly once. Never use bash to arm. Reply exactly ARMED. After a FIRSTMATE WATCHER WAKE, run bin/fm-wake-drain.sh, do not re-arm, and finish exactly WAKE-HANDLED.'
+wait_for_text 'watcher: started Pi extension arm child 1' 180 || fail "native watcher arm did not start"
+wait_for_status watching || fail "armed watcher status was not watching"
+wake_count=$(text_count WAKE-HANDLED)
+printf 'done: pi live e2e watcher fire\n' > "$PROJECT/state/pi-e2e.status"
+wait_for_status 'handling wake' 240 || fail "actionable wake status was not handling wake"
+wait_for_text_count_after WAKE-HANDLED "$wake_count" 180 || fail "Pi did not handle the watcher wake"
+
+send_prompt 'Use fm_watch_arm_pi exactly once to resume supervision. Reply exactly REARMED.'
+wait_for_text 'watcher: started Pi extension arm child 2' 180 || fail "native watcher did not re-arm"
+wait_for_status watching 180 || fail "re-armed watcher status was not watching"
+pid_file=$(find "$PROJECT/state" -maxdepth 3 -type f -name pid | head -1)
 watcher_pid=$(sed -n '1p' "$pid_file")
 arm_pid=$(ps -p "$watcher_pid" -o ppid= | tr -d ' ')
-[ -n "$arm_pid" ] || fail "re-armed watcher parent was not live"
+[ -n "$arm_pid" ] || fail "watcher arm process was not live"
 
-"$TMUX" -L "$SOCKET" send-keys -t "$SESSION" -l '/quit'
-sleep 1
+before_failure=$(capture | grep -Fc 'FIRSTMATE WATCHER WAKE: watcher: FAILED' || true)
+"$TMUX" -L "$SOCKET" send-keys -t "$SESSION" -l /reload
 "$TMUX" -L "$SOCKET" send-keys -t "$SESSION" Enter
-wait_for_text "PI_EXIT=0" 60 || fail "Pi did not exit cleanly"
-wait_pid_dead "$watcher_pid" || fail "watcher child survived clean Pi exit"
-wait_pid_dead "$arm_pid" || fail "arm child survived clean Pi exit"
+wait_for_status_absent 60 || fail "reload did not clear old status"
+wait_for_text 'Reloaded keybindings' 120 || fail "Pi reload did not complete"
+wait_for_status offline 120 || fail "reloaded watcher status was not offline"
+wait_pid_dead "$watcher_pid" || fail "old watcher survived reload"
+wait_pid_dead "$arm_pid" || fail "old arm survived reload"
+after_failure=$(capture | grep -Fc 'FIRSTMATE WATCHER WAKE: watcher: FAILED' || true)
+[ "$after_failure" -eq "$before_failure" ] || fail "reload emitted a false failure wake"
 
-printf 'ok - Pi %s live E2E rendered the tool, guarded once, woke, re-armed, and cleaned up on exit\n' "$PI_VERSION"
+send_prompt 'Use fm_watch_arm_pi exactly once after reload. Reply exactly RELOAD-REARMED.'
+wait_for_text 'watcher: started Pi extension arm child 3' 180 || fail "watcher did not arm after reload"
+wait_for_status watching 180 || fail "post-reload watcher status was not watching"
+new_pid_file=$(find "$PROJECT/state" -maxdepth 3 -type f -name pid | head -1)
+new_watcher_pid=$(sed -n '1p' "$new_pid_file")
+new_arm_pid=$(ps -p "$new_watcher_pid" -o ppid= | tr -d ' ')
+
+"$TMUX" -L "$SOCKET" send-keys -t "$SESSION" -l /quit
+"$TMUX" -L "$SOCKET" send-keys -t "$SESSION" Enter
+wait_for_status_absent 60 || fail "quit did not clear watcher status"
+wait_for_clean_exit || fail "Pi did not exit cleanly"
+wait_pid_dead "$new_watcher_pid" || fail "watcher survived clean Pi exit"
+wait_pid_dead "$new_arm_pid" || fail "arm survived clean Pi exit"
+orphan=$(pgrep -af "$LAB" 2>/dev/null | grep -E 'pi-coding-agent|fm-watch' || true)
+[ -z "$orphan" ] || fail "owned live lab left a process: $orphan"
+
+printf 'ok - Pi %s watcher lifecycle passed for %s with clean reload and exit\n' "$(pi --version)" "$ROLE"
