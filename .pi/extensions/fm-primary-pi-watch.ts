@@ -452,9 +452,9 @@ function stopArmOnProcessExit(coordinator: ArmCoordinator): void {
   signalArm(record, "SIGKILL");
 }
 
-function runPretoolCheck(command: string): Promise<{ code: number; stderr: string }> {
+function runChecker(script: string, command: string): Promise<{ code: number; stderr: string }> {
   return new Promise((resolveResult) => {
-    const child = spawn(`${fmRoot}/bin/fm-arm-pretool-check.sh`, ["--command", command], {
+    const child = spawn(`${fmRoot}/bin/${script}`, ["--command", command], {
       stdio: ["ignore", "ignore", "pipe"],
     });
     let stderr = "";
@@ -464,6 +464,14 @@ function runPretoolCheck(command: string): Promise<{ code: number; stderr: strin
     child.on("error", () => resolveResult({ code: 0, stderr: "" }));
     child.on("close", (code) => resolveResult({ code: code ?? 0, stderr }));
   });
+}
+
+function runPretoolCheck(command: string): Promise<{ code: number; stderr: string }> {
+  return runChecker("fm-arm-pretool-check.sh", command);
+}
+
+function runCdCheck(command: string): Promise<{ code: number; stderr: string }> {
+  return runChecker("fm-cd-pretool-check.sh", command);
 }
 
 export default function (pi: ExtensionAPI) {
@@ -662,6 +670,10 @@ export default function (pi: ExtensionAPI) {
     if (event.type !== "tool_call" || event.toolName !== "bash") return {};
     const command = String((event.input as { command?: unknown })?.command ?? "");
     if (!command) return {};
+    const cdResult = await runCdCheck(command);
+    if (cdResult.code === 2) {
+      return { block: true, reason: cdResult.stderr.trim() || "denied by the cd-guard PreToolUse seatbelt" };
+    }
     const result = await runPretoolCheck(command);
     if (result.code !== 2) return {};
     return { block: true, reason: result.stderr.trim() || "denied by the watcher-arm PreToolUse seatbelt" };
