@@ -62,7 +62,7 @@ test_afk_start_reclaims_stale_daemon_lock_reused_pid() {
   mkdir -p "$lock"
   printf '%s\n' "$$" > "$state/.supervise-daemon.pid"
   printf '%s\n' "$$" > "$lock/pid"
-  printf '%s\n' "stale daemon identity" > "$lock/pid-identity"
+  printf '%s\n' "ps:stale daemon identity" > "$lock/pid-identity"
 
   out=$(FM_STATE_OVERRIDE="$state" FM_SUPERVISOR_BACKEND=unsupported "$AFK_START" 2>&1)
   status=$?
@@ -73,6 +73,48 @@ test_afk_start_reclaims_stale_daemon_lock_reused_pid() {
   assert_not_contains "$out" "daemon already running" "fm-afk-start.sh trusted a stale daemon lock with a reused pid"
   assert_not_contains "$out" "another fm-supervise-daemon is already running" "daemon singleton lock still trusted the reused pid"
   pass "fm-afk-start.sh reclaims stale daemon locks whose live pid identity no longer matches"
+}
+
+test_afk_start_preserves_live_daemon_lock_with_legacy_identity_mismatch() {
+  local dir state out status lock
+  dir=$(make_supercase afk-start-live-legacy-identity-mismatch)
+  state="$dir/state"
+  lock="$state/.supervise-daemon.lock"
+  mkdir -p "$lock"
+  printf '%s\n' "$$" > "$lock/pid"
+  printf '%s\n' "legacy wall-clock identity changed" > "$lock/pid-identity"
+
+  out=$(FM_STATE_OVERRIDE="$state" FM_SUPERVISOR_BACKEND=unsupported "$AFK_START" 2>&1)
+  status=$?
+
+  [ "$status" -eq 0 ] || fail "fm-afk-start.sh rejected a live legacy lock after an inconclusive identity mismatch: $out"
+  assert_contains "$out" "afk: daemon already running pid=$$" "fm-afk-start.sh did not preserve the live legacy lock owner"
+  [ "$(cat "$lock/pid" 2>/dev/null || true)" = "$$" ] || fail "fm-afk-start.sh replaced the live legacy lock owner"
+  pass "fm-afk-start.sh preserves live legacy locks when identity comparison is inconclusive"
+}
+
+test_afk_start_preserves_live_daemon_lock_when_identity_probe_is_unavailable() {
+  local dir state fakebin out status lock
+  dir=$(make_supercase afk-start-live-identity-unavailable)
+  state="$dir/state"
+  fakebin="$dir/fakebin"
+  lock="$state/.supervise-daemon.lock"
+  cat > "$fakebin/ps" <<'SH'
+#!/usr/bin/env bash
+exit 1
+SH
+  chmod +x "$fakebin/ps"
+  mkdir -p "$lock"
+  printf '%s\n' "$$" > "$lock/pid"
+  printf '%s\n' "ps:recorded daemon identity" > "$lock/pid-identity"
+
+  out=$(PATH="$fakebin:$PATH" FM_STATE_OVERRIDE="$state" FM_SUPERVISOR_BACKEND=unsupported "$AFK_START" 2>&1)
+  status=$?
+
+  [ "$status" -eq 0 ] || fail "fm-afk-start.sh rejected a live lock when its identity probe was unavailable: $out"
+  assert_contains "$out" "afk: daemon already running pid=$$" "fm-afk-start.sh did not preserve the live lock after identity probe failure"
+  [ "$(cat "$lock/pid" 2>/dev/null || true)" = "$$" ] || fail "fm-afk-start.sh replaced the live owner after identity probe failure"
+  pass "fm-afk-start.sh preserves live daemon locks when identity probing is unavailable"
 }
 
 test_daemon_state_root_uses_fm_home() {
@@ -1652,6 +1694,8 @@ test_inject_msg_defers_on_dead_shell_unknown() {
 test_afk_start_refuses_when_flag_cannot_be_written
 test_afk_start_ignores_stale_pidfile_without_lock
 test_afk_start_reclaims_stale_daemon_lock_reused_pid
+test_afk_start_preserves_live_daemon_lock_with_legacy_identity_mismatch
+test_afk_start_preserves_live_daemon_lock_when_identity_probe_is_unavailable
 test_daemon_state_root_uses_fm_home
 test_classify_routine_signal_self
 test_classify_terminal_signal_escalates

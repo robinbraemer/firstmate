@@ -274,6 +274,282 @@ test_lock_live_steal_mutex_is_not_reclaimed() {
   pass "live steal mutex is not reclaimed"
 }
 
+test_lock_aged_live_owner_keeps_ownership_after_resume() {
+  local dir state lockdir ready holder original_owner out
+  dir=$(make_case lock-aged-live-owner)
+  state="$dir/state"
+  lockdir="$state/.contend.lock"
+  ready="$dir/ready"
+  FM_STATE_OVERRIDE="$state" bash -c '
+    . "$1"
+    fm_lock_try_acquire "$2" || exit 7
+    printf "%s\n" "${FM_LOCK_OWNER_DIR:-}" > "$3"
+    while :; do sleep 1; done
+  ' _ "$LIB" "$lockdir" "$ready" &
+  holder=$!
+  while [ ! -s "$ready" ]; do sleep 0.01; done
+  original_owner=$(cat "$ready")
+  kill -STOP "$holder"
+  touch -h -t 202001010000 "$lockdir" 2>/dev/null || sleep 2
+  out=$(FM_STATE_OVERRIDE="$state" bash -c '
+    . "$1"
+    if fm_lock_try_acquire "$2" 1; then rc=0; else rc=1; fi
+    printf "rc=%s owner=%s\n" "$rc" "$(readlink "$2" 2>/dev/null || true)"
+  ' _ "$LIB" "$lockdir")
+  kill -CONT "$holder" 2>/dev/null || true
+  kill "$holder" 2>/dev/null || true
+  wait "$holder" 2>/dev/null || true
+  case "$out" in
+    *"rc=1"*) ;;
+    *) fail "aged live lock owner was reclaimed while paused: $out" ;;
+  esac
+  case "$out" in
+    *"owner=$original_owner"*) ;;
+    *) fail "paused live owner lost its lock before resuming: $out" ;;
+  esac
+  pass "aged live lock owner remains authoritative across pause and resume"
+}
+
+test_lock_live_legacy_identity_mismatch_fails_closed() {
+  local dir state lockdir live out lockpid
+  dir=$(make_case lock-live-legacy-identity-mismatch)
+  state="$dir/state"
+  lockdir="$state/.contend.lock"
+  sleep 300 &
+  live=$!
+  mkdir "$lockdir"
+  printf '%s\n' "$live" > "$lockdir/pid"
+  printf '%s\n' 'legacy wall-clock identity changed' > "$lockdir/pid-identity"
+  touch -t 202001010000 "$lockdir"
+  out=$(FM_STATE_OVERRIDE="$state" bash -c '
+    . "$1"
+    if fm_lock_try_acquire "$2" 1; then rc=0; else rc=1; fi
+    printf "rc=%s held=%s\n" "$rc" "${FM_LOCK_HELD_PID:-}"
+  ' _ "$LIB" "$lockdir")
+  kill "$live" 2>/dev/null || true
+  wait "$live" 2>/dev/null || true
+  case "$out" in
+    *"rc=1"*"held=$live"*) ;;
+    *) fail "live legacy identity mismatch did not fail closed: $out" ;;
+  esac
+  lockpid=$(cat "$lockdir/pid" 2>/dev/null || true)
+  [ "$lockpid" = "$live" ] || fail "live legacy identity mismatch allowed lock theft (got '$lockpid')"
+  pass "live legacy identity mismatch fails closed"
+}
+
+test_lock_accepts_exact_legacy_identity() {
+  local dir state lockdir live identity out
+  dir=$(make_case lock-live-exact-legacy-identity)
+  state="$dir/state"
+  lockdir="$state/.contend.lock"
+  sleep 300 &
+  live=$!
+  identity=$(LC_ALL=C ps -p "$live" -o lstart= -o command= 2>/dev/null | sed 's/^[[:space:]]*//')
+  [ -n "$identity" ] || fail "could not capture legacy process identity"
+  mkdir "$lockdir"
+  printf '%s\n' "$live" > "$lockdir/pid"
+  printf '%s\n' "$identity" > "$lockdir/pid-identity"
+  out=$(FM_STATE_OVERRIDE="$state" bash -c '
+    . "$1"
+    if fm_lock_try_acquire "$2" 1; then rc=0; else rc=1; fi
+    printf "rc=%s held=%s\n" "$rc" "${FM_LOCK_HELD_PID:-}"
+  ' _ "$LIB" "$lockdir")
+  kill "$live" 2>/dev/null || true
+  wait "$live" 2>/dev/null || true
+  case "$out" in
+    *"rc=1"*"held=$live"*) ;;
+    *) fail "exact legacy identity was not accepted: $out" ;;
+  esac
+  pass "exact legacy identity remains compatible"
+}
+
+test_lock_live_tagged_identity_probe_failure_fails_closed() {
+  local dir state lockdir live out
+  dir=$(make_case lock-live-tagged-identity-unavailable)
+  state="$dir/state"
+  lockdir="$state/.contend.lock"
+  sleep 300 &
+  live=$!
+  mkdir "$lockdir"
+  printf '%s\n' "$live" > "$lockdir/pid"
+  printf '%s\n' 'proc:00000000-0000-0000-0000-000000000000:424242' > "$lockdir/pid-identity"
+  touch -t 202001010000 "$lockdir"
+  out=$(FM_STATE_OVERRIDE="$state" bash -c '
+    . "$1"
+    fm_pid_identity_from_proc() { return 1; }
+    if fm_lock_live_owner_is_fresh "$2" "$3" 1; then rc=0; else rc=1; fi
+    printf "rc=%s\n" "$rc"
+  ' _ "$LIB" "$lockdir" "$live")
+  kill "$live" 2>/dev/null || true
+  wait "$live" 2>/dev/null || true
+  [ "$out" = "rc=0" ] || fail "unavailable tagged identity probe marked the live owner stale: $out"
+  pass "unavailable tagged identity probe preserves the live lock owner"
+}
+
+test_proc_identity_probe_does_not_fall_back_to_ps() {
+  local out
+  out=$(bash -c '
+    . "$1"
+    fm_pid_identity_from_proc() { return 1; }
+    fm_pid_legacy_identity() { printf "%s\n" "legacy identity"; }
+    fm_pid_identity_matches "$2" proc:00000000-0000-0000-0000-000000000000:424242
+    printf "rc=%s\n" "$?"
+  ' _ "$LIB" "$$")
+  [ "$out" = "rc=2" ] || fail "unavailable proc identity was replaced by a ps mismatch: $out"
+  pass "proc identity probe stays unavailable when proc cannot be read"
+}
+
+test_path_age_feature_detects_gnu_stat_on_darwin() {
+  local dir fakebin path age
+  dir=$(make_case path-age-gnu-stat-darwin)
+  fakebin="$dir/fakebin"
+  path="$dir/state/beat"
+  touch "$path"
+  cat > "$fakebin/uname" <<'SH'
+#!/usr/bin/env bash
+printf '%s\n' Darwin
+SH
+  cat > "$fakebin/stat" <<'SH'
+#!/usr/bin/env bash
+case "${1:-}" in
+  -c) printf '%s\n' 1234 ;;
+  -f) printf '%s\n' '  File: "1234"' '    ID: 0 Namelen: 255 Type: ext2/ext3' ;;
+  *) exit 2 ;;
+esac
+SH
+  cat > "$fakebin/date" <<'SH'
+#!/usr/bin/env bash
+printf '%s\n' 2000
+SH
+  chmod +x "$fakebin/uname" "$fakebin/stat" "$fakebin/date"
+
+  age=$(PATH="$fakebin:$PATH" bash -c 'set -u; . "$1"; fm_path_age "$2"' _ "$LIB" "$path" 2>/dev/null) \
+    || fail "fm_path_age failed when GNU stat preceded BSD stat on a Darwin PATH"
+  [ "$age" = 766 ] || fail "fm_path_age did not use GNU stat's numeric mtime on a Darwin PATH (got '$age')"
+  pass "fm_path_age feature-detects GNU stat on a Darwin PATH"
+}
+
+test_lock_reclaims_aged_reused_pid_steal_mutex() {
+  local dir state lockdir dead reused out rc
+  dir=$(make_case lock-aged-reused-steal)
+  state="$dir/state"
+  lockdir="$state/.contend.lock"
+  dead=$(dead_pid)
+  mkdir "$lockdir" "$lockdir.steal"
+  printf '%s\n' "$dead" > "$lockdir/pid"
+  sleep 300 &
+  reused=$!
+  printf '%s\n' "$reused" > "$lockdir.steal/pid"
+  touch -t 202001010000 "$lockdir.steal"
+  rc=0
+  out=$(FM_STATE_OVERRIDE="$state" bash -c '
+    . "$1"
+    fm_lock_try_acquire "$2" 1 || exit 7
+    printf "pid=%s\n" "$(cat "$2/pid")"
+  ' _ "$LIB" "$lockdir") || rc=$?
+  kill "$reused" 2>/dev/null || true
+  wait "$reused" 2>/dev/null || true
+  [ "$rc" -eq 0 ] || fail "aged reused-PID steal mutex blocked recovery (rc=$rc)"
+  case "$out" in
+    "pid=$reused") fail "recovery published the unrelated reused PID: $out" ;;
+  esac
+  [ ! -e "$lockdir.steal" ] && [ ! -L "$lockdir.steal" ] \
+    || fail "aged reused-PID steal mutex survived recovery"
+  pass "aged reused-PID steal mutex is reclaimed recursively"
+}
+
+test_bounded_lock_identity_failure_returns_without_recursing() {
+  local dir state lockdir out worker i
+  dir=$(make_case lock-identity-failure)
+  state="$dir/state"
+  lockdir="$state/.contend.lock"
+  out="$dir/out"
+  FM_STATE_OVERRIDE="$state" bash -c '
+    . "$1"
+    fm_pid_identity() { return 1; }
+    if fm_lock_try_acquire "$2" 1; then rc=0; else rc=1; fi
+    printf "rc=%s\n" "$rc"
+  ' _ "$LIB" "$lockdir" > "$out" &
+  worker=$!
+  i=0
+  while kill -0 "$worker" 2>/dev/null && [ "$i" -lt 100 ]; do
+    sleep 0.01
+    i=$((i + 1))
+  done
+  if kill -0 "$worker" 2>/dev/null; then
+    kill "$worker" 2>/dev/null || true
+    wait "$worker" 2>/dev/null || true
+    fail "bounded lock acquisition recursed when process identity was unavailable"
+  fi
+  wait "$worker" || fail "bounded lock identity failure exited unexpectedly"
+  [ "$(cat "$out")" = "rc=1" ] || fail "bounded lock identity failure did not fail closed: $(cat "$out")"
+  [ -z "$(find "$state" -name '.contend.lock*' -print -quit)" ] || fail "bounded lock identity failure left lock state behind"
+  pass "bounded lock identity failure returns promptly and fails closed"
+}
+
+test_session_lock_publication_is_fenced_by_mutex_ownership() {
+  local dir home state fakebin ready go real_mktemp holder claim_base claim_pid i status out
+  dir=$(make_case session-lock-publication-fence)
+  home="$dir/home"
+  state="$home/state"
+  fakebin="$dir/fakebin"
+  ready="$dir/ready"
+  go="$dir/go"
+  claim_base="$dir/claim"
+  real_mktemp=$(command -v mktemp)
+  mkdir -p "$state" "$fakebin"
+  sleep 300 &
+  holder=$!
+  cat > "$fakebin/ps" <<'SH'
+#!/usr/bin/env bash
+case "$*" in
+  *"lstart="*"command="*) printf 'Sat Jul 11 12:00:00 2026 pi\n' ;;
+  *"comm="*) printf 'pi\n' ;;
+  *"args="*) printf 'pi\n' ;;
+  *"ppid="*) printf '%s\n' "$FM_HOLDER_PID" ;;
+  *) exit 1 ;;
+esac
+SH
+  cat > "$fakebin/mktemp" <<'SH'
+#!/usr/bin/env bash
+case "$*" in
+  *".lock.write."*)
+    : > "$FM_FENCE_READY"
+    while [ ! -e "$FM_FENCE_GO" ]; do sleep 0.01; done
+    ;;
+esac
+exec "$FM_REAL_MKTEMP" "$@"
+SH
+  chmod +x "$fakebin/ps" "$fakebin/mktemp"
+  PATH="$fakebin:$PATH" FM_HOME="$home" FM_HOLDER_PID="$holder" \
+    FM_FENCE_READY="$ready" FM_FENCE_GO="$go" FM_REAL_MKTEMP="$real_mktemp" \
+    "$ROOT/bin/fm-lock.sh" > "$claim_base.out" 2> "$claim_base.err" &
+  claim_pid=$!
+  i=0
+  while [ ! -e "$ready" ] && kill -0 "$claim_pid" 2>/dev/null && [ "$i" -lt 200 ]; do
+    sleep 0.01
+    i=$((i + 1))
+  done
+  [ -e "$ready" ] || fail "session-lock claimant did not reach the publication fence"
+  rm -f "$state/.lock.acquire"
+  mkdir "$state/.lock.acquire"
+  printf '999999\n' > "$state/.lock.acquire/pid"
+  printf 'competing-owner\n' > "$state/.lock"
+  : > "$go"
+  status=0
+  wait "$claim_pid" || status=$?
+  kill "$holder" 2>/dev/null || true
+  wait "$holder" 2>/dev/null || true
+  out=$(cat "$claim_base.err")
+  [ "$status" -ne 0 ] || fail "claimant published after losing its acquisition mutex"
+  case "$out" in
+    *"ownership was lost before publication"*) ;;
+    *) fail "claimant did not report its lost publication fence: $out" ;;
+  esac
+  [ "$(cat "$state/.lock")" = "competing-owner" ] || fail "claimant overwrote the competing canonical owner"
+  pass "session lock publication is fenced by acquisition-mutex ownership"
+}
+
 test_lock_does_not_steal_live_lock() {
   local dir state lockdir live out lockpid
   dir=$(make_case lock-live-noop)
@@ -396,7 +672,7 @@ test_watch_restart_rejects_reused_pid() {
   printf '%s\n' "$live" > "$state/.watch.lock/pid"
   printf '%s\n' "$dir" > "$state/.watch.lock/fm-home"
   printf '%s\n' "$WATCH" > "$state/.watch.lock/watcher-path"
-  printf '%s\n' "stale watcher identity" > "$state/.watch.lock/pid-identity"
+  printf '%s\n' "ps:stale watcher identity" > "$state/.watch.lock/pid-identity"
   PATH="$fakebin:$PATH" FM_HOME="$dir" FM_POLL=5 FM_SIGNAL_GRACE=1 FM_CHECK_INTERVAL=999999 FM_HEARTBEAT=999999 "$WATCH_ARM" --restart > "$out" &
   pid=$!
   # The honest arm forks the fresh watcher as a tracked child and waits on it, so
@@ -419,6 +695,78 @@ test_watch_restart_rejects_reused_pid() {
   wait "$pid" 2>/dev/null || true
   wait "$live" 2>/dev/null || true
   pass "watch restart refuses to signal a reused pid"
+}
+
+test_watch_restart_preserves_live_lock_when_identity_probe_is_unavailable() {
+  local dir state fakebin out live status lock_pid
+  dir=$(make_case restart-identity-unavailable)
+  state="$dir/state"
+  fakebin="$dir/fakebin"
+  out="$dir/restart.out"
+  sleep 300 &
+  live=$!
+  cat > "$fakebin/ps" <<'SH'
+#!/usr/bin/env bash
+exit 1
+SH
+  chmod +x "$fakebin/ps"
+  mkdir "$state/.watch.lock"
+  printf '%s\n' "$live" > "$state/.watch.lock/pid"
+  printf '%s\n' "$dir" > "$state/.watch.lock/fm-home"
+  printf '%s\n' "$WATCH" > "$state/.watch.lock/watcher-path"
+  printf '%s\n' 'ps:recorded watcher identity' > "$state/.watch.lock/pid-identity"
+  status=0
+  PATH="$fakebin:$PATH" FM_HOME="$dir" FM_ARM_CONFIRM_TIMEOUT=1 FM_POLL=5 FM_SIGNAL_GRACE=1 \
+    FM_CHECK_INTERVAL=999999 FM_HEARTBEAT=999999 "$WATCH_ARM" --restart > "$out" || status=$?
+  lock_pid=$(cat "$state/.watch.lock/pid" 2>/dev/null || true)
+  is_live_non_zombie "$live" || fail "restart killed a live pid while its identity probe was unavailable"
+  [ "$lock_pid" = "$live" ] || fail "restart cleared a live watcher lock while identity probing was unavailable (got '$lock_pid')"
+  [ "$status" -ne 0 ] || fail "restart reported success without confirming the live watcher identity: $(cat "$out")"
+  kill "$live" 2>/dev/null || true
+  wait "$live" 2>/dev/null || true
+  pass "watch restart preserves a live lock when identity probing is unavailable"
+}
+
+test_watch_restart_preserves_live_legacy_identity_mismatch() {
+  local dir state fakebin out live arm_pid status lock_pid i
+  dir=$(make_case restart-legacy-identity-mismatch)
+  state="$dir/state"
+  fakebin="$dir/fakebin"
+  out="$dir/restart.out"
+  sleep 300 &
+  live=$!
+  mkdir "$state/.watch.lock"
+  printf '%s\n' "$live" > "$state/.watch.lock/pid"
+  printf '%s\n' "$dir" > "$state/.watch.lock/fm-home"
+  printf '%s\n' "$WATCH" > "$state/.watch.lock/watcher-path"
+  printf '%s\n' 'legacy wall-clock identity changed' > "$state/.watch.lock/pid-identity"
+  PATH="$fakebin:$PATH" FM_HOME="$dir" FM_ARM_CONFIRM_TIMEOUT=1 FM_POLL=5 FM_SIGNAL_GRACE=1 \
+    FM_CHECK_INTERVAL=999999 FM_HEARTBEAT=999999 "$WATCH_ARM" --restart > "$out" &
+  arm_pid=$!
+  i=0
+  while kill -0 "$arm_pid" 2>/dev/null && [ "$i" -lt 30 ]; do
+    sleep 0.1
+    i=$((i + 1))
+  done
+  status=0
+  if kill -0 "$arm_pid" 2>/dev/null; then
+    status=124
+    kill "$arm_pid" 2>/dev/null || true
+  else
+    wait "$arm_pid" || status=$?
+  fi
+  lock_pid=$(cat "$state/.watch.lock/pid" 2>/dev/null || true)
+  if [ -n "$lock_pid" ] && [ "$lock_pid" != "$live" ]; then
+    kill "$lock_pid" 2>/dev/null || true
+  fi
+  kill "$live" 2>/dev/null || true
+  wait "$arm_pid" 2>/dev/null || true
+  wait "$live" 2>/dev/null || true
+
+  [ "$status" -ne 124 ] || fail "restart replaced a live legacy lock and waited on a duplicate watcher"
+  [ "$status" -ne 0 ] || fail "restart reported success without confirming the legacy lock owner's identity: $(cat "$out")"
+  [ "$lock_pid" = "$live" ] || fail "restart cleared a live legacy watcher lock after an inconclusive mismatch (got '$lock_pid')"
+  pass "watch restart preserves live legacy locks when identity comparison is inconclusive"
 }
 
 test_watch_restart_reports_healthy_peer_without_attaching() {
@@ -703,8 +1051,74 @@ test_pid_identity_is_locale_invariant() {
   pass "fm_pid_identity is locale-invariant across LC_ALL/LC_TIME"
 }
 
+test_pid_identity_prefers_linux_start_ticks() {
+  local dir fakebin count live expected boot_id first second
+  dir=$(make_case pid-identity-proc)
+  fakebin="$dir/fakebin"
+  count="$dir/ps-count"
+  sleep 300 &
+  live=$!
+  if [ ! -r "/proc/$live/stat" ]; then
+    kill "$live" 2>/dev/null || true
+    wait "$live" 2>/dev/null || true
+    pass "fm_pid_identity Linux start-tick preference is not applicable"
+    return
+  fi
+  expected=$(sed 's/^[^)]*) //' "/proc/$live/stat" | awk '{ print $20 }')
+  boot_id=$(cat /proc/sys/kernel/random/boot_id 2>/dev/null || true)
+  [ -n "$boot_id" ] || {
+    kill "$live" 2>/dev/null || true
+    wait "$live" 2>/dev/null || true
+    pass "fm_pid_identity Linux boot identity is not applicable"
+    return
+  }
+  cat > "$fakebin/ps" <<'SH'
+#!/usr/bin/env bash
+count=$(cat "$FM_FAKE_PS_COUNT" 2>/dev/null || printf '0')
+count=$((count + 1))
+printf '%s\n' "$count" > "$FM_FAKE_PS_COUNT"
+printf 'Sat Jul 11 12:00:0%s 2026 sleep 300\n' "$count"
+SH
+  chmod +x "$fakebin/ps"
+  first=$(PATH="$fakebin:$PATH" FM_FAKE_PS_COUNT="$count" bash -c '. "$1"; fm_pid_identity "$2"' _ "$LIB" "$live")
+  second=$(PATH="$fakebin:$PATH" FM_FAKE_PS_COUNT="$count" bash -c '. "$1"; fm_pid_identity "$2"' _ "$LIB" "$live")
+  kill "$live" 2>/dev/null || true
+  wait "$live" 2>/dev/null || true
+  [ "$first" = "proc:$boot_id:$expected" ] || fail "fm_pid_identity did not bind Linux start ticks to the boot id (got '$first')"
+  [ "$second" = "$first" ] || fail "fm_pid_identity changed with ps lstart (got '$first' then '$second')"
+  pass "fm_pid_identity prefers stable Linux start ticks"
+}
+
+test_pid_identity_parses_linux_start_ticks() {
+  local stat start_ticks
+  stat='123 (clock worker) S 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 424242 20'
+  start_ticks=$(bash -c '. "$1"; fm_pid_start_ticks_from_proc_stat "$2"' _ "$LIB" "$stat" 2>/dev/null || true)
+  [ "$start_ticks" = "424242" ] || fail "Linux proc identity parser did not return field 22 (got '$start_ticks')"
+  pass "Linux proc identity parser returns field 22"
+}
+
+test_proc_identity_distinguishes_boots_and_fails_closed_for_legacy() {
+  local out
+  out=$(bash -c '
+    . "$1"
+    fm_pid_start_ticks_from_proc() { printf "%s\n" 424242; }
+    fm_linux_boot_id() { printf "%s\n" aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa; }
+    identity=$(fm_pid_identity_from_proc 123)
+    printf "identity=%s\n" "$identity"
+    fm_pid_identity_matches 123 "$identity"; printf "exact=%s\n" "$?"
+    fm_pid_identity_matches 123 proc:bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb:424242; printf "cross=%s\n" "$?"
+    fm_pid_identity_matches 123 proc:424242; printf "legacy-exact=%s\n" "$?"
+    fm_pid_identity_matches 123 proc:515151; printf "legacy-mismatch=%s\n" "$?"
+  ' _ "$LIB")
+  [ "$out" = "identity=proc:aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa:424242
+exact=0
+cross=1
+legacy-exact=2
+legacy-mismatch=1" ] || fail "Linux process identity did not distinguish boots conservatively: $out"
+  pass "Linux process identity includes boot id and treats legacy collisions as inconclusive"
+}
+
 test_singleton_start
-test_pid_identity_is_locale_invariant
 test_stale_watch_lock_reclaimed
 test_live_stale_watch_lock_is_actionable
 test_guard_warnings
@@ -712,11 +1126,26 @@ test_lock_single_winner_under_concurrency
 test_lock_steals_dead_pid_lock
 test_lock_stale_steal_single_winner_under_concurrency
 test_lock_live_steal_mutex_is_not_reclaimed
+test_lock_reclaims_aged_reused_pid_steal_mutex
+test_lock_aged_live_owner_keeps_ownership_after_resume
+test_lock_live_legacy_identity_mismatch_fails_closed
+test_lock_accepts_exact_legacy_identity
+test_lock_live_tagged_identity_probe_failure_fails_closed
+test_proc_identity_probe_does_not_fall_back_to_ps
+test_path_age_feature_detects_gnu_stat_on_darwin
+test_pid_identity_parses_linux_start_ticks
+test_pid_identity_prefers_linux_start_ticks
+test_proc_identity_distinguishes_boots_and_fails_closed_for_legacy
+test_pid_identity_is_locale_invariant
+test_bounded_lock_identity_failure_returns_without_recursing
+test_session_lock_publication_is_fenced_by_mutex_ownership
 test_lock_does_not_steal_live_lock
 test_lock_empty_pid_uses_minimum_grace
 test_lock_late_claim_loses_after_recreate
 test_lock_paused_mid_acquire_claim_fails_during_steal
 test_watch_restart_rejects_reused_pid
+test_watch_restart_preserves_live_lock_when_identity_probe_is_unavailable
+test_watch_restart_preserves_live_legacy_identity_mismatch
 test_watch_restart_reports_healthy_peer_without_attaching
 test_watcher_self_evicts_on_lock_takeover
 test_arm_attaches_and_waits_for_live_fresh_watcher
