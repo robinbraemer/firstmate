@@ -17,7 +17,9 @@ TMUX=$(command -v tmux)
 PI_BIN=$(command -v pi)
 SOCKET="fm-pi-live-e2e-$$"
 SESSION=pi-live-e2e
-LAB=$(mktemp -d "$ROOT/.pi-live-e2e.XXXXXX")
+EVIDENCE_ROOT=${FM_PI_LIVE_EVIDENCE_ROOT:-${TMPDIR:-/tmp}/no-mistakes-evidence}
+mkdir -p "$EVIDENCE_ROOT"
+LAB=$(mktemp -d "$EVIDENCE_ROOT/fm-pi-live-e2e.XXXXXX")
 PROJECT="$LAB/project"
 PI_DIR="$LAB/pi-agent"
 ROLE=${FM_PI_LIVE_ROLE:-primary}
@@ -41,6 +43,17 @@ wait_for_text() {
   local expected=$1 attempts=${2:-120} i=0
   while [ "$i" -lt "$attempts" ]; do
     capture | grep -Fq "$expected" && return 0
+    sleep 0.5
+    i=$((i + 1))
+  done
+  capture >&2
+  return 1
+}
+
+wait_for_text_line() {
+  local expected=$1 attempts=${2:-120} i=0
+  while [ "$i" -lt "$attempts" ]; do
+    current_lines | grep -Fxq "$expected" && return 0
     sleep 0.5
     i=$((i + 1))
   done
@@ -122,7 +135,9 @@ if ! git -C "$ROOT" diff --quiet HEAD -- .pi bin; then
 fi
 [ "$ROLE" != secondmate ] || : > "$PROJECT/.fm-secondmate-home"
 mkdir -p "$PROJECT/state" "$PROJECT/config" "$PI_DIR"
+chmod 700 "$LAB" "$PI_DIR"
 cp "$AUTH_FILE" "$PI_DIR/auth.json"
+chmod 600 "$PI_DIR/auth.json"
 cat > "$PI_DIR/settings.json" <<JSON
 {"defaultProvider":"$PROVIDER","defaultModel":"$MODEL","defaultThinkingLevel":"$THINKING","enableInstallTelemetry":false,"packages":[]}
 JSON
@@ -149,6 +164,7 @@ wait_for_text_count_after WAKE-HANDLED "$wake_count" 180 || fail "Pi did not han
 send_prompt 'Use fm_watch_arm_pi exactly once to resume supervision. Reply exactly REARMED.'
 wait_for_text 'watcher: started Pi extension arm child 2' 180 || fail "native watcher did not re-arm"
 wait_for_status watching 180 || fail "re-armed watcher status was not watching"
+wait_for_text_line REARMED 180 || fail "Pi did not settle after re-arming"
 pid_file=$(find "$PROJECT/state" -maxdepth 3 -type f -name pid | head -1)
 watcher_pid=$(sed -n '1p' "$pid_file")
 arm_pid=$(ps -p "$watcher_pid" -o ppid= | tr -d ' ')
@@ -178,7 +194,7 @@ wait_for_status_absent 60 || fail "quit did not clear watcher status"
 wait_for_clean_exit || fail "Pi did not exit cleanly"
 wait_pid_dead "$new_watcher_pid" || fail "watcher survived clean Pi exit"
 wait_pid_dead "$new_arm_pid" || fail "arm survived clean Pi exit"
-orphan=$(pgrep -af "$LAB" 2>/dev/null | grep -E 'pi-coding-agent|fm-watch' || true)
+orphan=$(ps -axo pid=,command= 2>/dev/null | awk -v lab="$LAB" 'index($0, lab) && $0 ~ /(pi-coding-agent|fm-watch)/')
 [ -z "$orphan" ] || fail "owned live lab left a process: $orphan"
 
 printf 'ok - Pi %s watcher lifecycle passed for %s with clean reload and exit\n' "$(pi --version)" "$ROLE"

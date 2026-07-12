@@ -13,10 +13,8 @@ type ArmResult = {
 };
 
 type LockOwnership = "owned" | "missing" | "other";
-type CoordinatorState = "idle" | "starting" | "running" | "stopping";
 type WakeKind = "actionable" | "failure";
 type WatcherStatus = "offline" | "watching" | "handling wake" | "attention";
-type StopDisposition = "offline" | "clear";
 type StatusUi = { setStatus(key: string, text: string | undefined): void };
 
 type WakeDetails = {
@@ -39,9 +37,9 @@ type StatusClient = WakeSender & {
   sendWake: WakeSender;
 };
 
-type CompletedCapture = {
-  stdout: string;
-  stderr: string;
+type PendingWake = {
+  message: string;
+  details: WakeDetails;
 };
 
 type ArmRecord = {
@@ -61,10 +59,8 @@ type ArmRecord = {
 
 type ArmCoordinator = {
   current: ArmRecord | null;
-  lastCompleted: CompletedCapture | null;
   generation: number;
   sequence: number;
-  state: CoordinatorState;
   visibleStatus: WatcherStatus;
   startPromise: Promise<ArmResult> | null;
   startCancelled: boolean;
@@ -72,6 +68,7 @@ type ArmCoordinator = {
   shutdownPromise: Promise<void> | null;
   shutdownToken: symbol | null;
   clients: Map<symbol, StatusClient>;
+  pendingWake: PendingWake | null;
   exitListener?: () => void;
 };
 
@@ -111,9 +108,7 @@ function supervisingHome(): boolean {
   if (process.env.FM_HOME || process.env.FM_ROOT_OVERRIDE) {
     try {
       if (realpathSync(fmHome) === root) return true;
-    } catch {
-      return false;
-    }
+    } catch {}
   }
   const gitDir = spawnSync("git", ["-C", root, "rev-parse", "--git-dir"], { encoding: "utf8" });
   const commonDir = spawnSync("git", ["-C", root, "rev-parse", "--git-common-dir"], { encoding: "utf8" });
@@ -136,10 +131,8 @@ function coordinatorForHome(): ArmCoordinator {
   }
   const coordinator: ArmCoordinator = {
     current: null,
-    lastCompleted: null,
     generation: 0,
     sequence: 0,
-    state: "idle",
     visibleStatus: "offline",
     startPromise: null,
     startCancelled: false,
@@ -147,6 +140,7 @@ function coordinatorForHome(): ArmCoordinator {
     shutdownPromise: null,
     shutdownToken: null,
     clients: new Map<symbol, StatusClient>(),
+    pendingWake: null,
   };
   coordinators.set(fmHome, coordinator);
   return coordinator;
@@ -308,11 +302,7 @@ function settleArm(
   const ownsGeneration = coordinator.current === record && coordinator.generation === record.generation;
   if (ownsGeneration) {
     coordinator.current = null;
-    coordinator.lastCompleted = { stdout: record.stdout, stderr: record.stderr };
-    coordinator.state = "idle";
   }
-  if (!ownsGeneration || coordinator.shuttingDown || record.intentionalStopReason) return;
-
   const message = error
     ? `watcher: FAILED - Pi extension arm child ${record.generation} failed: ${error.message}`
     : record.actionable || failureLine(record, code, signal);
@@ -327,6 +317,11 @@ function settleArm(
     stdoutTruncated: record.stdoutTruncated,
     stderrTruncated: record.stderrTruncated,
   };
+  if (record.intentionalStopReason && kind === "actionable") {
+    coordinator.pendingWake = { message, details };
+    return;
+  }
+  if (!ownsGeneration || coordinator.shuttingDown || record.intentionalStopReason) return;
   if (kind === "failure") publishStatus(coordinator, "attention");
   const activeClient = [...coordinator.clients.values()].reverse().find((candidate) => candidate.active);
   if (!activeClient) return;
@@ -403,10 +398,8 @@ async function stopArmRecord(
   coordinator: ArmCoordinator,
   record: ArmRecord,
   reason: string,
-  disposition: StopDisposition,
 ): Promise<void> {
   if (!record.intentionalStopReason) record.intentionalStopReason = reason;
-  if (coordinator.current === record) coordinator.state = "stopping";
   signalArm(record, "SIGTERM");
   if (!(await stopsWithin(record, STOP_GRACE_MS))) {
     signalArm(record, "SIGKILL");
@@ -419,28 +412,6 @@ async function stopArmRecord(
   }
   if (coordinator.current === record) {
     coordinator.current = null;
-    coordinator.lastCompleted = { stdout: record.stdout, stderr: record.stderr };
-    coordinator.state = "idle";
-  }
-  if (
-    disposition === "offline" &&
-    !coordinator.shuttingDown &&
-    coordinator.clients.size > 0
-  ) {
-    publishStatus(coordinator, "offline");
-  }
-}
-
-export async function stopArm(
-  coordinator: ArmCoordinator,
-  reason: string,
-  disposition: StopDisposition = "clear",
-): Promise<void> {
-  const record = coordinator.current;
-  if (record) {
-    await stopArmRecord(coordinator, record, reason, disposition);
-  } else if (disposition === "offline" && coordinator.clients.size > 0) {
-    publishStatus(coordinator, "offline");
   }
 }
 
@@ -474,9 +445,25 @@ function runCdCheck(command: string): Promise<{ code: number; stderr: string }> 
   return runChecker("fm-cd-pretool-check.sh", command);
 }
 
+function runTurnendGuard(): Promise<{ code: number; stderr: string }> {
+  return new Promise((resolveResult) => {
+    const child = spawn(`${fmRoot}/bin/fm-turnend-guard.sh`, {
+      stdio: ["pipe", "ignore", "pipe"],
+    });
+    let stderr = "";
+    child.stderr.on("data", (chunk) => {
+      stderr += chunk.toString();
+    });
+    child.on("error", () => resolveResult({ code: 0, stderr: "" }));
+    child.on("close", (code) => resolveResult({ code: code ?? 0, stderr }));
+    child.stdin.end('{"stop_hook_active":false}');
+  });
+}
+
 export default function (pi: ExtensionAPI) {
   if (!supervisingHome()) return;
   const coordinator = coordinatorForHome();
+  let guardFollowupActive = false;
 
   async function sendWake(message: string, details: WakeDetails): Promise<void> {
     pi.sendMessage(
@@ -497,6 +484,15 @@ export default function (pi: ExtensionAPI) {
     sendWake,
   });
   coordinator.clients.set(client.token, client);
+  const pendingWake = coordinator.pendingWake;
+  if (pendingWake) {
+    coordinator.pendingWake = null;
+    void client.sendWake(pendingWake.message, pendingWake.details).catch(() => {
+      if (client.active && coordinator.clients.get(client.token) === client) {
+        publishStatus(coordinator, "attention");
+      }
+    });
+  }
 
   const cleanupOnProcessExit = () => {
     for (const activeClient of coordinator.clients.values()) {
@@ -556,7 +552,6 @@ export default function (pi: ExtensionAPI) {
       failureHint: "",
     };
     coordinator.current = record;
-    coordinator.state = "running";
     publishStatus(coordinator, "watching");
     child.stdout?.on("data", (chunk: Buffer) => {
       captureOutput(record, "stdout", chunk);
@@ -598,12 +593,10 @@ export default function (pi: ExtensionAPI) {
       return Promise.resolve({ ok: false, message: "watcher: not started - Pi extension session shut down" });
     }
     coordinator.startCancelled = false;
-    coordinator.state = "starting";
     let startPromise: Promise<ArmResult>;
     startPromise = startArmOnce().finally(() => {
       if (coordinator.startPromise !== startPromise) return;
       coordinator.startPromise = null;
-      coordinator.state = coordinator.current ? "running" : "idle";
     });
     coordinator.startPromise = startPromise;
     return startPromise;
@@ -640,7 +633,7 @@ export default function (pi: ExtensionAPI) {
       try {
         if (pendingStart) await pendingStart.catch(() => undefined);
         if (coordinator.shutdownToken !== shutdownToken) return;
-        if (record) await stopArmRecord(coordinator, record, reason, "clear");
+        if (record) await stopArmRecord(coordinator, record, reason);
         if (coordinator.shutdownToken !== shutdownToken) return;
       } finally {
         if (coordinator.shutdownToken === shutdownToken) {
@@ -677,6 +670,24 @@ export default function (pi: ExtensionAPI) {
     const result = await runPretoolCheck(command);
     if (result.code !== 2) return {};
     return { block: true, reason: result.stderr.trim() || "denied by the watcher-arm PreToolUse seatbelt" };
+  });
+
+  pi.on("agent_settled", async () => {
+    if (guardFollowupActive) {
+      guardFollowupActive = false;
+      return;
+    }
+    const result = await runTurnendGuard();
+    if (result.code !== 2) return;
+    guardFollowupActive = true;
+    try {
+      await pi.sendUserMessage(
+        `TURN WOULD END BLIND - supervision is off. Resume supervision according to the session-start operating block before ending the turn.\n\n${result.stderr}`,
+        { deliverAs: "followUp" },
+      );
+    } catch {
+      guardFollowupActive = false;
+    }
   });
 
   pi.registerCommand?.("fm-watch-arm-pi", {

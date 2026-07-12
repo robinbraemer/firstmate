@@ -12,23 +12,30 @@ FM_ROOT="${FM_ROOT_OVERRIDE:-$(cd "$SCRIPT_DIR/.." && pwd)}"
 FM_HOME="${FM_HOME:-${FM_ROOT_OVERRIDE:-$FM_ROOT}}"
 STATE="${FM_STATE_OVERRIDE:-$FM_HOME/state}"
 LOCK="$STATE/.lock"
+CLAIM="$STATE/.lock.claim"
 mkdir -p "$STATE"
 
 # Known harness command names; extend when a new adapter is verified.
-HARNESS_RE='claude|codex|opencode|grok|^pi$'
+HARNESS_NAME_RE='^(claude|codex|opencode|grok|pi)$'
+HARNESS_ARG_RE='(^|[/ ])(claude|codex|opencode|grok|pi)([-/ ]|$)'
+
+harness_command() {
+  local comm=$1 args=$2
+  printf '%s' "$(basename "$comm")" | grep -qE "$HARNESS_NAME_RE" && return 0
+  case "$comm" in
+    *node*|*python*) printf '%s' "$args" | grep -qE "$HARNESS_ARG_RE" ;;
+    *) return 1 ;;
+  esac
+}
 
 harness_pid() {
   local pid=$$ comm args
   for _ in 1 2 3 4 5 6 7 8; do
     comm=$(ps -o comm= -p "$pid" 2>/dev/null) || return 1
     args=$(ps -o args= -p "$pid" 2>/dev/null)
-    if printf '%s' "$(basename "$comm")" | grep -qE "$HARNESS_RE"; then
+    if harness_command "$comm" "$args"; then
       echo "$pid"; return 0
     fi
-    # Bare interpreter (e.g. node): match the harness name in its script path.
-    case "$comm" in
-      *node*|*python*) printf '%s' "$args" | grep -qE "$HARNESS_RE" && { echo "$pid"; return 0; } ;;
-    esac
     pid=$(ps -o ppid= -p "$pid" 2>/dev/null | tr -d ' ')
     [ -n "$pid" ] && [ "$pid" -gt 1 ] || return 1
   done
@@ -36,10 +43,41 @@ harness_pid() {
 }
 
 holder_alive() {  # true if $1 is a live process that looks like a harness
-  local pid=$1 comm
+  local pid=$1 comm args
   kill -0 "$pid" 2>/dev/null || return 1
   comm=$(ps -o comm= -p "$pid" 2>/dev/null) || return 1
-  printf '%s' "$(basename "$comm") $(ps -o args= -p "$pid" 2>/dev/null)" | grep -qE "$HARNESS_RE"
+  args=$(ps -o args= -p "$pid" 2>/dev/null)
+  harness_command "$comm" "$args"
+}
+
+release_claim() {
+  rm -f "$CLAIM/pid"
+  rmdir "$CLAIM" 2>/dev/null || true
+}
+
+acquire_claim() {
+  local owner attempts=0
+  while ! mkdir "$CLAIM" 2>/dev/null; do
+    owner=$(cat "$CLAIM/pid" 2>/dev/null || true)
+    case "$owner" in
+      ''|*[!0-9]*)
+        attempts=$((attempts + 1))
+        [ "$attempts" -lt 5 ] || return 1
+        sleep 0.01
+        continue
+        ;;
+    esac
+    if kill -0 "$owner" 2>/dev/null; then
+      attempts=$((attempts + 1))
+      [ "$attempts" -lt 200 ] || return 1
+      sleep 0.01
+      continue
+    fi
+    rm -f "$CLAIM/pid"
+    rmdir "$CLAIM" 2>/dev/null || return 1
+  done
+  printf '%s\n' "$$" > "$CLAIM/pid"
+  trap release_claim EXIT
 }
 
 if [ "${1:-}" = "status" ]; then
@@ -50,6 +88,7 @@ if [ "${1:-}" = "status" ]; then
 fi
 
 me=$(harness_pid) || { echo "error: cannot locate harness process in ancestry" >&2; exit 1; }
+acquire_claim || { echo "error: another session lock claim is in progress; operate read-only until resolved" >&2; exit 1; }
 if [ -f "$LOCK" ]; then
   old=$(cat "$LOCK")
   if [ "$old" != "$me" ] && holder_alive "$old"; then

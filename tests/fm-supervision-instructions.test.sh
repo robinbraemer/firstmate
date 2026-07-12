@@ -131,6 +131,16 @@ test_pi_snippet_preserves_hostile_extension_path_as_one_argument() {
   pass "pi supervision snippet preserves hostile extension paths as one inert argument"
 }
 
+test_pi_snippet_preserves_ampersands_in_paths() {
+  local home hostile_root out
+  home="$TMP_ROOT/pi-ampersand-home"
+  hostile_root="$TMP_ROOT/pi&root"
+  mkdir -p "$home/state" "$home/config"
+  out=$(FM_HOME="$home" FM_ROOT_OVERRIDE="$hostile_root" "$RENDER" --harness pi)
+  assert_contains "$out" "$hostile_root/.pi/extensions/fm-primary-pi-watch.ts" "renderer corrupted an ampersand in the Pi extension path"
+  pass "pi supervision snippet preserves ampersands in paths"
+}
+
 test_selected_harness_block_only
 test_unknown_fallback
 test_conditional_stanzas
@@ -139,3 +149,4 @@ test_grok_is_background_notify
 test_grok_command_sources_effective_config
 test_pi_snippet_uses_effective_extension_path
 test_pi_snippet_preserves_hostile_extension_path_as_one_argument
+test_pi_snippet_preserves_ampersands_in_paths

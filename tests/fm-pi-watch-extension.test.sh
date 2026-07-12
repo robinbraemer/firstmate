@@ -375,6 +375,140 @@ EOF
   pass "Pi watcher lifecycle publishes status, delivers one structured wake, re-arms, and cleans up"
 }
 
+test_pi_extension_loads_for_fresh_home_in_primary_checkout() {
+  local repo home plugin out status
+  repo="$TMP_ROOT/pi-fresh-home-root"
+  home="$TMP_ROOT/pi-fresh-home"
+  mkdir -p "$repo/bin" "$repo/.pi/extensions" "$repo/node_modules/typebox"
+  install_pi_watch_extension_fixture "$repo"
+  rm -f "$repo/.fm-secondmate-home"
+  git init -q "$repo"
+  : > "$repo/AGENTS.md"
+  rm -rf "$home"
+  plugin="$repo/.pi/extensions/fm-primary-pi-watch.ts"
+  out=$(PLUGIN="$plugin" FM_HOME="$home" FM_ROOT_OVERRIDE="$repo" node --input-type=module 2>&1 <<'EOF'
+import { pathToFileURL } from "node:url";
+let tool = null;
+const pi = {
+  on() {},
+  registerCommand() {},
+  registerTool(candidate) { if (candidate.name === "fm_watch_arm_pi") tool = candidate; },
+  sendMessage() {},
+};
+const mod = await import(pathToFileURL(process.env.PLUGIN).href);
+mod.default(pi);
+if (!tool) throw new Error("fresh FM_HOME disabled the primary watcher extension");
+EOF
+)
+  status=$?
+  expect_code 0 "$status" "Pi extension must load for a fresh FM_HOME in the primary checkout"
+  [ -z "$out" ] || fail "Pi fresh-home test printed output: $out"
+  pass "Pi extension loads for a fresh FM_HOME in the primary checkout"
+}
+
+test_pi_reload_preserves_captured_actionable_wake() {
+  local repo home plugin ready out status
+  repo="$TMP_ROOT/pi-reload-wake-root"
+  home="$TMP_ROOT/pi-reload-wake-home"
+  ready="$TMP_ROOT/pi-reload-wake-ready"
+  mkdir -p "$repo/bin" "$home/state" "$home/config"
+  install_pi_watch_extension_fixture "$repo"
+  plugin="$repo/.pi/extensions/fm-primary-pi-watch.ts"
+  cat > "$repo/bin/fm-watch-arm.sh" <<'SH'
+#!/usr/bin/env bash
+trap 'exit 0' TERM
+printf 'signal: wake captured before reload\n'
+: > "$FM_READY_FILE"
+while :; do sleep 1; done
+SH
+  chmod +x "$repo/bin/fm-watch-arm.sh"
+  out=$(PLUGIN="$plugin" FM_HOME="$home" FM_ROOT_OVERRIDE="$repo" FM_READY_FILE="$ready" node --input-type=module 2>&1 <<'EOF'
+import { existsSync, writeFileSync } from "node:fs";
+import { pathToFileURL } from "node:url";
+
+function client(wakes) {
+  const handlers = new Map();
+  let tool;
+  return {
+    handlers,
+    get tool() { return tool; },
+    pi: {
+      on(event, handler) { handlers.set(event, handler); },
+      registerCommand() {},
+      registerTool(candidate) { if (candidate.name === "fm_watch_arm_pi") tool = candidate; },
+      sendMessage(message, options) { wakes.push({ message, options }); },
+    },
+  };
+}
+
+writeFileSync(`${process.env.FM_HOME}/state/.lock`, `${process.pid}\n`);
+const url = pathToFileURL(process.env.PLUGIN).href;
+const oldWakes = [];
+const oldClient = client(oldWakes);
+(await import(`${url}?old`)).default(oldClient.pi);
+await oldClient.tool.execute("arm", {}, undefined, undefined, {});
+for (let i = 0; i < 100 && !existsSync(process.env.FM_READY_FILE); i += 1) await new Promise((resolve) => setTimeout(resolve, 10));
+if (!existsSync(process.env.FM_READY_FILE)) throw new Error("arm did not capture actionable output");
+await new Promise((resolve) => setTimeout(resolve, 50));
+await oldClient.handlers.get("session_shutdown")?.({ reason: "reload" }, {});
+
+const newWakes = [];
+const newClient = client(newWakes);
+(await import(`${url}?new`)).default(newClient.pi);
+await newClient.handlers.get("session_start")?.({}, { ui: { setStatus() {} } });
+for (let i = 0; i < 100 && newWakes.length === 0; i += 1) await new Promise((resolve) => setTimeout(resolve, 10));
+if (newWakes.length !== 1 || newWakes[0].message.details?.kind !== "actionable") {
+  throw new Error(`reload lost captured wake: ${JSON.stringify(newWakes)}`);
+}
+if (!newWakes[0].message.content.includes("wake captured before reload")) throw new Error("wrong preserved wake");
+await newClient.handlers.get("session_shutdown")?.({ reason: "done" }, {});
+EOF
+)
+  status=$?
+  expect_code 0 "$status" "Pi reload must preserve an already-captured actionable wake"
+  [ -z "$out" ] || fail "Pi reload-wake test printed output: $out"
+  pass "Pi reload preserves an already-captured actionable wake"
+}
+
+test_pi_extension_has_blind_turn_backstop() {
+  local repo home plugin out status
+  repo="$TMP_ROOT/pi-turn-backstop-root"
+  home="$TMP_ROOT/pi-turn-backstop-home"
+  mkdir -p "$repo/bin" "$home/state" "$home/config"
+  install_pi_watch_extension_fixture "$repo"
+  plugin="$repo/.pi/extensions/fm-primary-pi-watch.ts"
+  cat > "$repo/bin/fm-turnend-guard.sh" <<'SH'
+#!/usr/bin/env bash
+printf 'blind supervision\n' >&2
+exit 2
+SH
+  chmod +x "$repo/bin/fm-turnend-guard.sh"
+  out=$(PLUGIN="$plugin" FM_HOME="$home" FM_ROOT_OVERRIDE="$repo" node --input-type=module 2>&1 <<'EOF'
+import { pathToFileURL } from "node:url";
+const handlers = new Map();
+const messages = [];
+const pi = {
+  on(event, handler) { handlers.set(event, handler); },
+  registerCommand() {},
+  registerTool() {},
+  sendMessage() {},
+  async sendUserMessage(message, options) { messages.push({ message, options }); },
+};
+(await import(pathToFileURL(process.env.PLUGIN).href)).default(pi);
+await handlers.get("agent_settled")?.({}, {});
+if (messages.length !== 1 || !messages[0].message.includes("TURN WOULD END BLIND")) {
+  throw new Error(`missing blind-turn backstop: ${JSON.stringify(messages)}`);
+}
+await handlers.get("agent_settled")?.({}, {});
+if (messages.length !== 1) throw new Error("blind-turn backstop looped");
+EOF
+)
+  status=$?
+  expect_code 0 "$status" "Pi watcher extension must structurally prevent a blind turn"
+  [ -z "$out" ] || fail "Pi blind-turn test printed output: $out"
+  pass "Pi watcher extension structurally prevents a blind turn"
+}
+
 test_opencode_primary_watch_plugin_static_wiring() {
   local plugin text
   plugin="$ROOT/.opencode/plugins/fm-primary-watch-arm.js"
@@ -802,6 +936,9 @@ test_pi_tool_returns_agent_tool_result
 test_pi_process_exit_cleanup_listener_lifecycle
 test_pi_process_exit_cleanup_stops_arm_child
 test_pi_watcher_lifecycle_and_status_contract
+test_pi_extension_loads_for_fresh_home_in_primary_checkout
+test_pi_reload_preserves_captured_actionable_wake
+test_pi_extension_has_blind_turn_backstop
 test_opencode_primary_watch_plugin_static_wiring
 test_opencode_primary_watch_plugin_uses_effective_state_home
 test_opencode_primary_watch_plugin_sources_effective_config

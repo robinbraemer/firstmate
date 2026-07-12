@@ -9,8 +9,8 @@ if [ -z "$TSC_BIN" ]; then
   TSC_BIN=$(command -v tsc 2>/dev/null || true)
 fi
 if [ -z "$TSC_BIN" ] || [ ! -x "$TSC_BIN" ]; then
-  echo "not ok - tsc is required for the Pi extension type contract; install it or set FM_TSC_BIN" >&2
-  exit 1
+  echo "skip: tsc is unavailable; CI enforces the pinned Pi type contract"
+  exit 0
 fi
 
 resolve_pi_package() {
@@ -55,9 +55,14 @@ find_node_module() {  # <start-dir> <module-path>
 }
 
 PI_PACKAGE_DIR=$(resolve_pi_package) || {
-  echo "not ok - installed @earendil-works/pi-coding-agent package not found" >&2
-  exit 1
+  echo "skip: @earendil-works/pi-coding-agent is unavailable; CI enforces the pinned Pi type contract"
+  exit 0
 }
+version=$(jq -r '.version' "$PI_PACKAGE_DIR/package.json" 2>/dev/null || printf 'unknown')
+if [ "$version" != 0.80.6 ]; then
+  echo "not ok - Pi 0.80.6 is required for the extension type contract; found $version" >&2
+  exit 1
+fi
 TYPEBOX_DIR=$(find_node_module "$PI_PACKAGE_DIR" typebox) || {
   echo "not ok - typebox declarations were not found from $PI_PACKAGE_DIR" >&2
   exit 1
@@ -101,5 +106,4 @@ JSON
 if ! "$TSC_BIN" -p "$TMP_ROOT/tsconfig.json"; then
   exit 1
 fi
-version=$(jq -r '.version' "$PI_PACKAGE_DIR/package.json" 2>/dev/null || printf 'unknown')
 printf 'ok - Pi primary watcher extension passes strict no-emit typecheck against Pi %s\n' "$version"
