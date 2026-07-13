@@ -717,6 +717,61 @@ EOF
   pass "Pi shutdown cancels cadence restart during cleanup"
 }
 
+test_pi_spawned_restart_yields_to_away_mode() {
+  local repo home plugin arm_log bash_env out status
+  repo="$TMP_ROOT/pi-spawn-away-root"
+  home="$TMP_ROOT/pi-spawn-away-home"
+  arm_log="$TMP_ROOT/pi-spawn-away-arm"
+  bash_env="$TMP_ROOT/pi-spawn-away-env"
+  mkdir -p "$repo/bin" "$home/state" "$home/config"
+  install_pi_watch_extension_fixture "$repo"
+  plugin="$repo/.pi/extensions/fm-primary-pi-watch.ts"
+  cat > "$repo/bin/fm-watch-arm.sh" <<'SH'
+#!/usr/bin/env bash
+printf 'started\n' >> "$FM_ARM_LOG"
+trap 'exit 0' TERM
+while :; do sleep 1; done
+SH
+  cat > "$bash_env" <<'SH'
+#!/usr/bin/env bash
+printf 'away\n' > "$FM_HOME/state/.afk"
+SH
+  chmod +x "$repo/bin/fm-watch-arm.sh"
+  out=$(PLUGIN="$plugin" FM_HOME="$home" FM_ROOT_OVERRIDE="$repo" FM_ARM_LOG="$arm_log" \
+    BASH_ENV="$bash_env" node --input-type=module 2>&1 <<'EOF'
+import { existsSync, writeFileSync } from "node:fs";
+import { pathToFileURL } from "node:url";
+
+const handlers = new Map();
+const statuses = [];
+const wakes = [];
+const pi = {
+  on(event, handler) { handlers.set(event, handler); },
+  registerCommand() {},
+  registerTool() {},
+  sendMessage(message, options) { wakes.push({ message, options }); },
+};
+writeFileSync(`${process.env.FM_HOME}/state/.lock`, `${process.pid}\n`);
+const mod = await import(pathToFileURL(process.env.PLUGIN).href);
+mod.default(pi);
+await handlers.get("session_start")?.({}, { ui: { setStatus(_key, text) { statuses.push(text); } } });
+for (let i = 0; i < 100 && !existsSync(`${process.env.FM_HOME}/state/.afk`); i += 1) {
+  await new Promise((resolve) => setTimeout(resolve, 10));
+}
+await new Promise((resolve) => setTimeout(resolve, 100));
+if (!existsSync(`${process.env.FM_HOME}/state/.afk`)) throw new Error("spawned launcher did not enter away mode");
+if (existsSync(process.env.FM_ARM_LOG)) throw new Error("spawned launcher started a Pi-owned watcher during away mode");
+if (wakes.length !== 0) throw new Error(`intentional away suspension emitted a wake: ${JSON.stringify(wakes)}`);
+if (statuses.at(-1) !== "offline") throw new Error(`away suspension status: ${statuses}`);
+await handlers.get("session_shutdown")?.({ reason: "done" }, {});
+EOF
+)
+  status=$?
+  expect_code 0 "$status" "Pi spawned restart must yield to away-mode ownership"
+  [ -z "$out" ] || fail "Pi spawned away-mode restart test printed output: $out"
+  pass "Pi spawned restart yields to away-mode ownership"
+}
+
 test_pi_cleanup_failure_does_not_reuse_settled_arm() {
   local repo home plugin starts out status
   repo="$TMP_ROOT/pi-cleanup-failure-root"
@@ -1053,6 +1108,154 @@ EOF
   expect_code 0 "$status" "Pi settled-wake delivery failure must retry automatically"
   [ -z "$out" ] || fail "Pi settled-wake automatic retry test printed output: $out"
   pass "Pi settled-wake delivery failure retries automatically"
+}
+
+test_pi_settled_failure_delivery_survives_reload() {
+  local repo home plugin starts first_exit out status
+  repo="$TMP_ROOT/pi-failure-reload-root"
+  home="$TMP_ROOT/pi-failure-reload-home"
+  starts="$TMP_ROOT/pi-failure-reload-starts"
+  first_exit="$TMP_ROOT/pi-failure-reload-first-exit"
+  mkdir -p "$repo/bin" "$home/state" "$home/config"
+  install_pi_watch_extension_fixture "$repo"
+  plugin="$repo/.pi/extensions/fm-primary-pi-watch.ts"
+  cat > "$repo/bin/fm-watch-arm.sh" <<'SH'
+#!/usr/bin/env bash
+printf 'start\n' >> "$FM_START_LOG"
+if [ ! -e "$FM_FIRST_EXIT_FILE" ]; then
+  : > "$FM_FIRST_EXIT_FILE"
+  exit 23
+fi
+trap 'exit 0' TERM
+while :; do sleep 1; done
+SH
+  chmod +x "$repo/bin/fm-watch-arm.sh"
+  out=$(PLUGIN="$plugin" FM_HOME="$home" FM_ROOT_OVERRIDE="$repo" FM_START_LOG="$starts" \
+    FM_FIRST_EXIT_FILE="$first_exit" node --input-type=module 2>&1 <<'EOF'
+import { existsSync, readFileSync, writeFileSync } from "node:fs";
+import { pathToFileURL } from "node:url";
+
+function client(wakes, rejectDelivery = false) {
+  const handlers = new Map();
+  let attempts = 0;
+  return {
+    handlers,
+    get attempts() { return attempts; },
+    pi: {
+      on(event, handler) { handlers.set(event, handler); },
+      registerCommand() {},
+      registerTool() {},
+      sendMessage(message, options) {
+        attempts += 1;
+        if (rejectDelivery) throw new Error("synthetic failure-wake delivery rejection");
+        wakes.push({ message, options });
+      },
+    },
+  };
+}
+const lines = (path) => existsSync(path) ? readFileSync(path, "utf8").trim().split("\n").filter(Boolean) : [];
+const waitFor = async (predicate, message) => {
+  for (let i = 0; i < 150 && !predicate(); i += 1) await new Promise((resolve) => setTimeout(resolve, 10));
+  if (!predicate()) throw new Error(message);
+};
+
+writeFileSync(`${process.env.FM_HOME}/state/.lock`, `${process.pid}\n`);
+const url = pathToFileURL(process.env.PLUGIN).href;
+const oldClient = client([], true);
+(await import(`${url}?failure-old`)).default(oldClient.pi);
+await oldClient.handlers.get("session_start")?.({}, { ui: { setStatus() {} } });
+await waitFor(() => oldClient.attempts === 1, "settled failure delivery was not attempted");
+await oldClient.handlers.get("session_shutdown")?.({ reason: "reload" }, {});
+
+const wakes = [];
+const newClient = client(wakes);
+(await import(`${url}?failure-new`)).default(newClient.pi);
+await newClient.handlers.get("session_start")?.({}, { ui: { setStatus() {} } });
+await waitFor(() => wakes.length === 1, "reload lost the rejected failure wake");
+await waitFor(() => lines(process.env.FM_START_LOG).length === 2, "reload did not start a replacement arm");
+if (wakes[0].message.details?.kind !== "failure") throw new Error(`wrong retained wake kind: ${JSON.stringify(wakes[0])}`);
+if (!wakes[0].message.content.includes("exited 23")) throw new Error("wrong retained failure wake");
+await newClient.handlers.get("session_shutdown")?.({ reason: "done" }, {});
+EOF
+)
+  status=$?
+  expect_code 0 "$status" "Pi rejected failure wake must survive extension reload"
+  [ -z "$out" ] || fail "Pi failure-wake reload test printed output: $out"
+  pass "Pi rejected failure wake survives extension reload"
+}
+
+test_pi_rearm_failure_does_not_redeliver_wake() {
+  local repo home plugin starts first_exit out status
+  repo="$TMP_ROOT/pi-rearm-failure-root"
+  home="$TMP_ROOT/pi-rearm-failure-home"
+  starts="$TMP_ROOT/pi-rearm-failure-starts"
+  first_exit="$TMP_ROOT/pi-rearm-failure-first-exit"
+  mkdir -p "$repo/bin" "$home/state" "$home/config"
+  install_pi_watch_extension_fixture "$repo"
+  plugin="$repo/.pi/extensions/fm-primary-pi-watch.ts"
+  cat > "$repo/bin/fm-watch-arm.sh" <<'SH'
+#!/usr/bin/env bash
+printf 'start\n' >> "$FM_START_LOG"
+if [ ! -e "$FM_FIRST_EXIT_FILE" ]; then
+  : > "$FM_FIRST_EXIT_FILE"
+  printf 'signal: delivered before rearm failure\n'
+  exit 0
+fi
+trap 'exit 0' TERM
+while :; do sleep 1; done
+SH
+  chmod +x "$repo/bin/fm-watch-arm.sh"
+  out=$(PLUGIN="$plugin" FM_HOME="$home" FM_ROOT_OVERRIDE="$repo" FM_START_LOG="$starts" \
+    FM_FIRST_EXIT_FILE="$first_exit" node --input-type=module 2>&1 <<'EOF'
+import { existsSync, readFileSync, writeFileSync } from "node:fs";
+import { pathToFileURL } from "node:url";
+
+const handlers = new Map();
+const statuses = [];
+const wakes = [];
+let tool;
+const pi = {
+  on(event, handler) { handlers.set(event, handler); },
+  registerCommand() {},
+  registerTool(candidate) { if (candidate.name === "fm_watch_arm_pi") tool = candidate; },
+  sendMessage(message, options) { wakes.push({ message, options }); },
+};
+const lines = (path) => existsSync(path) ? readFileSync(path, "utf8").trim().split("\n").filter(Boolean) : [];
+const waitFor = async (predicate, message) => {
+  for (let i = 0; i < 150 && !predicate(); i += 1) await new Promise((resolve) => setTimeout(resolve, 10));
+  if (!predicate()) throw new Error(message);
+};
+
+writeFileSync(`${process.env.FM_HOME}/state/.lock`, `${process.pid}\n`);
+const mod = await import(pathToFileURL(process.env.PLUGIN).href);
+mod.default(pi);
+const coordinator = [...globalThis.__firstmatePiWatchCoordinators.values()][0];
+const client = [...coordinator.clients.values()][0];
+const originalRearm = client.rearm;
+let rearmAttempts = 0;
+client.rearm = async () => {
+  rearmAttempts += 1;
+  throw new Error("synthetic rearm rejection");
+};
+await handlers.get("session_start")?.({}, { ui: { setStatus(_key, text) { statuses.push(text); } } });
+await waitFor(() => wakes.length === 1, "actionable wake was not delivered");
+await waitFor(() => rearmAttempts === 1, `rearm rejection was not observed: ${rearmAttempts}`);
+await new Promise((resolve) => setTimeout(resolve, 50));
+if (rearmAttempts !== 1) throw new Error(`rearm rejection triggered another rearm: ${rearmAttempts}`);
+if (statuses.at(-1) !== "attention") throw new Error(`rearm rejection status: ${statuses}`);
+
+client.rearm = originalRearm;
+const result = await tool.execute("recover", {}, undefined, undefined, {});
+if (result.details?.ok !== true) throw new Error(`manual recovery failed: ${JSON.stringify(result)}`);
+await waitFor(() => lines(process.env.FM_START_LOG).length === 2, "manual recovery did not start a replacement arm");
+if (wakes.length !== 1) throw new Error(`already-delivered wake was queued again: ${JSON.stringify(wakes)}`);
+await handlers.get("session_shutdown")?.({ reason: "done" }, {});
+EOF
+)
+  status=$?
+  expect_code 0 "$status" "Pi rearm rejection must not requeue an already-delivered wake"
+  [ -z "$out" ] || fail "Pi rearm rejection test printed output: $out"
+  pass "Pi rearm rejection does not redeliver a wake"
 }
 
 test_pi_reload_defers_pending_wake_during_away_mode() {
@@ -1572,10 +1775,13 @@ test_pi_watcher_defers_settled_wake_during_away_mode
 test_pi_watcher_defers_settled_failure_during_away_mode
 test_pi_watcher_restarts_only_for_effective_cadence_changes
 test_pi_shutdown_cancels_cadence_restart_during_cleanup
+test_pi_spawned_restart_yields_to_away_mode
 test_pi_extension_loads_for_fresh_home_in_primary_checkout
 test_pi_reload_preserves_captured_actionable_wake
 test_pi_pending_wake_delivery_failure_retries
 test_pi_settled_wake_delivery_failure_retries_automatically
+test_pi_settled_failure_delivery_survives_reload
+test_pi_rearm_failure_does_not_redeliver_wake
 test_pi_reload_defers_pending_wake_during_away_mode
 test_pi_live_process_scan_does_not_match_itself
 test_opencode_primary_watch_plugin_static_wiring

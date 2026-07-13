@@ -101,6 +101,7 @@ const WATCHER_STATUS_TEXT: Record<WatcherStatus, WatcherStatus> = {
 const requestedStopGrace = Number(process.env.FM_PI_WATCH_STOP_GRACE_MS ?? "1000");
 const STOP_GRACE_MS = Number.isFinite(requestedStopGrace) && requestedStopGrace >= 0 ? requestedStopGrace : 1000;
 const STOP_KILL_GRACE_MS = 500;
+const AWAY_SUSPENSION_LINE = "watcher: suspended - away mode owns supervision";
 const coordinatorHost = globalThis as CoordinatorHost;
 const coordinators = coordinatorHost.__firstmatePiWatchCoordinators ??= new Map<string, ArmCoordinator>();
 
@@ -271,6 +272,20 @@ function inspectOutputLine(record: ArmRecord, line: string): void {
   if (!record.failureHint && (/^watcher: healthy\b/.test(boundedLine) || /^watcher: FAILED/.test(boundedLine))) {
     record.failureHint = boundedLine;
   }
+  if (boundedLine === AWAY_SUSPENSION_LINE && !record.intentionalStopReason) {
+    record.intentionalStopReason = "away-mode";
+  }
+}
+
+function clientOwnsGeneration(
+  coordinator: ArmCoordinator,
+  client: StatusClient,
+  generation: number,
+): boolean {
+  return coordinator.generation === generation
+    && !coordinator.shuttingDown
+    && client.active
+    && coordinator.clients.get(client.token) === client;
 }
 
 function captureOutput(record: ArmRecord, stream: "stdout" | "stderr", chunk: Buffer): void {
@@ -339,37 +354,33 @@ function settleArm(
     coordinator.pendingWake = { message, details };
     return;
   }
+  if (ownsGeneration && record.intentionalStopReason === "away-mode") {
+    publishStatus(coordinator, "offline");
+  }
   if (!ownsGeneration || coordinator.shuttingDown || record.intentionalStopReason) return;
   if (kind === "failure") publishStatus(coordinator, "attention");
   const activeClient = [...coordinator.clients.values()].reverse().find((candidate) => candidate.active);
   if (!activeClient) return;
-  void activeClient.sendWake(message, details).then(async () => {
-    if (
-      kind === "actionable" &&
-      coordinator.generation === record.generation &&
-      !coordinator.shuttingDown &&
-      activeClient.active &&
-      coordinator.clients.get(activeClient.token) === activeClient
-    ) {
-      publishStatus(coordinator, "handling wake");
-      await activeClient.rearm();
-    }
-  }).catch(() => {
-    if (
-      coordinator.generation === record.generation &&
-      !coordinator.shuttingDown &&
-      activeClient.active &&
-      coordinator.clients.get(activeClient.token) === activeClient
-    ) {
-      if (kind === "actionable") {
-        coordinator.pendingWake = { message, details };
-      }
+  void (async () => {
+    try {
+      await activeClient.sendWake(message, details);
+    } catch {
+      if (!clientOwnsGeneration(coordinator, activeClient, record.generation)) return;
+      coordinator.pendingWake = { message, details };
       publishStatus(coordinator, "attention");
       if (kind === "actionable") {
         void activeClient.rearm().catch(() => undefined);
       }
+      return;
     }
-  });
+    if (kind !== "actionable" || !clientOwnsGeneration(coordinator, activeClient, record.generation)) return;
+    publishStatus(coordinator, "handling wake");
+    void activeClient.rearm().catch(() => {
+      if (clientOwnsGeneration(coordinator, activeClient, record.generation)) {
+        publishStatus(coordinator, "attention");
+      }
+    });
+  })();
 }
 
 function signalArm(record: ArmRecord, signal: NodeJS.Signals): void {
@@ -578,10 +589,14 @@ export default function (pi: ExtensionAPI) {
       ...process.env,
       FM_HOME: fmHome,
       FM_ROOT_OVERRIDE: fmRoot,
+      FM_STATE_OVERRIDE: state,
       FM_CONFIG_OVERRIDE: config,
       FM_WATCH_ARM_SCRIPT: armScript,
     };
-    const child = spawn("bash", ["-lc", "config_dir=\"${FM_CONFIG_OVERRIDE:-$FM_HOME/config}\"; [ -f \"$config_dir/x-mode.env\" ] && . \"$config_dir/x-mode.env\"; exec \"$FM_WATCH_ARM_SCRIPT\" --restart"], {
+    const launchCommand = "state_dir=\"${FM_STATE_OVERRIDE:-$FM_HOME/state}\"; if [ -f \"$state_dir/.afk\" ]; then printf '%s\\n' '"
+      + AWAY_SUSPENSION_LINE
+      + "'; exit 0; fi; config_dir=\"${FM_CONFIG_OVERRIDE:-$FM_HOME/config}\"; [ -f \"$config_dir/x-mode.env\" ] && . \"$config_dir/x-mode.env\"; exec \"$FM_WATCH_ARM_SCRIPT\" --restart";
+    const child = spawn("bash", ["-lc", launchCommand], {
       cwd: fmRoot,
       env,
       detached: true,
