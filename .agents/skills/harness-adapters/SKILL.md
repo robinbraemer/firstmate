@@ -150,12 +150,11 @@ Directory trust dialog on first run per repo root: "Do you trust the contents of
 Accept with Enter.
 The decision persists for the repo, so later worktrees of the same project skip it.
 
-Resume after exit with `codex resume <session-id>`.
+Resume after exit with `env -u CODEX_HOME codex resume <session-id>`.
 The session id is printed on quit.
 
-Every Firstmate-launched Codex crewmate, scout, and secondmate must preserve `HOME=/Users/robin` and explicitly unset ambient `CODEX_HOME` at the Codex process boundary.
-Apply the same canonical auth boundary to Codex launch, resume, and recovery work, and never request an Orca login.
-Pi Quota Router credentials are separate and Pi-only.
+Every Firstmate-launched Codex crewmate, scout, and secondmate must preserve the invoking user's existing `HOME` and explicitly unset ambient `CODEX_HOME` at the Codex process boundary.
+The same boundary applies to Codex launch, resume, and recovery work.
 
 **Primary-session guard fact (verified 2026-07-08, codex-cli 0.142.1).**
 The firstmate PRIMARY's own `.codex/hooks.json` registers a Stop hook that pipes Codex's Stop payload to `bin/fm-turnend-guard.sh`.
