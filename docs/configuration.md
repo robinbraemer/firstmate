@@ -160,7 +160,6 @@ The primary propagates `config/crew-dispatch.json`, `config/crew-harness`, and `
 `config/secondmate-harness` is not inherited because secondmates do not launch secondmates.
 For grok, `fm-spawn.sh` installs one firstmate-owned global turn-end hook under `$GROK_HOME/hooks/`, or `~/.grok/hooks/` when `GROK_HOME` is unset, and drops a per-task `.fm-grok-turnend` pointer in the worktree, with teardown removing the task token and pointer.
 For Pi secondmate launches, `fm-spawn.sh` uses one-run `--approve` plus `-e` pointed at the secondmate home's tracked `.pi/extensions/fm-primary-pi-watch.ts`.
-`FM_PI_WATCH_STOP_GRACE_MS` controls the extension's process-group TERM grace during reload or shutdown and defaults to 1000 milliseconds before bounded KILL escalation.
 
 ## Crew dispatch profiles (config/crew-dispatch.json)
 
@@ -322,7 +321,7 @@ FM_STATE_OVERRIDE=       # alternate state dir, mainly for tests
 FM_DATA_OVERRIDE=        # alternate data dir, mainly for tests
 FM_PROJECTS_OVERRIDE=    # alternate projects dir, mainly for tests
 FM_CONFIG_OVERRIDE=      # alternate config dir, mainly for tests
-FM_PI_WATCH_STOP_GRACE_MS=1000  # Pi watcher-owned process-group TERM grace in milliseconds
+FM_PI_WATCH_STOP_GRACE_MS=1000  # Pi extension arm process-group TERM grace for away suspension, cadence replacement, reload, and shutdown
 FM_BACKEND=             # optional runtime backend override for new spawns; tmux/herdr/zellij/orca/cmux support ship/scout spawns, codex-app is not accepted
 HERDR_SESSION=default  # herdr-only: named session for normal backend ops; not enough for destructive cleanup (docs/herdr-backend.md)
 FM_BACKEND_HERDR_COMPOSER_LINES=20  # herdr-only: tail lines scanned by composer-state guard/fallback paths; idle-baseline submit confirmation uses agent-state

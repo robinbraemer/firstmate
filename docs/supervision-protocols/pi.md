@@ -8,14 +8,16 @@ When this session owns supervision and away mode is not active:
    Replace the Pi process from outside its composer; never submit a Pi launch command as a Pi prompt or start a nested Pi through its own Bash tool.
 5. Bare `-e` does not suppress Pi's project-trust dialog.
 6. The extension automatically arms supervision from Pi's bound `session_start` lifecycle.
-   While `state/.afk` exists, lifecycle reconciliation stops the extension-owned arm, retains pending wakes without native follow-up delivery, keeps its status offline, and resumes normal arming after the flag clears.
+   While `state/.afk` exists, lifecycle reconciliation stops the extension-owned arm, retains actionable wakes and failures not caused by that intentional stop without native follow-up delivery, and keeps its status offline.
+   After the flag clears, the next lifecycle reconciliation delivers the retained wake before resuming normal arming.
    Use `fm_watch_arm_pi` or the human-entered `/fm-watch-arm-pi` command only as an idempotent recovery fallback.
    Never run `bin/fm-watch-arm.sh` through Pi's bash tool because that foreground arm can wedge the agent and bypass extension-owned cleanup.
 7. The extension starts `bin/fm-watch-arm.sh --restart` as an owned detached process group and sends an actionable exit through Pi's custom `firstmate-watcher-wake` message with follow-up delivery and turn triggering.
    The wake is a structured custom background event rather than a user-role message.
    Once Pi accepts that native custom wake, the extension immediately starts the next arm cycle without waiting for model action or a turn-end callback.
 8. One process-wide coordinator per effective `FM_HOME` owns the current arm generation.
-   Duplicate factories share that coordinator, stale generation callbacks cannot clear a replacement, output capture stays bounded, and every unexpected terminal outcome delivers exactly once.
+   Duplicate factories share that coordinator, stale generation callbacks cannot clear a replacement, output capture stays bounded, and every unexpected terminal outcome records one wake for delivery.
+   A failed native submission stays pending and is retried before the next arm, so it is cleared only after one successful delivery.
    Intentional session shutdown suppresses false wakes, terminates the whole arm/watcher process group with bounded TERM-to-KILL escalation, and waits for cleanup before reload or quit completes.
    The Pi footer status key `firstmate-pi-watcher` reads `offline` before startup, `watching` while the current arm owns supervision, `handling wake` after an actionable custom wake is accepted, and `attention` when ownership, startup, delivery, or an unexpected arm exit fails.
    Here, `handling wake` means Pi synchronously accepted the extension's structured custom-message submission; it does not confirm that the requested follow-up turn started.
