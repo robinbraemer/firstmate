@@ -331,7 +331,7 @@ function settleArm(
     stdoutTruncated: record.stdoutTruncated,
     stderrTruncated: record.stderrTruncated,
   };
-  if (record.intentionalStopReason && kind === "actionable") {
+  if (kind === "actionable" && (record.intentionalStopReason || existsSync(`${state}/.afk`))) {
     coordinator.pendingWake = { message, details };
     return;
   }

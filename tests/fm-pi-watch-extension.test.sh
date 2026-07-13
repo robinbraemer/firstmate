@@ -446,6 +446,69 @@ EOF
   pass "Pi watcher lifecycle yields to away mode and resumes after exit"
 }
 
+test_pi_watcher_defers_settled_wake_during_away_mode() {
+  local repo home plugin starts wake out status
+  repo="$TMP_ROOT/pi-away-settle-root"
+  home="$TMP_ROOT/pi-away-settle-home"
+  starts="$TMP_ROOT/pi-away-settle-starts"
+  wake="$TMP_ROOT/pi-away-settle-wake"
+  mkdir -p "$repo/bin" "$home/state" "$home/config"
+  install_pi_watch_extension_fixture "$repo"
+  plugin="$repo/.pi/extensions/fm-primary-pi-watch.ts"
+  cat > "$repo/bin/fm-watch-arm.sh" <<'SH'
+#!/usr/bin/env bash
+printf 'start\n' >> "$FM_START_LOG"
+trap 'exit 0' TERM
+while [ ! -e "$FM_WAKE_FILE" ]; do sleep 0.02; done
+rm -f "$FM_WAKE_FILE"
+printf 'signal: wake settled during away mode\n'
+SH
+  chmod +x "$repo/bin/fm-watch-arm.sh"
+  out=$(PLUGIN="$plugin" FM_HOME="$home" FM_ROOT_OVERRIDE="$repo" FM_START_LOG="$starts" \
+    FM_WAKE_FILE="$wake" node --input-type=module 2>&1 <<'EOF'
+import { existsSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { pathToFileURL } from "node:url";
+
+const handlers = new Map();
+const wakes = [];
+const pi = {
+  on(event, handler) { handlers.set(event, handler); },
+  registerCommand() {},
+  registerTool() {},
+  sendMessage(message, options) { wakes.push({ message, options }); },
+};
+const lines = (path) => existsSync(path) ? readFileSync(path, "utf8").trim().split("\n").filter(Boolean) : [];
+const waitFor = async (predicate, message) => {
+  for (let i = 0; i < 150 && !predicate(); i += 1) await new Promise((resolve) => setTimeout(resolve, 10));
+  if (!predicate()) throw new Error(message);
+};
+
+writeFileSync(`${process.env.FM_HOME}/state/.lock`, `${process.pid}\n`);
+const mod = await import(pathToFileURL(process.env.PLUGIN).href);
+mod.default(pi);
+await handlers.get("session_start")?.({}, { ui: { setStatus() {} } });
+await waitFor(() => lines(process.env.FM_START_LOG).length === 1, "initial arm did not start");
+
+writeFileSync(`${process.env.FM_HOME}/state/.afk`, "away\n");
+writeFileSync(process.env.FM_WAKE_FILE, "wake\n");
+await new Promise((resolve) => setTimeout(resolve, 100));
+if (wakes.length !== 0) throw new Error(`settled wake bypassed away mode: ${JSON.stringify(wakes)}`);
+if (lines(process.env.FM_START_LOG).length !== 1) throw new Error("settled wake rearmed during away mode");
+
+rmSync(`${process.env.FM_HOME}/state/.afk`);
+await handlers.get("tool_execution_end")?.({ type: "tool_execution_end", toolName: "bash" }, {});
+await waitFor(() => wakes.length === 1, "post-away reconciliation did not deliver the settled wake");
+await waitFor(() => lines(process.env.FM_START_LOG).length === 2, "post-away reconciliation did not start a replacement arm");
+if (!wakes[0].message.content.includes("wake settled during away mode")) throw new Error("wrong deferred settled wake");
+await handlers.get("session_shutdown")?.({ reason: "done" }, {});
+EOF
+)
+  status=$?
+  expect_code 0 "$status" "Pi arm settlement must defer actionable wakes during away mode"
+  [ -z "$out" ] || fail "Pi away-mode settlement test printed output: $out"
+  pass "Pi arm settlement defers actionable wakes during away mode"
+}
+
 test_pi_watcher_restarts_only_for_effective_cadence_changes() {
   local repo home plugin starts cleaned out status
   repo="$TMP_ROOT/pi-cadence-root"
@@ -1372,6 +1435,7 @@ test_pi_process_exit_cleanup_stops_arm_child
 test_pi_watcher_lifecycle_and_status_contract
 test_pi_cleanup_failure_does_not_reuse_settled_arm
 test_pi_watcher_yields_to_away_mode_lifecycle
+test_pi_watcher_defers_settled_wake_during_away_mode
 test_pi_watcher_restarts_only_for_effective_cadence_changes
 test_pi_shutdown_cancels_cadence_restart_during_cleanup
 test_pi_extension_loads_for_fresh_home_in_primary_checkout
