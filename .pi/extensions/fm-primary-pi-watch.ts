@@ -331,7 +331,7 @@ function settleArm(
     stdoutTruncated: record.stdoutTruncated,
     stderrTruncated: record.stderrTruncated,
   };
-  if (kind === "actionable" && (record.intentionalStopReason || existsSync(`${state}/.afk`))) {
+  if (existsSync(`${state}/.afk`) || (kind === "actionable" && record.intentionalStopReason)) {
     coordinator.pendingWake = { message, details };
     return;
   }
@@ -357,7 +357,13 @@ function settleArm(
       activeClient.active &&
       coordinator.clients.get(activeClient.token) === activeClient
     ) {
+      if (kind === "actionable") {
+        coordinator.pendingWake = { message, details };
+      }
       publishStatus(coordinator, "attention");
+      if (kind === "actionable") {
+        void activeClient.rearm().catch(() => undefined);
+      }
     }
   });
 }
