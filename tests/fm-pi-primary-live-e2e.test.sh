@@ -43,6 +43,44 @@ validated_pane_identity() {
   printf '%s\n' "$candidate"
 }
 
+wait_for_pi_pane_identity() {
+  local tmux=$1 socket=$2 session=$3 pid=$4 initial=$5 attempts=${6:-100}
+  local initial_prefix candidate candidate_prefix candidate_command i=0
+  initial_prefix=$(printf '%s\n' "$initial" | awk '
+    NF >= 9 {
+      prefix = $1
+      for (field = 2; field <= 8; field += 1) prefix = prefix " " $field
+      print prefix
+    }
+  ')
+  [ -n "$initial_prefix" ] || return 1
+  while [ "$i" -lt "$attempts" ]; do
+    candidate=$(validated_pane_identity "$tmux" "$socket" "$session" "$pid") || return 1
+    candidate_prefix=$(printf '%s\n' "$candidate" | awk '
+      NF >= 9 {
+        prefix = $1
+        for (field = 2; field <= 8; field += 1) prefix = prefix " " $field
+        print prefix
+      }
+    ')
+    [ "$candidate_prefix" = "$initial_prefix" ] || return 1
+    candidate_command=$(printf '%s\n' "$candidate" | awk '
+      NF >= 9 {
+        command = $9
+        for (field = 10; field <= NF; field += 1) command = command " " $field
+        print command
+      }
+    ')
+    if [ "$candidate_command" = pi ]; then
+      printf '%s\n' "$candidate"
+      return 0
+    fi
+    sleep 0.05
+    i=$((i + 1))
+  done
+  return 1
+}
+
 tracked_processes() {
   printf '%s\n' "$1" | awk '
     NF >= 11 {
@@ -224,13 +262,76 @@ EOF
     printf 'not ok - Pi live cleanup returned the wrong validated identity\n' >&2
     exit 1
   fi
+  identity_count="$scan_lab/identity-count"
+  cat > "$scan_lab/identity-bin/ps" <<EOF
+#!/bin/sh
+count=0
+[ ! -f "$identity_count" ] || count=\$(cat "$identity_count")
+count=\$((count + 1))
+printf '%s\n' "\$count" > "$identity_count"
+if [ "\$count" -le 2 ]; then
+  printf '%s\n' '1 2 3 Mon Jul 13 12:00:00 2026 env PI_CODING_AGENT_DIR=/tmp pi'
+else
+  printf '%s\n' '1 2 3 Mon Jul 13 12:00:00 2026 pi'
+fi
+EOF
+  cat > "$scan_lab/identity-bin/tmux" <<EOF
+#!/bin/sh
+count=\$(cat "$identity_count")
+if [ "\$count" -gt 3 ]; then
+  printf '1 %s\n' "$scan_pid_root"
+else
+  printf '0 %s\n' "$scan_pid_root"
+fi
+EOF
+  chmod +x "$scan_lab/identity-bin/ps" "$scan_lab/identity-bin/tmux"
+  transient_identity=$(PATH="$scan_lab/identity-bin:$PATH" validated_pane_identity \
+    "$scan_lab/identity-bin/tmux" scan-socket scan-session "$scan_pid_root") || {
+    printf 'not ok - Pi live cleanup rejected the transient launch identity\n' >&2
+    exit 1
+  }
+  case "$transient_identity" in
+    *' env PI_CODING_AGENT_DIR=/tmp pi') ;;
+    *)
+      printf 'not ok - Pi live cleanup did not observe the transient launch identity\n' >&2
+      exit 1
+      ;;
+  esac
+  stable_identity=$(PATH="$scan_lab/identity-bin:$PATH" wait_for_pi_pane_identity \
+    "$scan_lab/identity-bin/tmux" scan-socket scan-session "$scan_pid_root" "$transient_identity" 3) || {
+    printf 'not ok - Pi live cleanup did not capture the first validated post-exec Pi identity\n' >&2
+    exit 1
+  }
+  if [ "$stable_identity" != '1 2 3 Mon Jul 13 12:00:00 2026 pi' ]; then
+    printf 'not ok - Pi live cleanup retained a transient launch identity\n' >&2
+    exit 1
+  fi
+  cat > "$scan_lab/identity-bin/ps" <<EOF
+#!/bin/sh
+printf '%s\n' '1 9 3 Mon Jul 13 12:00:00 2026 pi'
+EOF
+  cat > "$scan_lab/identity-bin/tmux" <<EOF
+#!/bin/sh
+printf '0 %s\n' "$scan_pid_root"
+EOF
+  retained_identity=$transient_identity
+  if mismatched_identity=$(PATH="$scan_lab/identity-bin:$PATH" wait_for_pi_pane_identity \
+      "$scan_lab/identity-bin/tmux" scan-socket scan-session "$scan_pid_root" "$transient_identity" 2); then
+    retained_identity=$mismatched_identity
+  fi
+  if [ "$retained_identity" != "$transient_identity" ]; then
+    printf 'not ok - Pi live cleanup replaced launch authority across a birth-identity mismatch\n' >&2
+    exit 1
+  fi
   launch_order=$(awk '
     /^initial_identity=[$][(]validated_pane_identity / { print "candidate" }
     /^PI_START_IDENTITY=[$]initial_identity$/ { print "commit" }
+    /^post_exec_identity=[$][(]wait_for_pi_pane_identity / { print "post-exec" }
+    /^PI_START_IDENTITY=[$]post_exec_identity$/ { print "refresh" }
     /^wait_for_text READY / { print "ready" }
   ' "${BASH_SOURCE[0]}")
-  if [ "$launch_order" != "$(printf 'candidate\ncommit\nready')" ]; then
-    printf 'not ok - Pi live cleanup did not capture launch identity before startup wait\n' >&2
+  if [ "$launch_order" != "$(printf 'candidate\ncommit\npost-exec\nrefresh\nready')" ]; then
+    printf 'not ok - Pi live cleanup did not stabilize launch identity before startup wait\n' >&2
     exit 1
   fi
   if PATH="$scan_lab/failing-bin:$PATH" terminate_scanned_processes "$scan_lab" 3 "$scan_pid_root" "$scan_root_identity"; then
@@ -474,8 +575,13 @@ fi
 initial_identity=$(validated_pane_identity "$TMUX" "$SOCKET" "$SESSION" "$PI_PID") \
   || fail "Pi launch identity was unavailable"
 PI_START_IDENTITY=$initial_identity
+post_exec_identity=$(wait_for_pi_pane_identity \
+  "$TMUX" "$SOCKET" "$SESSION" "$PI_PID" "$PI_START_IDENTITY") \
+  || fail "Pi post-exec identity was unavailable"
+PI_START_IDENTITY=$post_exec_identity
 wait_for_text READY 180 || fail "Pi did not start with the watcher extension"
-refreshed_identity=$(validated_pane_identity "$TMUX" "$SOCKET" "$SESSION" "$PI_PID") \
+refreshed_identity=$(wait_for_pi_pane_identity \
+  "$TMUX" "$SOCKET" "$SESSION" "$PI_PID" "$PI_START_IDENTITY" 1) \
   || fail "Pi launch identity could not be refreshed safely"
 PI_START_IDENTITY=$refreshed_identity
 wait_for_status watching 180 || fail "watcher did not auto-arm at session start"
