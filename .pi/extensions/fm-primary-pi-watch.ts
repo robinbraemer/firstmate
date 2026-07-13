@@ -541,7 +541,17 @@ export default function (pi: ExtensionAPI) {
     if (pendingWake) {
       const activeClient = [...coordinator.clients.values()].reverse().find((candidate) => candidate.active);
       if (activeClient) {
-        await activeClient.sendWake(pendingWake.message, pendingWake.details);
+        try {
+          await activeClient.sendWake(pendingWake.message, pendingWake.details);
+        } catch (error) {
+          publishStatus(coordinator, "attention");
+          return {
+            ok: false,
+            message: error instanceof Error
+              ? `watcher: FAILED - pending wake delivery failed: ${error.message}`
+              : "watcher: FAILED - pending wake delivery failed",
+          };
+        }
         if (coordinator.pendingWake === pendingWake) coordinator.pendingWake = null;
         publishStatus(coordinator, "handling wake");
       }

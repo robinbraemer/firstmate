@@ -769,6 +769,96 @@ EOF
   pass "Pi reload preserves an already-captured actionable wake"
 }
 
+test_pi_pending_wake_delivery_failure_retries() {
+  local repo home plugin starts out status
+  repo="$TMP_ROOT/pi-pending-retry-root"
+  home="$TMP_ROOT/pi-pending-retry-home"
+  starts="$TMP_ROOT/pi-pending-retry-starts"
+  mkdir -p "$repo/bin" "$home/state" "$home/config"
+  install_pi_watch_extension_fixture "$repo"
+  plugin="$repo/.pi/extensions/fm-primary-pi-watch.ts"
+  cat > "$repo/bin/fm-watch-arm.sh" <<'SH'
+#!/usr/bin/env bash
+printf 'start\n' >> "$FM_START_LOG"
+trap 'exit 0' TERM
+printf 'signal: pending wake for retry\n'
+while :; do sleep 1; done
+SH
+  chmod +x "$repo/bin/fm-watch-arm.sh"
+  out=$(PLUGIN="$plugin" FM_HOME="$home" FM_ROOT_OVERRIDE="$repo" FM_START_LOG="$starts" node --input-type=module 2>&1 <<'EOF'
+import { existsSync, readFileSync, writeFileSync } from "node:fs";
+import { pathToFileURL } from "node:url";
+
+function client(wakes, failures = 0) {
+  const handlers = new Map();
+  const statuses = [];
+  let attempts = 0;
+  let tool;
+  return {
+    handlers,
+    statuses,
+    get attempts() { return attempts; },
+    get tool() { return tool; },
+    context: { ui: { setStatus(_key, text) { statuses.push(text); } } },
+    pi: {
+      on(event, handler) { handlers.set(event, handler); },
+      registerCommand() {},
+      registerTool(candidate) { if (candidate.name === "fm_watch_arm_pi") tool = candidate; },
+      sendMessage(message, options) {
+        attempts += 1;
+        if (attempts <= failures) throw new Error("transient pending-wake delivery failure");
+        wakes.push({ message, options });
+      },
+    },
+  };
+}
+const lines = (path) => existsSync(path) ? readFileSync(path, "utf8").trim().split("\n").filter(Boolean) : [];
+const waitFor = async (predicate, message) => {
+  for (let i = 0; i < 100 && !predicate(); i += 1) await new Promise((resolve) => setTimeout(resolve, 10));
+  if (!predicate()) throw new Error(message);
+};
+
+writeFileSync(`${process.env.FM_HOME}/state/.lock`, `${process.pid}\n`);
+const url = pathToFileURL(process.env.PLUGIN).href;
+const oldClient = client([]);
+(await import(`${url}?retry-old`)).default(oldClient.pi);
+await oldClient.tool.execute("arm", {}, undefined, undefined, {});
+await waitFor(() => lines(process.env.FM_START_LOG).length === 1, "initial arm did not start");
+await new Promise((resolve) => setTimeout(resolve, 50));
+await oldClient.handlers.get("session_shutdown")?.({ reason: "reload" }, {});
+
+const newWakes = [];
+const newClient = client(newWakes, 2);
+(await import(`${url}?retry-new`)).default(newClient.pi);
+await newClient.handlers.get("session_start")?.({}, newClient.context);
+if (newClient.attempts !== 1) throw new Error(`initial pending delivery attempts: ${newClient.attempts}`);
+if (newWakes.length !== 0) throw new Error(`failed delivery cleared the pending wake: ${JSON.stringify(newWakes)}`);
+if (newClient.statuses.at(-1) !== "attention") throw new Error(`failed delivery status: ${newClient.statuses}`);
+if (lines(process.env.FM_START_LOG).length !== 1) throw new Error("failed delivery started a replacement arm");
+
+const failedRetry = await newClient.tool.execute("retry-fail", {}, undefined, undefined, {});
+if (failedRetry.details?.ok !== false || !failedRetry.details?.message.includes("pending wake delivery failed")) {
+  throw new Error(`failed retry result: ${JSON.stringify(failedRetry)}`);
+}
+if (newClient.attempts !== 2 || newWakes.length !== 0) throw new Error("failed retry did not preserve the pending wake");
+if (newClient.statuses.at(-1) !== "attention") throw new Error(`failed retry status: ${newClient.statuses}`);
+if (lines(process.env.FM_START_LOG).length !== 1) throw new Error("failed retry started a replacement arm");
+
+const retry = await newClient.tool.execute("retry", {}, undefined, undefined, {});
+if (retry.details?.ok !== true) throw new Error(`retry result: ${JSON.stringify(retry)}`);
+await waitFor(() => newWakes.length === 1, "lifecycle retry did not deliver the pending wake");
+await waitFor(() => lines(process.env.FM_START_LOG).length === 2, "lifecycle retry did not start a replacement arm");
+if (newClient.attempts !== 3) throw new Error(`retry pending delivery attempts: ${newClient.attempts}`);
+if (!newWakes[0].message.content.includes("pending wake for retry")) throw new Error("wrong retried wake");
+await newClient.handlers.get("session_shutdown")?.({ reason: "done" }, {});
+EOF
+)
+  status=$?
+  expect_code 0 "$status" "Pi pending-wake delivery failure must remain retryable"
+  [ -z "$out" ] || fail "Pi pending-wake retry test printed output: $out"
+  pass "Pi pending-wake delivery failure remains retryable"
+}
+
 test_pi_reload_defers_pending_wake_during_away_mode() {
   local repo home plugin ready out status
   repo="$TMP_ROOT/pi-reload-away-root"
@@ -1286,6 +1376,7 @@ test_pi_watcher_restarts_only_for_effective_cadence_changes
 test_pi_shutdown_cancels_cadence_restart_during_cleanup
 test_pi_extension_loads_for_fresh_home_in_primary_checkout
 test_pi_reload_preserves_captured_actionable_wake
+test_pi_pending_wake_delivery_failure_retries
 test_pi_reload_defers_pending_wake_during_away_mode
 test_pi_live_process_scan_does_not_match_itself
 test_opencode_primary_watch_plugin_static_wiring
