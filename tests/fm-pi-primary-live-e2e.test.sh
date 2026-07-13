@@ -34,6 +34,15 @@ process_identity() {
   LC_ALL=C ps -o ppid=,pgid=,sess=,lstart=,command= -p "$1" 2>/dev/null | awk '{$1 = $1; print}'
 }
 
+validated_pane_identity() {
+  local tmux=$1 socket=$2 session=$3 pid=$4 candidate pane
+  candidate=$(process_identity "$pid")
+  [ -n "$candidate" ] || return 1
+  pane=$("$tmux" -L "$socket" display-message -p -t "$session" '#{pane_dead} #{pane_pid}' 2>/dev/null) || return 1
+  [ "$pane" = "0 $pid" ] || return 1
+  printf '%s\n' "$candidate"
+}
+
 tracked_processes() {
   printf '%s\n' "$1" | awk '
     NF >= 11 {
@@ -173,6 +182,55 @@ if [ "${1:-}" = --process-scan-self-test ]; then
   fi
   if ! kill -0 "$scan_pid_one" 2>/dev/null; then
     printf 'not ok - Pi live cleanup signaled a live tracked PID without verifying its identity\n' >&2
+    exit 1
+  fi
+  mkdir -p "$scan_lab/identity-bin"
+  identity_marker="$scan_lab/identity-captured"
+  pane_state="$scan_lab/pane-state"
+  cat > "$scan_lab/identity-bin/ps" <<EOF
+#!/bin/sh
+: > "$identity_marker"
+printf '%s\n' '1 2 3 Mon Jul 13 12:00:00 2026 pi'
+EOF
+  cat > "$scan_lab/identity-bin/tmux" <<EOF
+#!/bin/sh
+[ -f "$identity_marker" ] || exit 17
+cat "$pane_state"
+EOF
+  chmod +x "$scan_lab/identity-bin/ps" "$scan_lab/identity-bin/tmux"
+  printf '1 %s\n' "$scan_pid_root" > "$pane_state"
+  retained_identity='launch-identity'
+  if refreshed_identity=$(PATH="$scan_lab/identity-bin:$PATH" validated_pane_identity \
+      "$scan_lab/identity-bin/tmux" scan-socket scan-session "$scan_pid_root"); then
+    retained_identity=$refreshed_identity
+  fi
+  if [ "$retained_identity" != launch-identity ] || [ ! -f "$identity_marker" ]; then
+    printf 'not ok - Pi live cleanup replaced launch identity after pane ownership was lost\n' >&2
+    exit 1
+  fi
+  printf '0 %s\n' "$protected_pid" > "$pane_state"
+  if PATH="$scan_lab/identity-bin:$PATH" validated_pane_identity \
+      "$scan_lab/identity-bin/tmux" scan-socket scan-session "$scan_pid_root" >/dev/null; then
+    printf 'not ok - Pi live cleanup accepted a replacement pane PID\n' >&2
+    exit 1
+  fi
+  printf '0 %s\n' "$scan_pid_root" > "$pane_state"
+  refreshed_identity=$(PATH="$scan_lab/identity-bin:$PATH" validated_pane_identity \
+    "$scan_lab/identity-bin/tmux" scan-socket scan-session "$scan_pid_root") || {
+    printf 'not ok - Pi live cleanup rejected the still-live launch pane\n' >&2
+    exit 1
+  }
+  if [ "$refreshed_identity" != '1 2 3 Mon Jul 13 12:00:00 2026 pi' ]; then
+    printf 'not ok - Pi live cleanup returned the wrong validated identity\n' >&2
+    exit 1
+  fi
+  launch_order=$(awk '
+    /^initial_identity=[$][(]validated_pane_identity / { print "candidate" }
+    /^PI_START_IDENTITY=[$]initial_identity$/ { print "commit" }
+    /^wait_for_text READY / { print "ready" }
+  ' "${BASH_SOURCE[0]}")
+  if [ "$launch_order" != "$(printf 'candidate\ncommit\nready')" ]; then
+    printf 'not ok - Pi live cleanup did not capture launch identity before startup wait\n' >&2
     exit 1
   fi
   if PATH="$scan_lab/failing-bin:$PATH" terminate_scanned_processes "$scan_lab" 3 "$scan_pid_root" "$scan_root_identity"; then
@@ -413,9 +471,13 @@ PI_PID=$("$TMUX" -L "$SOCKET" display-message -p -t "$SESSION" '#{pane_pid}')
 if ! printf '%s\n' "$PI_PID" | grep -Eq '^[0-9]+$' || ! kill -0 "$PI_PID" 2>/dev/null; then
   fail "Pi launch PID was not live"
 fi
+initial_identity=$(validated_pane_identity "$TMUX" "$SOCKET" "$SESSION" "$PI_PID") \
+  || fail "Pi launch identity was unavailable"
+PI_START_IDENTITY=$initial_identity
 wait_for_text READY 180 || fail "Pi did not start with the watcher extension"
-PI_START_IDENTITY=$(process_identity "$PI_PID")
-[ -n "$PI_START_IDENTITY" ] || fail "Pi launch identity was unavailable"
+refreshed_identity=$(validated_pane_identity "$TMUX" "$SOCKET" "$SESSION" "$PI_PID") \
+  || fail "Pi launch identity could not be refreshed safely"
+PI_START_IDENTITY=$refreshed_identity
 wait_for_status watching 180 || fail "watcher did not auto-arm at session start"
 capture | grep -Fq 'Trust project folder?' && fail "--approve produced a trust dialog"
 
