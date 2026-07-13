@@ -434,6 +434,15 @@ test_pi_wiring() {
   pass ".pi primary extension: tool_call runs the cd-guard alongside the watcher-arm check"
 }
 
+test_pi_documented_carrier_is_current() {
+  local doc content
+  doc="$ROOT/docs/cd-guard.md"
+  content=$(cat "$doc")
+  assert_not_contains "$content" 'pi -p -e .pi/extensions/fm-primary-turnend-guard.ts' "cd-guard documentation must not instruct loading the deleted Pi turn-end extension"
+  assert_contains "$content" 'pi -p -e .pi/extensions/fm-primary-pi-watch.ts' "cd-guard documentation must name the current watcher extension in runnable Pi examples"
+  pass "docs/cd-guard.md: Pi runnable example uses the current watcher extension"
+}
+
 test_scripts_are_shellcheck_clean() {
   shellcheck "$ROOT/bin/fm-cd-pretool-check.sh" >/dev/null 2>&1 \
     || fail "bin/fm-cd-pretool-check.sh is not shellcheck-clean"
@@ -457,4 +466,5 @@ test_codex_wiring
 test_grok_wiring
 test_opencode_wiring
 test_pi_wiring
+test_pi_documented_carrier_is_current
 test_scripts_are_shellcheck_clean

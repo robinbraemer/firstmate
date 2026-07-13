@@ -525,6 +525,15 @@ test_pi_extension_carries_pretool_check() {
   pass ".pi primary extension: tool_call handler invokes the shared checker and can block"
 }
 
+test_pi_documented_carrier_is_current() {
+  local doc content
+  doc="$ROOT/docs/arm-pretool-check.md"
+  content=$(cat "$doc")
+  assert_not_contains "$content" 'pi -p -e .pi/extensions/fm-primary-turnend-guard.ts' "arm-pretool documentation must not instruct loading the deleted Pi turn-end extension"
+  assert_contains "$content" 'pi -p -e .pi/extensions/fm-primary-pi-watch.ts' "arm-pretool documentation must name the current watcher extension in runnable Pi examples"
+  pass "docs/arm-pretool-check.md: Pi runnable example uses the current watcher extension"
+}
+
 # --- shellcheck (belt-and-suspenders; CI/CONTRIBUTING.md also runs this) -----
 
 test_shellcheck_clean() {
@@ -556,4 +565,5 @@ test_claude_settings_pretool_hook_wired
 test_codex_hooks_pretool_wired
 test_opencode_pretool_plugin_wired
 test_pi_extension_carries_pretool_check
+test_pi_documented_carrier_is_current
 test_shellcheck_clean
