@@ -769,6 +769,81 @@ EOF
   pass "Pi reload preserves an already-captured actionable wake"
 }
 
+test_pi_reload_defers_pending_wake_during_away_mode() {
+  local repo home plugin ready out status
+  repo="$TMP_ROOT/pi-reload-away-root"
+  home="$TMP_ROOT/pi-reload-away-home"
+  ready="$TMP_ROOT/pi-reload-away-ready"
+  mkdir -p "$repo/bin" "$home/state" "$home/config"
+  install_pi_watch_extension_fixture "$repo"
+  plugin="$repo/.pi/extensions/fm-primary-pi-watch.ts"
+  cat > "$repo/bin/fm-watch-arm.sh" <<'SH'
+#!/usr/bin/env bash
+trap 'exit 0' TERM
+printf 'signal: wake captured before away-mode reload\n'
+: > "$FM_READY_FILE"
+while :; do sleep 1; done
+SH
+  chmod +x "$repo/bin/fm-watch-arm.sh"
+  out=$(PLUGIN="$plugin" FM_HOME="$home" FM_ROOT_OVERRIDE="$repo" FM_READY_FILE="$ready" node --input-type=module 2>&1 <<'EOF'
+import { existsSync, rmSync, writeFileSync } from "node:fs";
+import { pathToFileURL } from "node:url";
+
+function client(wakes, initiallyBound = true) {
+  const handlers = new Map();
+  let tool;
+  let bound = initiallyBound;
+  return {
+    handlers,
+    get tool() { return tool; },
+    bind() { bound = true; },
+    pi: {
+      on(event, handler) { handlers.set(event, handler); },
+      registerCommand() {},
+      registerTool(candidate) { if (candidate.name === "fm_watch_arm_pi") tool = candidate; },
+      sendMessage(message, options) {
+        if (!bound) throw new Error("sendMessage called before bindCore");
+        wakes.push({ message, options });
+      },
+    },
+  };
+}
+
+writeFileSync(`${process.env.FM_HOME}/state/.lock`, `${process.pid}\n`);
+const url = pathToFileURL(process.env.PLUGIN).href;
+const oldClient = client([]);
+(await import(`${url}?away-old`)).default(oldClient.pi);
+await oldClient.tool.execute("arm", {}, undefined, undefined, {});
+for (let i = 0; i < 100 && !existsSync(process.env.FM_READY_FILE); i += 1) await new Promise((resolve) => setTimeout(resolve, 10));
+if (!existsSync(process.env.FM_READY_FILE)) throw new Error("arm did not capture actionable output");
+await new Promise((resolve) => setTimeout(resolve, 50));
+writeFileSync(`${process.env.FM_HOME}/state/.afk`, "away\n");
+await oldClient.handlers.get("session_shutdown")?.({ reason: "reload" }, {});
+
+const newWakes = [];
+const newClient = client(newWakes, false);
+(await import(`${url}?away-new`)).default(newClient.pi);
+newClient.bind();
+await newClient.handlers.get("session_start")?.({}, { ui: { setStatus() {} } });
+await new Promise((resolve) => setTimeout(resolve, 50));
+if (newWakes.length !== 0) throw new Error(`away-mode reload delivered pending wake: ${JSON.stringify(newWakes)}`);
+
+rmSync(`${process.env.FM_HOME}/state/.afk`);
+await newClient.handlers.get("tool_execution_end")?.({ type: "tool_execution_end", toolName: "bash" }, {});
+for (let i = 0; i < 100 && newWakes.length === 0; i += 1) await new Promise((resolve) => setTimeout(resolve, 10));
+if (newWakes.length !== 1 || newWakes[0].message.details?.kind !== "actionable") {
+  throw new Error(`away-mode exit lost pending wake: ${JSON.stringify(newWakes)}`);
+}
+if (!newWakes[0].message.content.includes("wake captured before away-mode reload")) throw new Error("wrong deferred wake");
+await newClient.handlers.get("session_shutdown")?.({ reason: "done" }, {});
+EOF
+)
+  status=$?
+  expect_code 0 "$status" "Pi reload must defer a pending wake until away mode exits"
+  [ -z "$out" ] || fail "Pi away-mode reload test printed output: $out"
+  pass "Pi reload defers pending wakes during away mode"
+}
+
 test_pi_live_process_scan_does_not_match_itself() {
   local out status
   out=$("$ROOT/tests/fm-pi-primary-live-e2e.test.sh" --process-scan-self-test 2>&1)
@@ -1211,6 +1286,7 @@ test_pi_watcher_restarts_only_for_effective_cadence_changes
 test_pi_shutdown_cancels_cadence_restart_during_cleanup
 test_pi_extension_loads_for_fresh_home_in_primary_checkout
 test_pi_reload_preserves_captured_actionable_wake
+test_pi_reload_defers_pending_wake_during_away_mode
 test_pi_live_process_scan_does_not_match_itself
 test_opencode_primary_watch_plugin_static_wiring
 test_opencode_primary_watch_plugin_uses_effective_state_home

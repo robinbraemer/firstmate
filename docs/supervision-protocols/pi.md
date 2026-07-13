@@ -8,7 +8,7 @@ When this session owns supervision and away mode is not active:
    Replace the Pi process from outside its composer; never submit a Pi launch command as a Pi prompt or start a nested Pi through its own Bash tool.
 5. Bare `-e` does not suppress Pi's project-trust dialog.
 6. The extension automatically arms supervision from Pi's bound `session_start` lifecycle.
-   While `state/.afk` exists, lifecycle reconciliation stops the extension-owned arm, keeps its status offline, and resumes normal arming after the flag clears.
+   While `state/.afk` exists, lifecycle reconciliation stops the extension-owned arm, retains pending wakes without native follow-up delivery, keeps its status offline, and resumes normal arming after the flag clears.
    Use `fm_watch_arm_pi` or the human-entered `/fm-watch-arm-pi` command only as an idempotent recovery fallback.
    Never run `bin/fm-watch-arm.sh` through Pi's bash tool because that foreground arm can wedge the agent and bypass extension-owned cleanup.
 7. The extension starts `bin/fm-watch-arm.sh --restart` as an owned detached process group and sends an actionable exit through Pi's custom `firstmate-watcher-wake` message with follow-up delivery and turn triggering.

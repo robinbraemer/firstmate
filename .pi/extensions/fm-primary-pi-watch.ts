@@ -637,17 +637,6 @@ export default function (pi: ExtensionAPI) {
     client.ui = ctx.ui;
     writeClientStatus(client, coordinator.visibleStatus);
     markLoaded();
-    const pendingWake = coordinator.pendingWake;
-    if (pendingWake) {
-      try {
-        await client.sendWake(pendingWake.message, pendingWake.details);
-        if (coordinator.pendingWake === pendingWake) coordinator.pendingWake = null;
-        publishStatus(coordinator, "handling wake");
-      } catch {
-        publishStatus(coordinator, "attention");
-        return;
-      }
-    }
     await startArm();
   });
 
