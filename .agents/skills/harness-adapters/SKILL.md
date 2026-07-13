@@ -153,8 +153,8 @@ The decision persists for the repo, so later worktrees of the same project skip 
 Resume after exit with `env -u CODEX_HOME codex resume <session-id>`.
 The session id is printed on quit.
 
-Every Firstmate-launched Codex crewmate, scout, and secondmate must preserve the invoking user's existing `HOME` and explicitly unset ambient `CODEX_HOME` at the Codex process boundary.
-The same boundary applies to Codex launch, resume, and recovery work.
+`bin/fm-spawn.sh`'s verified Codex template owns the launch boundary for crewmates, scouts, batches, and secondmates; caller-supplied raw launch commands remain caller-owned escape hatches.
+Use the same process boundary when manually resuming or recovering a Codex direct report.
 
 **Primary-session guard fact (verified 2026-07-08, codex-cli 0.142.1).**
 The firstmate PRIMARY's own `.codex/hooks.json` registers a Stop hook that pipes Codex's Stop payload to `bin/fm-turnend-guard.sh`.

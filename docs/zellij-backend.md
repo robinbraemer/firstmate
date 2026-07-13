@@ -4,7 +4,7 @@ This document records the empirical verification behind `bin/backends/zellij.sh`
 It is the zellij equivalent of the tmux facts recorded in the `harness-adapters` skill and of `docs/herdr-backend.md`'s herdr facts.
 
 Zellij is [a terminal multiplexer](https://zellij.dev) with a CLI action interface (`zellij action <subcommand>`) for scripted control of sessions, tabs, and panes.
-Verified against the real installed binary: zellij 0.44.0, macOS aarch64.
+Verified against real installed binaries: zellij 0.44.0 and 0.44.1, macOS aarch64.
 All real-zellij verification in this document and in `tests/fm-backend-zellij-smoke.test.sh` uses isolated, uniquely-named sessions (via `FM_ZELLIJ_SESSION`) plus the guarded teardown helper in `tests/zellij-test-safety.sh` - never the real `firstmate` session name a live fleet would use, and never `kill-all-sessions`/`delete-all-sessions`.
 
 ## Setup
@@ -165,7 +165,7 @@ This means the exit code can **never** be trusted to detect a bad target on this
 On 2026-07-13, zellij 0.44.1 on macOS aarch64 was checked with an isolated session by creating a task tab, closing it with `zellij action close-tab-by-id <id>`, and running `zellij action new-tab --cwd /tmp --name probe` again.
 The second `new-tab` returned exit 0 with empty stdout even though `zellij action list-tabs --json` immediately contained `{"tab_id":1,"name":"probe"}`.
 The terminal pane could lag behind the tab entry for a later `zellij action list-panes --json` read.
-`fm_backend_zellij_create_task` therefore recovers an empty-output creation only when exactly one tab matches the requested scoped title, then polls for up to two seconds for its terminal pane.
+`fm_backend_zellij_create_task` therefore recovers an empty-output creation only when exactly one tab matches the requested scoped title, then polls for up to ten seconds for its terminal pane.
 
 **Accepted residual gaps**: a pane can still die in the brief window between `fm_backend_zellij_target_ready`'s ownership check and the operation's own `zellij action` call.
 That remaining race degrades to "the operation quietly did nothing" - the same class of gap firstmate already tolerates for an unverified send on any backend, caught downstream by `fm-spawn.sh`'s worktree-discovery poll timing out after 60s, `fm_backend_zellij_send_text_submit`'s preflight or content-diff retry loop (which reports `send-failed`, `pending`, or `unknown` rather than a false "sent" for these cases), or the watcher's stale-pane detection eventually noticing a pane that never changes.

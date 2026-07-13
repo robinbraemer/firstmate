@@ -39,10 +39,9 @@
 # posture. Moving/relocating a firstmate installation changes its tag
 # (acceptable - recorded worktree paths do not survive a move either).
 #
-# Empirical verification (real zellij 0.44.0, macOS aarch64, 2026-07-02;
-# docs/zellij-backend.md has the full evidence log) resolved every "gaps to
-# verify" item in the design report, plus additional real findings not
-# anticipated by the report:
+# Empirical verification is recorded in docs/zellij-backend.md.
+# It resolved every design-report verification gap and records the additional
+# implementation findings summarized below:
 #
 #   1. dump-screen on a background session with NO attached client: WORKS.
 #   2. Key names: Enter -> "Enter", Escape -> "Esc" (NOT "Escape"), Ctrl-C ->
