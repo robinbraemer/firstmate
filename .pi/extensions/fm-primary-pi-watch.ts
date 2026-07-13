@@ -414,19 +414,22 @@ async function stopArmRecord(
   record: ArmRecord,
   reason: string,
 ): Promise<void> {
-  if (!record.intentionalStopReason) record.intentionalStopReason = reason;
-  signalArm(record, "SIGTERM");
-  if (!(await stopsWithin(record, STOP_GRACE_MS))) {
-    signalArm(record, "SIGKILL");
-    if (!(await stopsWithin(record, STOP_KILL_GRACE_MS))) {
-      if (!record.settled) settleArm(coordinator, record, null, "SIGKILL");
-      if (processGroupAlive(record)) {
-        throw new Error(`watcher: FAILED - process group ${record.child.pid} survived SIGKILL`);
+  try {
+    if (!record.intentionalStopReason) record.intentionalStopReason = reason;
+    signalArm(record, "SIGTERM");
+    if (!(await stopsWithin(record, STOP_GRACE_MS))) {
+      signalArm(record, "SIGKILL");
+      if (!(await stopsWithin(record, STOP_KILL_GRACE_MS))) {
+        if (!record.settled) settleArm(coordinator, record, null, "SIGKILL");
+        if (processGroupAlive(record)) {
+          throw new Error(`watcher: FAILED - process group ${record.child.pid} survived SIGKILL`);
+        }
       }
     }
-  }
-  if (coordinator.current === record) {
-    coordinator.current = null;
+  } finally {
+    if (coordinator.current === record) {
+      coordinator.current = null;
+    }
   }
 }
 
@@ -501,7 +504,18 @@ export default function (pi: ExtensionAPI) {
     process.once("exit", cleanupOnProcessExit);
   }
 
+  async function suspendForAwayMode(): Promise<ArmResult | null> {
+    if (!existsSync(`${state}/.afk`)) return null;
+    const record = coordinator.current;
+    if (record) await stopArmRecord(coordinator, record, "away-mode");
+    if (!existsSync(`${state}/.afk`)) return null;
+    publishStatus(coordinator, "offline");
+    return { ok: true, message: "watcher: suspended - away mode owns supervision" };
+  }
+
   async function startArmOnce(): Promise<ArmResult> {
+    const initialSuspension = await suspendForAwayMode();
+    if (initialSuspension) return initialSuspension;
     if (lockOwnership() !== "owned") await claimSessionLock();
     if (coordinator.startCancelled || coordinator.shuttingDown || coordinator.clients.size === 0) {
       return { ok: false, message: "watcher: not started - Pi extension session shut down" };
@@ -510,15 +524,19 @@ export default function (pi: ExtensionAPI) {
       publishStatus(coordinator, "attention");
       return { ok: false, message: "watcher: read-only - session lock is held by another firstmate session" };
     }
+    const lockedSuspension = await suspendForAwayMode();
+    if (lockedSuspension) return lockedSuspension;
     markLoaded();
     const cadence = cadenceFingerprint();
-    if (coordinator.current?.cadence === cadence) {
+    if (coordinator.current?.cadence === cadence && !coordinator.current.settled) {
       return { ok: true, message: "watcher: healthy - Pi extension already has an arm child" };
     }
     if (coordinator.current) await stopArmRecord(coordinator, coordinator.current, "cadence-change");
     if (coordinator.startCancelled || coordinator.shuttingDown || coordinator.clients.size === 0) {
       return { ok: false, message: "watcher: not started - Pi extension session shut down" };
     }
+    const postCleanupSuspension = await suspendForAwayMode();
+    if (postCleanupSuspension) return postCleanupSuspension;
     const pendingWake = coordinator.pendingWake;
     if (pendingWake) {
       const activeClient = [...coordinator.clients.values()].reverse().find((candidate) => candidate.active);
@@ -531,6 +549,8 @@ export default function (pi: ExtensionAPI) {
     if (coordinator.startCancelled || coordinator.shuttingDown || coordinator.clients.size === 0) {
       return { ok: false, message: "watcher: not started - Pi extension session shut down" };
     }
+    const preSpawnSuspension = await suspendForAwayMode();
+    if (preSpawnSuspension) return preSpawnSuspension;
 
     const id = ++coordinator.sequence;
     const generation = ++coordinator.generation;

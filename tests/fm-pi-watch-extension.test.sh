@@ -371,6 +371,81 @@ EOF
   pass "Pi watcher lifecycle auto-arms, delivers one structured wake, re-arms, and cleans up"
 }
 
+test_pi_watcher_yields_to_away_mode_lifecycle() {
+  local repo home plugin starts cleaned out status
+  repo="$TMP_ROOT/pi-away-mode-root"
+  home="$TMP_ROOT/pi-away-mode-home"
+  starts="$TMP_ROOT/pi-away-mode-starts"
+  cleaned="$TMP_ROOT/pi-away-mode-cleaned"
+  mkdir -p "$repo/bin" "$home/state" "$home/config"
+  install_pi_watch_extension_fixture "$repo"
+  plugin="$repo/.pi/extensions/fm-primary-pi-watch.ts"
+  cat > "$repo/bin/fm-watch-arm.sh" <<'SH'
+#!/usr/bin/env bash
+printf 'start\n' >> "$FM_START_LOG"
+trap 'printf "clean\n" >> "$FM_CLEAN_LOG"; exit 0' TERM INT
+while :; do sleep 0.02; done
+SH
+  chmod +x "$repo/bin/fm-watch-arm.sh"
+  out=$(PLUGIN="$plugin" FM_HOME="$home" FM_ROOT_OVERRIDE="$repo" FM_START_LOG="$starts" \
+    FM_CLEAN_LOG="$cleaned" node --input-type=module 2>&1 <<'EOF'
+import { existsSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { pathToFileURL } from "node:url";
+
+const handlers = new Map();
+const statuses = [];
+let tool;
+const pi = {
+  on(event, handler) { handlers.set(event, handler); },
+  registerCommand() {},
+  registerTool(candidate) { if (candidate.name === "fm_watch_arm_pi") tool = candidate; },
+  sendMessage() {},
+};
+const lines = (path) => existsSync(path) ? readFileSync(path, "utf8").trim().split("\n").filter(Boolean) : [];
+const waitFor = async (predicate, message) => {
+  for (let i = 0; i < 150 && !predicate(); i += 1) await new Promise((resolve) => setTimeout(resolve, 10));
+  if (!predicate()) throw new Error(message);
+};
+writeFileSync(`${process.env.FM_HOME}/state/.lock`, `${process.pid}\n`);
+writeFileSync(`${process.env.FM_HOME}/state/.afk`, "away\n");
+const mod = await import(pathToFileURL(process.env.PLUGIN).href);
+mod.default(pi);
+await handlers.get("session_start")?.({}, {
+  ui: { setStatus(_key, text) { statuses.push(text); } },
+});
+await new Promise((resolve) => setTimeout(resolve, 50));
+if (lines(process.env.FM_START_LOG).length !== 0) throw new Error("watcher armed while away mode was already active");
+if (statuses.at(-1) !== "offline") throw new Error(`initial away-mode status: ${statuses}`);
+
+rmSync(`${process.env.FM_HOME}/state/.afk`);
+await handlers.get("tool_execution_end")?.({ type: "tool_execution_end", toolName: "bash" }, {});
+await waitFor(() => lines(process.env.FM_START_LOG).length === 1, "watcher did not resume after away mode exited");
+if (statuses.at(-1) !== "watching") throw new Error(`resumed status: ${statuses}`);
+
+writeFileSync(`${process.env.FM_HOME}/state/.afk`, "away\n");
+await handlers.get("tool_execution_end")?.({ type: "tool_execution_end", toolName: "bash" }, {});
+await waitFor(() => lines(process.env.FM_CLEAN_LOG).length === 1, "away-mode entry did not stop the extension-owned arm");
+if (lines(process.env.FM_START_LOG).length !== 1) throw new Error("away-mode entry replaced the watcher arm");
+if (statuses.at(-1) !== "offline") throw new Error(`away-mode entry status: ${statuses}`);
+const suspended = await tool.execute("while-away", {}, undefined, undefined, {});
+if (!suspended.content[0].text.includes("away mode owns supervision")) {
+  throw new Error(`manual arm ignored away mode: ${JSON.stringify(suspended)}`);
+}
+if (lines(process.env.FM_START_LOG).length !== 1) throw new Error("manual arm started a watcher during away mode");
+
+rmSync(`${process.env.FM_HOME}/state/.afk`);
+await handlers.get("tool_execution_end")?.({ type: "tool_execution_end", toolName: "bash" }, {});
+await waitFor(() => lines(process.env.FM_START_LOG).length === 2, "watcher did not reconcile after away-mode exit");
+if (statuses.at(-1) !== "watching") throw new Error(`second resumed status: ${statuses}`);
+await handlers.get("session_shutdown")?.({ reason: "done" }, {});
+EOF
+)
+  status=$?
+  expect_code 0 "$status" "Pi watcher lifecycle must yield to away mode and resume after exit"
+  [ -z "$out" ] || fail "Pi away-mode lifecycle test printed output: $out"
+  pass "Pi watcher lifecycle yields to away mode and resumes after exit"
+}
+
 test_pi_watcher_restarts_only_for_effective_cadence_changes() {
   local repo home plugin starts cleaned out status
   repo="$TMP_ROOT/pi-cadence-root"
@@ -510,6 +585,82 @@ EOF
   expect_code 0 "$status" "Pi shutdown must cancel a cadence restart while cleanup is in progress"
   [ -z "$out" ] || fail "Pi shutdown/cadence race test printed output: $out"
   pass "Pi shutdown cancels cadence restart during cleanup"
+}
+
+test_pi_cleanup_failure_does_not_reuse_settled_arm() {
+  local repo home plugin starts out status
+  repo="$TMP_ROOT/pi-cleanup-failure-root"
+  home="$TMP_ROOT/pi-cleanup-failure-home"
+  starts="$TMP_ROOT/pi-cleanup-failure-starts"
+  mkdir -p "$repo/bin" "$home/state" "$home/config"
+  install_pi_watch_extension_fixture "$repo"
+  plugin="$repo/.pi/extensions/fm-primary-pi-watch.ts"
+  cat > "$repo/bin/fm-watch-arm.sh" <<'SH'
+#!/usr/bin/env bash
+printf 'start\n' >> "$FM_START_LOG"
+trap 'exit 0' TERM INT
+while :; do sleep 0.02; done
+SH
+  chmod +x "$repo/bin/fm-watch-arm.sh"
+  out=$(PLUGIN="$plugin" FM_HOME="$home" FM_ROOT_OVERRIDE="$repo" FM_START_LOG="$starts" \
+    FM_PI_WATCH_STOP_GRACE_MS=0 node --input-type=module 2>&1 <<'EOF'
+import { existsSync, readFileSync, writeFileSync } from "node:fs";
+import { pathToFileURL } from "node:url";
+
+function client(statuses) {
+  const handlers = new Map();
+  return {
+    handlers,
+    pi: {
+      on(event, handler) { handlers.set(event, handler); },
+      registerCommand() {},
+      registerTool() {},
+      sendMessage() {},
+    },
+    context: { ui: { setStatus(_key, text) { statuses.push(text); } } },
+  };
+}
+const lines = (path) => existsSync(path) ? readFileSync(path, "utf8").trim().split("\n").filter(Boolean) : [];
+const waitFor = async (predicate, message) => {
+  for (let i = 0; i < 150 && !predicate(); i += 1) await new Promise((resolve) => setTimeout(resolve, 10));
+  if (!predicate()) throw new Error(message);
+};
+writeFileSync(`${process.env.FM_HOME}/state/.lock`, `${process.pid}\n`);
+const url = pathToFileURL(process.env.PLUGIN).href;
+const oldStatuses = [];
+const oldClient = client(oldStatuses);
+(await import(`${url}?cleanup-old`)).default(oldClient.pi);
+await oldClient.handlers.get("session_start")?.({}, oldClient.context);
+await waitFor(() => lines(process.env.FM_START_LOG).length === 1, "initial arm did not start");
+
+const originalKill = process.kill;
+process.kill = function (pid, signal) {
+  if (typeof pid === "number" && pid < 0 && signal === 0) return true;
+  return originalKill.call(process, pid, signal);
+};
+let cleanupError = "";
+try {
+  await oldClient.handlers.get("session_shutdown")?.({ reason: "reload" }, {});
+} catch (error) {
+  cleanupError = error instanceof Error ? error.message : String(error);
+} finally {
+  process.kill = originalKill;
+}
+if (!cleanupError.includes("survived SIGKILL")) throw new Error(`cleanup failure was not exercised: ${cleanupError}`);
+
+const newStatuses = [];
+const newClient = client(newStatuses);
+(await import(`${url}?cleanup-new`)).default(newClient.pi);
+await newClient.handlers.get("session_start")?.({}, newClient.context);
+await waitFor(() => lines(process.env.FM_START_LOG).length === 2, "cleanup-failed record was treated as a healthy arm");
+if (newStatuses.at(-1) !== "watching") throw new Error(`replacement status: ${newStatuses}`);
+await newClient.handlers.get("session_shutdown")?.({ reason: "done" }, {});
+EOF
+)
+  status=$?
+  expect_code 0 "$status" "Pi cleanup failure must not leave a settled arm eligible for reuse"
+  [ -z "$out" ] || fail "Pi cleanup-failure test printed output: $out"
+  pass "Pi cleanup failure quarantines the settled arm"
 }
 
 test_pi_extension_loads_for_fresh_home_in_primary_checkout() {
@@ -1054,6 +1205,8 @@ test_pi_tool_returns_agent_tool_result
 test_pi_process_exit_cleanup_listener_lifecycle
 test_pi_process_exit_cleanup_stops_arm_child
 test_pi_watcher_lifecycle_and_status_contract
+test_pi_cleanup_failure_does_not_reuse_settled_arm
+test_pi_watcher_yields_to_away_mode_lifecycle
 test_pi_watcher_restarts_only_for_effective_cadence_changes
 test_pi_shutdown_cancels_cadence_restart_during_cleanup
 test_pi_extension_loads_for_fresh_home_in_primary_checkout

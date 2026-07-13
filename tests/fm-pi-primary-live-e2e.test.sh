@@ -163,6 +163,7 @@ terminate_scanned_processes() {
 
 finish_lab_cleanup() {
   local lab=$1 cleanup_failed=$2
+  rm -f "$lab/pi-agent/auth.json" || return 1
   [ "$cleanup_failed" -eq 0 ] || return 1
   rm -rf "$lab"
 }
@@ -339,11 +340,16 @@ EOF
     exit 1
   fi
   retention_probe="$scan_lab/retained-evidence"
-  mkdir -p "$retention_probe"
+  mkdir -p "$retention_probe/pi-agent"
+  printf 'copied credential\n' > "$retention_probe/pi-agent/auth.json"
   finish_lab_cleanup "$retention_probe" 1
   retention_status=$?
   if [ "$retention_status" -ne 1 ] || [ ! -d "$retention_probe" ]; then
     printf 'not ok - Pi live cleanup deleted evidence after a failed process scan\n' >&2
+    exit 1
+  fi
+  if [ -e "$retention_probe/pi-agent/auth.json" ]; then
+    printf 'not ok - Pi live cleanup retained the copied auth credential with failed evidence\n' >&2
     exit 1
   fi
   mismatch_identity="$scan_root_identity mismatched"
