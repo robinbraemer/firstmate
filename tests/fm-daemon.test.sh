@@ -611,6 +611,36 @@ test_daemon_drains_durable_intake_without_immediate_injection() {
   pass "daemon drains and classifies durable intake without consuming temporary files"
 }
 
+test_daemon_shutdown_drains_intake_before_flush() {
+  local dir state intake delivered
+  dir=$(make_supercase intake-shutdown-drain)
+  state="$dir/state"
+  intake="$state/.subsuper-intake"
+  delivered="$dir/delivered"
+  mkdir -p "$intake"
+  printf 'check: %s: captain decision needed at shutdown\n' "$state/shutdown.check.sh" > "$intake/check.wake"
+
+  (
+    inject_msg() { printf '%s\n' "$1" > "$delivered"; }
+    FM_STATE_OVERRIDE="$state" FM_ESCALATE_BATCH_SECS=999 drain_intake_then_flush "$state"
+  ) || fail "daemon shutdown did not drain intake before flushing escalations"
+  [ ! -e "$intake/check.wake" ] || fail "daemon shutdown left handled intake for the next away session"
+  [ ! -s "$state/.subsuper-escalations" ] || fail "daemon shutdown left a drained escalation buffered"
+  assert_contains "$(cat "$delivered")" "captain decision needed at shutdown" "daemon shutdown flush omitted the drained intake reason"
+  pass "daemon shutdown drains durable intake into its current escalation flush"
+}
+
+test_afk_return_contract_reconciles_residual_intake() {
+  local skill="$ROOT/.agents/skills/afk/SKILL.md"
+  assert_grep 'read the reason from every complete residual' "$skill" \
+    "afk return contract does not capture residual durable intake"
+  assert_grep 'state/.subsuper-intake/*.wake' "$skill" \
+    "afk return contract does not name residual durable intake"
+  assert_grep 'remove each wake file only after its reason is captured' "$skill" \
+    "afk return contract can discard residual intake before catch-up captures it"
+  pass "afk return contract captures residual intake before removing it"
+}
+
 test_inject_skip_forces_self() {
   local dir state
   dir=$(make_supercase skip)
@@ -1706,6 +1736,8 @@ test_escalate_batch_age_uses_first_append
 test_heartbeat_scan_dedup
 test_handle_wake_routes_self_and_escalate
 test_daemon_drains_durable_intake_without_immediate_injection
+test_daemon_shutdown_drains_intake_before_flush
+test_afk_return_contract_reconciles_residual_intake
 test_inject_skip_forces_self
 test_is_wake_reason_distinguishes_status_stdout
 test_terminal_stale_escalate_leaves_no_marker

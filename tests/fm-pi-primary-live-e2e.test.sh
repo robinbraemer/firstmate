@@ -4,13 +4,14 @@ set -u
 
 scan_lab_processes() {
   local lab=$1 root_pid=${2:-} root_identity=${3:-} snapshot
-  snapshot=$(LC_ALL=C ps -axo pid=,ppid=,stat=,lstart=,command= 2>/dev/null) || return 1
+  snapshot=$(LC_ALL=C ps -axo pid=,ppid=,pgid=,sess=,stat=,lstart=,command= 2>/dev/null) || return 1
   printf '%s\n' "$snapshot" | awk -v lab="$lab" -v root="$root_pid" -v expected="$root_identity" '
-    $3 !~ /^Z/ {
+    $5 !~ /^Z/ {
       order[++count] = $1
       parent[$1] = $2
       line[$1] = $0
-      identity = $4 " " $5 " " $6 " " $7 " " $8
+      identity = $2 " " $3 " " $4
+      for (field = 6; field <= NF; field += 1) identity = identity " " $field
       if (($1 == root && identity == expected) || (index($0, lab) && $0 ~ /(^|[ \/])(pi|pi-coding-agent|fm-watch(-arm)?[.]sh)([ \/]|$)/)) owned[$1] = 1
     }
     END {
@@ -30,41 +31,54 @@ scan_lab_processes() {
 }
 
 process_identity() {
-  LC_ALL=C ps -o lstart= -p "$1" 2>/dev/null | awk '{$1 = $1; print}'
+  LC_ALL=C ps -o ppid=,pgid=,sess=,lstart=,command= -p "$1" 2>/dev/null | awk '{$1 = $1; print}'
 }
 
 tracked_processes() {
-  local snapshot=$1 pid _ identity
-  while read -r pid _; do
-    [ -n "$pid" ] || continue
-    identity=$(process_identity "$pid")
-    [ -n "$identity" ] && printf '%s %s\n' "$pid" "$identity"
-  done <<EOF
-$snapshot
-EOF
+  printf '%s\n' "$1" | awk '
+    NF >= 11 {
+      identity = $2 " " $3 " " $4
+      for (field = 6; field <= NF; field += 1) identity = identity " " $field
+      print $1 " " identity
+    }
+  '
 }
 
 tracked_process_alive() {
-  local pid=$1 expected=$2 stat current
-  stat=$(ps -o stat= -p "$pid" 2>/dev/null | awk '{$1 = $1; print}')
-  [ -n "$stat" ] && [ "${stat#Z}" = "$stat" ] || return 1
-  current=$(process_identity "$pid")
-  [ -n "$current" ] && [ "$current" = "$expected" ]
+  local pid=$1 expected=$2 record stat current
+  record=$(LC_ALL=C ps -o stat=,ppid=,pgid=,sess=,lstart=,command= -p "$pid" 2>/dev/null | awk '{$1 = $1; print}')
+  if [ -z "$record" ]; then
+    kill -0 "$pid" 2>/dev/null && return 2
+    return 1
+  fi
+  stat=${record%% *}
+  [ "${stat#Z}" = "$stat" ] || return 1
+  current=${record#* }
+  [ "$current" = "$expected" ] || [ "${current#* }" = "${expected#* }" ]
 }
 
 live_tracked_processes() {
-  local tracked=$1 pid identity
+  local tracked=$1 pid identity status=0 rc
   while read -r pid identity; do
-    [ -n "$pid" ] && tracked_process_alive "$pid" "$identity" && printf '%s %s\n' "$pid" "$identity"
+    [ -n "$pid" ] || continue
+    tracked_process_alive "$pid" "$identity"
+    rc=$?
+    if [ "$rc" -eq 0 ]; then
+      printf '%s %s\n' "$pid" "$identity"
+    elif [ "$rc" -eq 2 ]; then
+      status=1
+    fi
   done <<EOF
 $tracked
 EOF
+  return "$status"
 }
 
 wait_for_tracked_processes_gone() {
-  local tracked=$1 attempts=${2:-50} i=0
+  local tracked=$1 attempts=${2:-50} i=0 live
   while [ "$i" -lt "$attempts" ]; do
-    [ -z "$(live_tracked_processes "$tracked")" ] && return 0
+    live=$(live_tracked_processes "$tracked") || return 1
+    [ -z "$live" ] && return 0
     sleep 0.1
     i=$((i + 1))
   done
@@ -72,50 +86,112 @@ wait_for_tracked_processes_gone() {
 }
 
 signal_tracked_processes() {
-  local tracked=$1 signal=$2 pid identity
+  local tracked=$1 signal=$2 pid identity status=0 rc
   while read -r pid identity; do
-    [ -n "$pid" ] && tracked_process_alive "$pid" "$identity" && kill -"$signal" "$pid" 2>/dev/null || true
+    [ -n "$pid" ] || continue
+    tracked_process_alive "$pid" "$identity"
+    rc=$?
+    if [ "$rc" -eq 0 ]; then
+      kill -"$signal" "$pid" 2>/dev/null || status=1
+    elif [ "$rc" -eq 2 ]; then
+      status=1
+    fi
   done <<EOF
 $tracked
 EOF
+  return "$status"
 }
 
 terminate_scanned_processes() {
   local lab=$1 attempts=${2:-50} root_pid=${3:-} root_identity=${4:-} snapshot tracked
-  snapshot=$(scan_lab_processes "$lab" "$root_pid" "$root_identity")
+  snapshot=$(scan_lab_processes "$lab" "$root_pid" "$root_identity") || return 1
   [ -n "$snapshot" ] || return 0
   tracked=$(tracked_processes "$snapshot")
   [ -n "$tracked" ] || return 0
-  signal_tracked_processes "$tracked" TERM
+  signal_tracked_processes "$tracked" TERM || return 1
   wait_for_tracked_processes_gone "$tracked" "$attempts" && return 0
-  signal_tracked_processes "$tracked" KILL
+  signal_tracked_processes "$tracked" KILL || return 1
   wait_for_tracked_processes_gone "$tracked" "$attempts"
+}
+
+finish_lab_cleanup() {
+  local lab=$1 cleanup_failed=$2
+  [ "$cleanup_failed" -eq 0 ] || return 1
+  rm -rf "$lab"
 }
 
 if [ "${1:-}" = --process-scan-self-test ]; then
   scan_lab=$(mktemp -d "${TMPDIR:-/tmp}/fm-pi-live-scan.XXXXXX")
+  cleanup_scan_probes() {
+    local pid
+    for pid in "${scan_pid_one:-}" "${scan_pid_two:-}" "${scan_pid_root:-}" "${scan_pid_child:-}" "${protected_pid:-}"; do
+      [ -n "$pid" ] && kill -KILL "$pid" 2>/dev/null || true
+    done
+    for pid in "${scan_pid_one:-}" "${scan_pid_two:-}" "${scan_pid_root:-}" "${protected_pid:-}"; do
+      [ -n "$pid" ] && wait "$pid" 2>/dev/null || true
+    done
+    rm -rf "$scan_lab"
+  }
+  trap cleanup_scan_probes EXIT
   bash -c 'trap "exit 0" TERM; while :; do sleep 1; done' "$scan_lab/fm-watch-arm.sh" >/dev/null 2>&1 &
   scan_pid_one=$!
   bash -c 'trap "exit 0" TERM; while :; do sleep 1; done' "$scan_lab/fm-watch.sh" >/dev/null 2>&1 &
   scan_pid_two=$!
+  sleep 300 &
+  protected_pid=$!
   perl -e '$0 = "pi"; $SIG{TERM} = sub { exit 0 }; my $pid = fork; die "fork failed" unless defined $pid; if (!$pid) { $SIG{TERM} = "IGNORE"; sleep 1 while 1 } wait' >/dev/null 2>&1 &
   scan_pid_root=$!
-  scan_root_identity=$(process_identity "$scan_pid_root")
   scan_pid_child=
   for _ in $(seq 1 20); do
+    scan_root_identity=$(process_identity "$scan_pid_root")
     scan_pid_child=$(ps -axo pid=,ppid= | awk -v root="$scan_pid_root" '$2 == root { print $1; exit }')
-    [ -n "$scan_pid_child" ] && break
+    case "$scan_root_identity" in
+      *" pi") [ -n "$scan_pid_child" ] && break ;;
+    esac
     sleep 0.05
   done
   sleep 0.1
+  owned_row=$(LC_ALL=C ps -axo pid=,ppid=,pgid=,sess=,stat=,lstart=,command= | awk -v owned="$scan_pid_one" -v protected="$protected_pid" \
+    '$1 == owned { $1 = protected; print; exit }')
+  forged_tracked=$(tracked_processes "$owned_row")
+  signal_tracked_processes "$forged_tracked" TERM
+  for _ in $(seq 1 20); do
+    kill -0 "$protected_pid" 2>/dev/null || break
+    sleep 0.05
+  done
+  if ! kill -0 "$protected_pid" 2>/dev/null; then
+    printf 'not ok - Pi live cleanup re-authorized a reused PID after its ownership snapshot\n' >&2
+    exit 1
+  fi
+  mkdir -p "$scan_lab/failing-bin"
+  printf '#!/bin/sh\nexit 19\n' > "$scan_lab/failing-bin/ps"
+  chmod +x "$scan_lab/failing-bin/ps"
+  owned_tracked=$(tracked_processes "$(scan_lab_processes "$scan_lab" "$scan_pid_root" "$scan_root_identity" | awk -v pid="$scan_pid_one" '$1 == pid')")
+  if PATH="$scan_lab/failing-bin:$PATH" signal_tracked_processes "$owned_tracked" TERM; then
+    printf 'not ok - Pi live cleanup accepted an unavailable identity for a live tracked PID\n' >&2
+    exit 1
+  fi
+  if ! kill -0 "$scan_pid_one" 2>/dev/null; then
+    printf 'not ok - Pi live cleanup signaled a live tracked PID without verifying its identity\n' >&2
+    exit 1
+  fi
+  if PATH="$scan_lab/failing-bin:$PATH" terminate_scanned_processes "$scan_lab" 3 "$scan_pid_root" "$scan_root_identity"; then
+    printf 'not ok - Pi live cleanup treated a failed process scan as clean\n' >&2
+    exit 1
+  fi
+  retention_probe="$scan_lab/retained-evidence"
+  mkdir -p "$retention_probe"
+  finish_lab_cleanup "$retention_probe" 1
+  retention_status=$?
+  if [ "$retention_status" -ne 1 ] || [ ! -d "$retention_probe" ]; then
+    printf 'not ok - Pi live cleanup deleted evidence after a failed process scan\n' >&2
+    exit 1
+  fi
   mismatch_identity="$scan_root_identity mismatched"
   mismatch_lab="$scan_lab/unmatched-root-only"
   mismatch_out=$(scan_lab_processes "$mismatch_lab" "$scan_pid_root" "$mismatch_identity")
   if printf '%s\n' "$mismatch_out" | awk -v root="$scan_pid_root" -v child="$scan_pid_child" \
       '$1 == root || $1 == child { found = 1 } END { exit !found }'; then
-    kill -KILL "$scan_pid_one" "$scan_pid_two" "$scan_pid_root" "$scan_pid_child" 2>/dev/null || true
-    wait "$scan_pid_one" "$scan_pid_two" "$scan_pid_root" 2>/dev/null || true
-    rm -rf "$scan_lab"
     printf 'not ok - Pi live scanner trusted a reused root PID: %s\n' "$mismatch_out" >&2
     exit 1
   fi
@@ -132,9 +208,6 @@ if [ "${1:-}" = --process-scan-self-test ]; then
     || ! printf '%s\n' "$scan_out" | awk -v one="$scan_pid_one" -v two="$scan_pid_two" \
       -v root="$scan_pid_root" -v child="$scan_pid_child" \
       '$1 == one { first = 1 } $1 == two { second = 1 } $1 == root { primary = 1 } $1 == child { descendant = 1 } END { exit !(first && second && primary && descendant) }'; then
-    kill -KILL "$scan_pid_one" "$scan_pid_two" "$scan_pid_root" "$scan_pid_child" 2>/dev/null || true
-    wait "$scan_pid_one" "$scan_pid_two" "$scan_pid_root" 2>/dev/null || true
-    rm -rf "$scan_lab"
     printf 'not ok - Pi live process scanner returned: %s\n' "$scan_out" >&2
     exit 1
   fi
@@ -151,8 +224,8 @@ if [ "${1:-}" = --process-scan-self-test ]; then
     printf 'not ok - Pi live cleanup lost reparented descendant %s\n' "$scan_pid_child" >&2
     exit 1
   fi
-  wait "$scan_pid_one" "$scan_pid_two" "$scan_pid_root" 2>/dev/null || true
-  rm -rf "$scan_lab"
+  trap - EXIT
+  cleanup_scan_probes
   echo "ok - Pi live cleanup isolates and terminates lab-owned processes"
   exit 0
 fi
@@ -303,13 +376,12 @@ terminate_lab_processes() {
 }
 
 cleanup() {
-  local status=$? survivors
-  terminate_lab_processes || status=1
+  local status=$? survivors cleanup_failed=0
+  terminate_lab_processes || { status=1; cleanup_failed=1; }
   "$TMUX" -L "$SOCKET" kill-server 2>/dev/null || true
-  if terminate_lab_processes; then
-    rm -rf "$LAB"
-  else
-    survivors=$(lab_processes)
+  terminate_lab_processes || { status=1; cleanup_failed=1; }
+  if ! finish_lab_cleanup "$LAB" "$cleanup_failed"; then
+    survivors=$(lab_processes) || survivors='process scan unavailable'
     printf 'not ok - lab-owned processes survived cleanup; evidence retained at %s\n%s\n' "$LAB" "$survivors" >&2
     status=1
   fi
@@ -341,9 +413,9 @@ PI_PID=$("$TMUX" -L "$SOCKET" display-message -p -t "$SESSION" '#{pane_pid}')
 if ! printf '%s\n' "$PI_PID" | grep -Eq '^[0-9]+$' || ! kill -0 "$PI_PID" 2>/dev/null; then
   fail "Pi launch PID was not live"
 fi
+wait_for_text READY 180 || fail "Pi did not start with the watcher extension"
 PI_START_IDENTITY=$(process_identity "$PI_PID")
 [ -n "$PI_START_IDENTITY" ] || fail "Pi launch identity was unavailable"
-wait_for_text READY 180 || fail "Pi did not start with the watcher extension"
 wait_for_status watching 180 || fail "watcher did not auto-arm at session start"
 capture | grep -Fq 'Trust project folder?' && fail "--approve produced a trust dialog"
 
@@ -393,7 +465,7 @@ wait_for_status_absent 60 || fail "quit did not clear watcher status"
 wait_for_clean_exit || fail "Pi did not exit cleanly"
 wait_pid_dead "$new_watcher_pid" || fail "watcher survived clean Pi exit"
 wait_pid_dead "$new_arm_pid" || fail "arm survived clean Pi exit"
-orphan=$(lab_processes)
+orphan=$(lab_processes) || fail "final lab process scan failed"
 [ -z "$orphan" ] || fail "owned live lab left a process: $orphan"
 
 printf 'ok - Pi %s watcher lifecycle passed for %s with clean reload and exit\n' "$(pi --version)" "$ROLE"

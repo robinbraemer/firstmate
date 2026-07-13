@@ -59,7 +59,8 @@ No `/back` is needed. The first genuine message is the return signal:
 
 - A message **without** the sentinel marker and **not** starting with `/afk` -> the captain is back.
   Run `bin/fm-afk-launch.sh stop`: it stops the daemon in the correct order - it SIGTERMs the daemon so its shutdown flush runs **while `state/.afk` is still present** (clearing the flag first makes that flush a no-op via the daemon's presence gate, stranding undelivered escalations), then closes the daemon's own terminal by exact id, then clears `state/.afk` last.
-  Then flush one distilled "while you were out" catch-up (drain `state/.wake-queue`, summarize any pending escalations from `state/.subsuper-escalations` and any `state/.subsuper-inject-wedged` marker), and resume full per-wake responsiveness through the emitted primary-harness supervision protocol from session start.
+  After it stops, read the reason from every complete residual `state/.subsuper-intake/*.wake` into the current catch-up, treat any reason that is not confidently routine as captain-relevant, and remove each wake file only after its reason is captured.
+  Then flush one distilled "while you were out" catch-up by draining `state/.wake-queue` and summarizing pending `state/.subsuper-escalations` plus any `state/.subsuper-inject-wedged` marker before resuming full per-wake responsiveness through the emitted primary-harness supervision protocol from session start.
 - A message **with** the sentinel marker (`FM_INJECT_MARK`, ASCII 0x1f) -> it
   is a daemon escalation; stay afk and process it.
 - Re-invoking `/afk` while already away -> stay afk (refresh the flag); this

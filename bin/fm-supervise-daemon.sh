@@ -1238,6 +1238,13 @@ drain_intake() {  # <state>
   return "$status"
 }
 
+drain_intake_then_flush() {  # <state>
+  local state=$1 status=0
+  drain_intake "$state" || status=1
+  escalate_flush "$state" || status=1
+  return "$status"
+}
+
 # --- log --------------------------------------------------------------------
 # Uses LOG set by fm_super_main; harmless no-op-ish if unset (tests source fns
 # directly and pass state explicitly, so they do not call log).
@@ -1377,11 +1384,11 @@ fm_super_main() {
   cleanup() {
     trap - TERM INT
     wedge_alarm_stop_active_notifier
-    escalate_flush "$STATE" 2>/dev/null || true
     if [ -n "${WATCHER_PID:-}" ]; then
       kill "$WATCHER_PID" 2>/dev/null || true
       wait "$WATCHER_PID" 2>/dev/null || true
     fi
+    drain_intake_then_flush "$STATE" 2>/dev/null || true
     if [ -n "${CUR_TMP:-}" ]; then
       rm -f "$CUR_TMP" 2>/dev/null || true
     fi
