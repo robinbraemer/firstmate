@@ -369,6 +369,7 @@ EOF
     exit 1
   fi
   scan_out=$(scan_lab_processes "$scan_lab" "$scan_pid_root" "$scan_root_identity")
+  scan_child_tracked=$(tracked_processes "$(printf '%s\n' "$scan_out" | awk -v child="$scan_pid_child" '$1 == child')")
   if [ "$(printf '%s\n' "$scan_out" | awk 'NF { count += 1 } END { print count + 0 }')" -lt 4 ] \
     || ! printf '%s\n' "$scan_out" | awk -v one="$scan_pid_one" -v two="$scan_pid_two" \
       -v root="$scan_pid_root" -v child="$scan_pid_child" \
@@ -380,11 +381,10 @@ EOF
     printf 'not ok - Pi live cleanup left processes: %s\n' "$(scan_lab_processes "$scan_lab" "$scan_pid_root" "$scan_root_identity")" >&2
     exit 1
   }
-  for _ in $(seq 1 20); do
-    kill -0 "$scan_pid_child" 2>/dev/null || break
-    sleep 0.05
-  done
-  if kill -0 "$scan_pid_child" 2>/dev/null; then
+  scan_child_identity=${scan_child_tracked#* }
+  tracked_process_alive "$scan_pid_child" "$scan_child_identity"
+  scan_child_status=$?
+  if [ "$scan_child_status" -ne 1 ]; then
     kill -KILL "$scan_pid_child" 2>/dev/null || true
     printf 'not ok - Pi live cleanup lost reparented descendant %s\n' "$scan_pid_child" >&2
     exit 1
