@@ -351,7 +351,7 @@ fm_backend_zellij_create_task() {  # <session> <label> <cwd>
   esac
   i=0
   pane_id=
-  while [ "$i" -lt 20 ]; do
+  while [ "$i" -lt 100 ]; do
     pane_id=$(fm_backend_zellij_pane_for_tab "$session" "$tab_id")
     [ -z "$pane_id" ] || break
     i=$((i + 1))
