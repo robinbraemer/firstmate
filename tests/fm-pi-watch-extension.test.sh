@@ -394,12 +394,13 @@ import { pathToFileURL } from "node:url";
 
 const handlers = new Map();
 const statuses = [];
+const wakes = [];
 let tool;
 const pi = {
   on(event, handler) { handlers.set(event, handler); },
   registerCommand() {},
   registerTool(candidate) { if (candidate.name === "fm_watch_arm_pi") tool = candidate; },
-  sendMessage() {},
+  sendMessage(message, options) { wakes.push({ message, options }); },
 };
 const lines = (path) => existsSync(path) ? readFileSync(path, "utf8").trim().split("\n").filter(Boolean) : [];
 const waitFor = async (predicate, message) => {
@@ -436,6 +437,7 @@ if (lines(process.env.FM_START_LOG).length !== 1) throw new Error("manual arm st
 rmSync(`${process.env.FM_HOME}/state/.afk`);
 await handlers.get("tool_execution_end")?.({ type: "tool_execution_end", toolName: "bash" }, {});
 await waitFor(() => lines(process.env.FM_START_LOG).length === 2, "watcher did not reconcile after away-mode exit");
+if (wakes.length !== 0) throw new Error(`intentional away-mode stop emitted a wake: ${JSON.stringify(wakes)}`);
 if (statuses.at(-1) !== "watching") throw new Error(`second resumed status: ${statuses}`);
 await handlers.get("session_shutdown")?.({ reason: "done" }, {});
 EOF

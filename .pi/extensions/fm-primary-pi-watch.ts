@@ -331,7 +331,11 @@ function settleArm(
     stdoutTruncated: record.stdoutTruncated,
     stderrTruncated: record.stderrTruncated,
   };
-  if (existsSync(`${state}/.afk`) || (kind === "actionable" && record.intentionalStopReason)) {
+  const awayModeActive = existsSync(`${state}/.afk`);
+  const shouldDefer = kind === "actionable"
+    ? awayModeActive || Boolean(record.intentionalStopReason)
+    : awayModeActive && !record.intentionalStopReason;
+  if (shouldDefer) {
     coordinator.pendingWake = { message, details };
     return;
   }
