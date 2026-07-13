@@ -153,6 +153,10 @@ The decision persists for the repo, so later worktrees of the same project skip 
 Resume after exit with `codex resume <session-id>`.
 The session id is printed on quit.
 
+Every Firstmate-launched Codex crewmate, scout, and secondmate must preserve `HOME=/Users/robin` and explicitly unset ambient `CODEX_HOME` at the Codex process boundary.
+Apply the same canonical auth boundary to Codex launch, resume, and recovery work, and never request an Orca login.
+Pi Quota Router credentials are separate and Pi-only.
+
 **Primary-session guard fact (verified 2026-07-08, codex-cli 0.142.1).**
 The firstmate PRIMARY's own `.codex/hooks.json` registers a Stop hook that pipes Codex's Stop payload to `bin/fm-turnend-guard.sh`.
 Codex Stop hooks block on exit 2 and expose `stop_hook_active` for the same one-block loop safety Claude uses.
