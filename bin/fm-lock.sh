@@ -4,6 +4,7 @@
 # which lives as long as the firstmate session - unlike the transient subshell
 # PID of any one tool call, which is dead moments after it is written.
 # Usage: fm-lock.sh           acquire; exit 1 if another live session holds it
+#                             or another lock claim is in progress
 #        fm-lock.sh status    print holder and liveness; always exits 0
 set -u
 

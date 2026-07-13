@@ -448,6 +448,16 @@ wait_for_text_line() {
   return 1
 }
 
+wait_for_turn_idle() {
+  local attempts=${1:-120} i=0
+  while [ "$i" -lt "$attempts" ]; do
+    current_lines | grep -Fq 'Working...' || return 0
+    sleep 0.1
+    i=$((i + 1))
+  done
+  return 1
+}
+
 wait_for_status() {
   local expected=$1 attempts=${2:-120} i=0
   while [ "$i" -lt "$attempts" ]; do
@@ -593,10 +603,13 @@ arm_pid=$(ps -p "$watcher_pid" -o ppid= | tr -d ' ')
 if [ -z "$arm_pid" ] || ! kill -0 "$arm_pid" 2>/dev/null; then
   fail "watcher arm process was not live"
 fi
-send_prompt 'After a FIRSTMATE WATCHER WAKE, run bin/fm-wake-drain.sh, do not re-arm, and finish exactly WAKE-HANDLED.'
+send_prompt 'Reply exactly WAKE-READY now. On the next FIRSTMATE WATCHER WAKE, run bin/fm-wake-drain.sh, do not re-arm, and finish exactly WAKE-HANDLED.'
+wait_for_text_line WAKE-READY 180 || fail "Pi did not acknowledge the watcher-wake instruction"
+wait_for_turn_idle 180 || fail "Pi did not settle after acknowledging the watcher-wake instruction"
 wake_count=$(text_count WAKE-HANDLED)
 printf 'done: pi live e2e watcher fire\n' > "$PROJECT/state/pi-e2e.status"
 wait_for_text_count_after WAKE-HANDLED "$wake_count" 180 || fail "Pi did not handle the watcher wake"
+wait_for_turn_idle 180 || fail "Pi did not settle after handling the watcher wake"
 wait_pid_dead "$watcher_pid" || fail "completed watcher survived automatic re-arm"
 wait_pid_dead "$arm_pid" || fail "completed arm survived automatic re-arm"
 new_watcher_pid=$(wait_for_live_watcher_pid "$watcher_pid" 120) \
