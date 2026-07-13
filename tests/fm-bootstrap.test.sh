@@ -115,9 +115,9 @@ make_fake_fleet_sync_root() {
   mkdir -p "$fake_root/bin"
   cat > "$fake_root/bin/fm-fleet-sync.sh" <<'SH'
 #!/usr/bin/env bash
-[ -z "${FM_FAKE_FLEET_SYNC_STARTED_MARKER:-}" ] || : > "$FM_FAKE_FLEET_SYNC_STARTED_MARKER"
 printf '%s\n' 'alpha: synced'
 printf '%s\n' 'beta: skipped: no origin remote'
+[ -z "${FM_FAKE_FLEET_SYNC_STARTED_MARKER:-}" ] || : > "$FM_FAKE_FLEET_SYNC_STARTED_MARKER"
 exec perl -e 'sleep 300'
 SH
   chmod +x "$fake_root/bin/fm-fleet-sync.sh"
@@ -150,19 +150,20 @@ add_no_origin_projects() {
 run_bootstrap_timeout_case() {
   local home=$1 fake_root=$2 fakebin=$3 override started_marker git_record wait_for_marker
   override=__unset__
-  started_marker=${5:-}
+  started_marker=${5:-"$home/fleet-output-ready"}
   git_record=${6:-}
   wait_for_marker=${7:-0}
   [ "$#" -lt 4 ] || override=$4
   (
     # shellcheck disable=SC2317,SC2329 # Exported and invoked by the bootstrap subprocess.
     sleep() {
-      local inc=${1:-1}
-      SECONDS=$((SECONDS + inc))
-      if [ "${FM_FAKE_SLEEP_YIELDS:-0}" -lt 5 ]; then
-        FM_FAKE_SLEEP_YIELDS=$((${FM_FAKE_SLEEP_YIELDS:-0} + 1))
+      local inc=${1:-1} tries=0
+      while [ ! -e "$FM_FAKE_FLEET_SYNC_STARTED_MARKER" ] && [ "$tries" -lt 100 ]; do
         command sleep 0.01
-      fi
+        tries=$((tries + 1))
+      done
+      [ -e "$FM_FAKE_FLEET_SYNC_STARTED_MARKER" ] || exit 1
+      SECONDS=$((SECONDS + inc))
     }
     # shellcheck disable=SC2317,SC2329 # Exported and invoked by the bootstrap subprocess.
     git() {
