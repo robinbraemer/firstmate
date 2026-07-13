@@ -586,6 +586,31 @@ test_handle_wake_routes_self_and_escalate() {
   pass "handle_wake routes routine->self and captain->escalate"
 }
 
+test_daemon_drains_durable_intake_without_immediate_injection() {
+  local dir state intake
+  dir=$(make_supercase intake-drain)
+  state="$dir/state"
+  intake="$state/.subsuper-intake"
+  mkdir -p "$intake"
+  printf 'working\n' > "$state/intake-routine.status"
+  printf 'signal: %s\n' "$state/intake-routine.status" > "$intake/routine.wake"
+  printf 'check: %s: captain decision needed\n' "$state/intake.check.sh" > "$intake/check.wake"
+  printf 'check: ignored temporary file\n' > "$intake/write.tmp"
+
+  [ -s "$intake/routine.wake" ] && [ -s "$intake/check.wake" ] \
+    || fail "pre-start daemon intake did not persist"
+  FM_STATE_OVERRIDE="$state" FM_ESCALATE_BATCH_SECS=999 drain_intake "$state" \
+    || fail "daemon did not drain durable intake"
+  [ ! -e "$intake/routine.wake" ] && [ ! -e "$intake/check.wake" ] \
+    || fail "daemon left successfully handled intake behind"
+  [ -e "$intake/write.tmp" ] || fail "daemon consumed an incomplete temporary intake file"
+  grep -F "check: $state/intake.check.sh: captain decision needed" "$state/.subsuper-escalations" >/dev/null 2>&1 \
+    || fail "daemon did not buffer a drained check wake"
+  [ "$(wc -l < "$state/.subsuper-escalations" | tr -d ' ')" -eq 1 ] \
+    || fail "daemon escalated a routine intake wake"
+  pass "daemon drains and classifies durable intake without consuming temporary files"
+}
+
 test_inject_skip_forces_self() {
   local dir state
   dir=$(make_supercase skip)
@@ -1680,6 +1705,7 @@ test_escalate_batches_into_one_digest
 test_escalate_batch_age_uses_first_append
 test_heartbeat_scan_dedup
 test_handle_wake_routes_self_and_escalate
+test_daemon_drains_durable_intake_without_immediate_injection
 test_inject_skip_forces_self
 test_is_wake_reason_distinguishes_status_stdout
 test_terminal_stale_escalate_leaves_no_marker

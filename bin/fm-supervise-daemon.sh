@@ -33,8 +33,8 @@
 #     to daemon-owned one-shot behavior and enqueues every wake to
 #     state/.wake-queue BEFORE advancing its suppression markers, so a
 #     crash/restart/missed injection is recovered on the next fm-wake-drain.sh.
-#     The daemon does not touch the queue; it only reads the watcher's stdout
-#     reason.
+#     The daemon leaves that queue to firstmate and classifies watcher stdout
+#     plus atomically spooled state/.subsuper-intake/*.wake handoffs.
 #   - Fail-safe-to-escalate: any wake the classifier cannot confidently mark
 #     routine is escalated.
 #   - Bounded wedge latency: a stale pane without a declared external wait is
@@ -1163,7 +1163,7 @@ handle_wake() {  # <reason> <state>
   local kind="" arg=""
   if should_force_self "$reason"; then
     log "wake force-self (FM_INJECT_SKIP): $reason"
-    return
+    return 0
   fi
   case "$reason" in
     signal:*) kind=signal; arg="${reason#signal: }"
@@ -1180,7 +1180,7 @@ handle_wake() {  # <reason> <state>
   case "$action" in
     escalate)
       log "escalate: $reason -> $distilled"
-      escalate_add "$state" "$distilled"
+      escalate_add "$state" "$distilled" || return 1
       # A terminal-stale escalate must not leave a persistence marker behind, or
       # housekeeping re-escalates the same pane as a false wedge later.
       [ "$kind" = "stale" ] && stale_marker_remove "$arg" "$state"
@@ -1216,6 +1216,26 @@ handle_wake() {  # <reason> <state>
       log "self-handle: $reason -> $distilled"
       ;;
   esac
+  return 0
+}
+
+drain_intake() {  # <state>
+  local state=$1 intake wake reason status=0
+  intake="$state/.subsuper-intake"
+  [ -d "$intake" ] || return 0
+  for wake in "$intake"/*.wake; do
+    [ -f "$wake" ] || continue
+    if ! reason=$(cat -- "$wake") || [ -z "$reason" ]; then
+      status=1
+      continue
+    fi
+    if handle_wake "$reason" "$state"; then
+      rm -f -- "$wake" || status=1
+    else
+      status=1
+    fi
+  done
+  return "$status"
 }
 
 # --- log --------------------------------------------------------------------
@@ -1350,6 +1370,7 @@ fm_super_main() {
   afk_active "$STATE" && afk_status="on"
   log "daemon starting (pid $$); target=$TARGET; target_source=$target_source; backend=$BACKEND; backend_source=$backend_source; afk=$afk_status; inject_skip='${FM_INJECT_SKIP:-$INJECT_SKIP_DEFAULT}'; stale_escalate=${FM_STALE_ESCALATE_SECS:-$STALE_ESCALATE_SECS_DEFAULT}s; batch=${FM_ESCALATE_BATCH_SECS:-$ESCALATE_BATCH_SECS_DEFAULT}s"
   migrate_watcher_pause_markers "$STATE"
+  drain_intake "$STATE" || log "warn: durable intake drain incomplete; retained for retry"
 
   # --- shutdown: flush buffered escalations, reap child, release lock -------
   local WATCHER_PID="" CUR_TMP=""
@@ -1399,6 +1420,7 @@ fm_super_main() {
 
   local rc reason
   while true; do
+    drain_intake "$STATE" || log "warn: durable intake drain incomplete; retained for retry"
     # --- pane-gone guard (preserved) ---------------------------------------
     # With the #29 watcher's enqueue-before-suppress, a wake is no longer
     # swallowed by running the watcher with no injection target. We still back

@@ -1,7 +1,7 @@
 // Firstmate primary watcher bridge for Pi.
 import { spawn, spawnSync, type ChildProcess } from "node:child_process";
-import { createHash } from "node:crypto";
-import { existsSync, mkdirSync, readFileSync, realpathSync, writeFileSync } from "node:fs";
+import { createHash, randomUUID } from "node:crypto";
+import { existsSync, mkdirSync, readFileSync, realpathSync, renameSync, unlinkSync, writeFileSync } from "node:fs";
 import { dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
@@ -88,6 +88,8 @@ const config = process.env.FM_CONFIG_OVERRIDE || `${fmHome}/config`;
 const armScript = `${fmRoot}/bin/fm-watch-arm.sh`;
 const lockScript = `${fmRoot}/bin/fm-lock.sh`;
 const marker = `${state}/.pi-watch-extension-loaded`;
+const awayIntakeDir = `${state}/.subsuper-intake`;
+const extensionSessionId = `${process.pid}-${randomUUID()}`;
 const extensionVersion = `sha256:${createHash("sha256").update(readFileSync(extensionFile)).digest("hex")}`;
 const MAX_CAPTURE_BYTES = 16 * 1024;
 const MAX_PENDING_LINE_BYTES = 4 * 1024;
@@ -242,7 +244,37 @@ function awayModeActive(): boolean {
 }
 
 function cadenceFingerprint(): string {
-  return existsSync(`${config}/x-mode.env`) ? "x-mode" : "default";
+  let interval = process.env.FM_CHECK_INTERVAL || "300";
+  try {
+    const contents = readFileSync(`${config}/x-mode.env`, "utf8");
+    for (const line of contents.split(/\r?\n/)) {
+      const match = line.match(/^\s*(?:export\s+)?FM_CHECK_INTERVAL\s*=\s*(?:"([0-9]+)"|'([0-9]+)'|([0-9]+))\s*(?:#.*)?$/);
+      if (match) interval = match[1] || match[2] || match[3];
+    }
+  } catch {}
+  return `FM_CHECK_INTERVAL=${interval}`;
+}
+
+function transferWakeToAway(coordinator: ArmCoordinator, wake: PendingWake): boolean {
+  const target = `${awayIntakeDir}/${extensionSessionId}-${wake.details.generation}.wake`;
+  if (existsSync(target)) {
+    if (coordinator.pendingWake === wake) coordinator.pendingWake = null;
+    return true;
+  }
+  const temporary = `${awayIntakeDir}/.${extensionSessionId}-${wake.details.generation}-${randomUUID()}.tmp`;
+  try {
+    mkdirSync(awayIntakeDir, { recursive: true, mode: 0o700 });
+    writeFileSync(temporary, `${wake.message}\n`, { encoding: "utf8", flag: "wx", mode: 0o600 });
+    renameSync(temporary, target);
+    if (coordinator.pendingWake === wake) coordinator.pendingWake = null;
+    return true;
+  } catch {
+    try {
+      unlinkSync(temporary);
+    } catch {}
+    coordinator.pendingWake = wake;
+    return false;
+  }
 }
 
 function actionableLine(line: string): string {
@@ -328,12 +360,15 @@ function settleArm(
     stderrTruncated: record.stderrTruncated,
   };
   if (record.intentionalStopReason && kind === "actionable") {
-    if (record.intentionalStopReason !== "away-mode") coordinator.pendingWake = { message, details };
+    const wake = { message, details };
+    if (record.intentionalStopReason === "away-mode") transferWakeToAway(coordinator, wake);
+    else coordinator.pendingWake = wake;
     return;
   }
   if (!ownsGeneration || coordinator.shuttingDown || record.intentionalStopReason) return;
   if (awayModeActive()) {
-    publishStatus(coordinator, "offline");
+    const transferred = transferWakeToAway(coordinator, { message, details });
+    publishStatus(coordinator, transferred ? "offline" : "attention");
     return;
   }
   if (kind === "failure") publishStatus(coordinator, "attention");
@@ -505,7 +540,11 @@ export default function (pi: ExtensionAPI) {
     if (awayModeActive()) {
       const record = coordinator.current;
       if (record) await stopArmRecord(coordinator, record, "away-mode");
-      coordinator.pendingWake = null;
+      const pendingWake = coordinator.pendingWake;
+      if (pendingWake && !transferWakeToAway(coordinator, pendingWake)) {
+        publishStatus(coordinator, "attention");
+        return { ok: false, message: "watcher: FAILED - away-mode wake handoff failed" };
+      }
       publishStatus(coordinator, "offline");
       return { ok: true, message: "watcher: paused - away mode owns supervision" };
     }
@@ -621,8 +660,7 @@ export default function (pi: ExtensionAPI) {
     const pendingWake = coordinator.pendingWake;
     if (pendingWake) {
       if (awayModeActive()) {
-        coordinator.pendingWake = null;
-        publishStatus(coordinator, "offline");
+        publishStatus(coordinator, transferWakeToAway(coordinator, pendingWake) ? "offline" : "attention");
       } else {
         try {
           await client.sendWake(pendingWake.message, pendingWake.details);

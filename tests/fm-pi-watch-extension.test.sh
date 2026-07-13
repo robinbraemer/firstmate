@@ -383,13 +383,13 @@ test_pi_watcher_hands_off_during_away_mode() {
   cat > "$repo/bin/fm-watch-arm.sh" <<'SH'
 #!/usr/bin/env bash
 printf 'start\n' >> "$FM_START_LOG"
-trap 'printf "signal: away-owned wake\n"; printf "clean\n" >> "$FM_CLEAN_LOG"; exit 0' TERM INT
+trap 'printf "check: /tmp/away.check.sh: captain decision needed\n"; printf "clean\n" >> "$FM_CLEAN_LOG"; exit 0' TERM INT
 while :; do sleep 1; done
 SH
   chmod +x "$repo/bin/fm-watch-arm.sh"
   out=$(PLUGIN="$plugin" FM_HOME="$home" FM_ROOT_OVERRIDE="$repo" FM_START_LOG="$starts" \
     FM_CLEAN_LOG="$cleaned" node --input-type=module 2>&1 <<'EOF'
-import { existsSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
 import { pathToFileURL } from "node:url";
 
 const handlers = new Map();
@@ -421,11 +421,20 @@ await handlers.get("tool_execution_end")?.({ type: "tool_execution_end", toolNam
 await waitForCount(process.env.FM_START_LOG, 1);
 
 writeFileSync(`${process.env.FM_HOME}/state/.afk`, "away\n");
+writeFileSync(`${process.env.FM_HOME}/state/.subsuper-intake`, "blocked\n");
 await handlers.get("tool_execution_end")?.({ type: "tool_execution_end", toolName: "bash" }, {});
 await waitForCount(process.env.FM_CLEAN_LOG, 1);
-if (statuses.at(-1) !== "offline") throw new Error(`away status: ${statuses}`);
+if (statuses.at(-1) !== "attention") throw new Error(`failed handoff status: ${statuses}`);
 const paused = await tool.execute("away", {}, undefined, undefined, {});
-if (!paused.content[0].text.includes("away mode")) throw new Error(`away result: ${JSON.stringify(paused)}`);
+if (paused.details.ok || !paused.content[0].text.includes("handoff failed")) throw new Error(`failed away result: ${JSON.stringify(paused)}`);
+rmSync(`${process.env.FM_HOME}/state/.subsuper-intake`);
+const retried = await tool.execute("away", {}, undefined, undefined, {});
+if (!retried.details.ok || !retried.content[0].text.includes("away mode")) throw new Error(`away retry: ${JSON.stringify(retried)}`);
+const intakeDir = `${process.env.FM_HOME}/state/.subsuper-intake`;
+const wakeFiles = readdirSync(intakeDir).filter((name) => name.endsWith(".wake"));
+if (wakeFiles.length !== 1 || readFileSync(`${intakeDir}/${wakeFiles[0]}`, "utf8").trim() !== "check: /tmp/away.check.sh: captain decision needed") {
+  throw new Error(`away intake: ${wakeFiles}`);
+}
 await new Promise((resolve) => setTimeout(resolve, 50));
 if (lines(process.env.FM_START_LOG).length !== 1) throw new Error("away mode re-armed Pi");
 if (wakes.length !== 0) throw new Error(`away mode emitted a Pi wake: ${JSON.stringify(wakes)}`);
@@ -478,10 +487,12 @@ const waitForCount = async (expected) => {
   if (lines(process.env.FM_START_LOG).length !== expected) throw new Error(`expected ${expected} starts, got ${lines(process.env.FM_START_LOG)}`);
 };
 writeFileSync(`${process.env.FM_HOME}/state/.lock`, `${process.pid}\n`);
+writeFileSync(`${process.env.FM_HOME}/config/x-mode.env`, "# stale bootstrap output\nexport FM_CHECK_INTERVAL=60\n");
 const mod = await import(pathToFileURL(process.env.PLUGIN).href);
 mod.default(pi);
 await handlers.get("session_start")?.({}, { ui: { setStatus() {} } });
 await waitForCount(1);
+if (lines(process.env.FM_START_LOG)[0] !== "interval=60") throw new Error(`stale cadence not applied initially: ${lines(process.env.FM_START_LOG)}`);
 
 await handlers.get("tool_execution_end")?.({ type: "tool_execution_end", toolName: "read" }, {});
 await new Promise((resolve) => setTimeout(resolve, 50));
