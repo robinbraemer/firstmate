@@ -659,6 +659,25 @@ real_path_or_raw() {  # <path>
   fi
 }
 
+git_common_dir_real() {  # <git-worktree-or-checkout>
+  local path=$1 common
+  common=$(git -C "$path" rev-parse --git-common-dir 2>/dev/null) || return 1
+  case "$common" in
+    /*) ;;
+    *) common="$path/$common" ;;
+  esac
+  (cd "$common" 2>/dev/null && pwd -P)
+}
+
+spawn_path_is_project_worktree() {  # <candidate-path>
+  local candidate=$1 candidate_real candidate_common project_common
+  candidate_real=$(real_path_or_raw "$candidate")
+  [ "$candidate_real" != "$PROJ_ABS_REAL" ] || return 1
+  candidate_common=$(git_common_dir_real "$candidate_real") || return 1
+  project_common=$(git_common_dir_real "$PROJ_ABS_REAL") || return 1
+  [ "$candidate_common" = "$project_common" ]
+}
+
 # Session-provider container-ensure + task creation. tmux stays exactly as P1
 # left it (same session-name / new-window sequence, see bin/backends/tmux.sh);
 # a herdr spawn goes through the version-gated, workspace-per-HOME,
@@ -835,12 +854,13 @@ if [ "$KIND" != secondmate ] && [ "$BACKEND" != orca ]; then
   # automatic-rename slips through), display-message -t <bad-name> falls back to the
   # active client's window, which would misread firstmate's OWN pane path as the
   # worktree and tangle a hook into the primary checkout. The window id never lies.
-  # Compare against PROJ_ABS_REAL (physical), not PROJ_ABS: a symlinked project
-  # prefix would otherwise make the pane's OS-level cwd read differ from
-  # PROJ_ABS on the very first poll, before the pane has actually moved.
+  # Accept only a linked worktree from the same Git common directory as the
+  # project. A new shell can briefly report an unrelated Git cwd from startup
+  # files (for example ~/.oh-my-zsh); merely checking that it differs from the
+  # project would persist that transient path into task metadata.
   for _ in $(seq 1 60); do
     p=$(spawn_current_path "$WT_TARGET" || true)
-    if [ -n "$p" ] && [ "$(real_path_or_raw "$p")" != "$PROJ_ABS_REAL" ]; then
+    if [ -n "$p" ] && spawn_path_is_project_worktree "$p"; then
       WT="$p"
       break
     fi

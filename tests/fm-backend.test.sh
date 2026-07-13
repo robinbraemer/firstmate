@@ -871,6 +871,43 @@ test_spawn_symlinked_project_prefix_avoids_false_refusal() {
   pass "fm-spawn.sh: a project reached through a symlinked prefix (e.g. macOS /tmp -> /private/tmp) does not trip the isolation guard's false refusal"
 }
 
+# A newly-created backend shell can briefly report a cwd from its startup
+# files before settling in the requested project directory. The real Herdr
+# smoke caught zsh startup inside ~/.oh-my-zsh here: because that directory is
+# itself a Git repo, the old "different Git root" check accepted it as the
+# acquired worktree and persisted it into task metadata. The sequenced-cwd fake
+# reports that unrelated Git worktree once, then the requested project's real
+# linked worktree. fm-spawn must ignore the unrelated root.
+
+test_spawn_ignores_unrelated_startup_git_cwd() {
+  local dir startup_project startup_repo proj wt data id state config log fb out rc
+  dir="$TMP_ROOT/startup-cwd"
+  startup_project="$dir/unrelated-startup-project"
+  startup_repo="$dir/unrelated-startup-repo"
+  proj="$dir/project"
+  wt="$dir/worktree"
+  data="$dir/data"
+  id="spawnstartupcwd"
+  fm_git_worktree "$startup_project" "$startup_repo" "startup-shell"
+  fm_git_worktree "$proj" "$wt" "fm/$id"
+  fb=$(make_spawn_symlink_fakebin "$dir/fake" "$startup_repo" "$wt")
+  mkdir -p "$data/$id"
+  printf 'test brief content\n' > "$data/$id/brief.md"
+  state="$dir/state"
+  config="$dir/config"
+  mkdir -p "$state" "$config"
+  log="$dir/spawn.log"
+
+  out=$(run_spawn_case "$ROOT" "$fb" "$log" "$state" "$data" "$config" "$proj" -- "$id" "$proj" claude 2>&1)
+  rc=$?
+  expect_code 0 "$rc" "fm-spawn.sh should ignore an unrelated Git cwd during backend shell startup"$'\n'"$out"
+  assert_contains "$out" "worktree=$wt" \
+    "fm-spawn.sh accepted an unrelated startup Git cwd instead of the project's linked worktree"
+
+  rm -rf "/tmp/fm-$id"
+  pass "fm-spawn.sh: ignores an unrelated startup Git cwd when resolving the project worktree"
+}
+
 # --- old vs new: fm-teardown.sh ----------------------------------------------
 
 make_teardown_fakebin() {  # <dir> -> echoes fakebin dir; logs tmux+treehouse calls
@@ -1082,6 +1119,7 @@ test_backend_of_selector_matches_explicit_target_meta
 test_send_conformance_old_vs_new
 test_peek_conformance_old_vs_new
 test_spawn_symlinked_project_prefix_avoids_false_refusal
+test_spawn_ignores_unrelated_startup_git_cwd
 test_teardown_conformance_old_vs_new
 test_spawn_refuses_unknown_backend_flag
 test_spawn_refuses_codex_app_backend_flag

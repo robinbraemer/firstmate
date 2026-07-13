@@ -190,6 +190,16 @@ pass "real zellij: kill removes the pane+tab and is idempotent/best-effort"
 # --- list_live (name-based recovery discovery) --------------------------------
 
 LABEL2="fm-smoke2"
+# Closing the last task tab ends a headless Zellij session. A normal fm-spawn
+# always runs container_ensure before create_task, so repeat that lifecycle
+# step here after the asynchronous session shutdown settles instead of calling
+# the lower-level create primitive on a dead session.
+for _ in $(seq 1 30); do
+  fm_backend_zellij_session_exists "$SESSION" || break
+  sleep 0.1
+done
+CONTAINER3=$(fm_backend_zellij_container_ensure) || fail "container_ensure after last-tab teardown failed"
+[ "$CONTAINER3" = "$SESSION" ] || fail "container_ensure after last-tab teardown returned '$CONTAINER3', expected '$SESSION'"
 TASK_IDS2=$(fm_backend_zellij_create_task "$SESSION" "$LABEL2" /tmp) || fail "second create_task failed"
 read -r _TAB_ID2 PANE_ID2 <<EOF
 $TASK_IDS2
