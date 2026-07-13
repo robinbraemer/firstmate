@@ -516,6 +516,9 @@ export default function (pi: ExtensionAPI) {
       return { ok: true, message: "watcher: healthy - Pi extension already has an arm child" };
     }
     if (coordinator.current) await stopArmRecord(coordinator, coordinator.current, "cadence-change");
+    if (coordinator.startCancelled || coordinator.shuttingDown || coordinator.clients.size === 0) {
+      return { ok: false, message: "watcher: not started - Pi extension session shut down" };
+    }
     const pendingWake = coordinator.pendingWake;
     if (pendingWake) {
       const activeClient = [...coordinator.clients.values()].reverse().find((candidate) => candidate.active);
@@ -524,6 +527,9 @@ export default function (pi: ExtensionAPI) {
         if (coordinator.pendingWake === pendingWake) coordinator.pendingWake = null;
         publishStatus(coordinator, "handling wake");
       }
+    }
+    if (coordinator.startCancelled || coordinator.shuttingDown || coordinator.clients.size === 0) {
+      return { ok: false, message: "watcher: not started - Pi extension session shut down" };
     }
 
     const id = ++coordinator.sequence;
@@ -650,7 +656,8 @@ export default function (pi: ExtensionAPI) {
       try {
         if (pendingStart) await pendingStart.catch(() => undefined);
         if (coordinator.shutdownToken !== shutdownToken) return;
-        if (record) await stopArmRecord(coordinator, record, reason);
+        const currentRecord = coordinator.current;
+        if (currentRecord) await stopArmRecord(coordinator, currentRecord, reason);
         if (coordinator.shutdownToken !== shutdownToken) return;
       } finally {
         if (coordinator.shutdownToken === shutdownToken) {

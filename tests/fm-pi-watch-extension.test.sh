@@ -442,6 +442,76 @@ EOF
   pass "Pi watcher reconciles only effective cadence changes"
 }
 
+test_pi_shutdown_cancels_cadence_restart_during_cleanup() {
+  local repo home plugin starts stops out status
+  repo="$TMP_ROOT/pi-shutdown-cadence-root"
+  home="$TMP_ROOT/pi-shutdown-cadence-home"
+  starts="$TMP_ROOT/pi-shutdown-cadence-starts"
+  stops="$TMP_ROOT/pi-shutdown-cadence-stops"
+  mkdir -p "$repo/bin" "$home/state" "$home/config"
+  install_pi_watch_extension_fixture "$repo"
+  plugin="$repo/.pi/extensions/fm-primary-pi-watch.ts"
+  cat > "$repo/bin/fm-watch-arm.sh" <<'SH'
+#!/usr/bin/env bash
+printf 'pid=%s interval=%s\n' "$$" "${FM_CHECK_INTERVAL:-300}" >> "$FM_START_LOG"
+trap 'printf "stopping\n" >> "$FM_STOP_LOG"; sleep 0.2; printf "stopped\n" >> "$FM_STOP_LOG"; exit 0' TERM INT
+while :; do sleep 0.05; done
+SH
+  chmod +x "$repo/bin/fm-watch-arm.sh"
+  out=$(PLUGIN="$plugin" FM_HOME="$home" FM_ROOT_OVERRIDE="$repo" FM_START_LOG="$starts" \
+    FM_STOP_LOG="$stops" node --input-type=module 2>&1 <<'EOF'
+import { existsSync, readFileSync, writeFileSync } from "node:fs";
+import { pathToFileURL } from "node:url";
+
+const handlers = new Map();
+const pi = {
+  on(event, handler) { handlers.set(event, handler); },
+  registerCommand() {},
+  registerTool() {},
+  sendMessage() {},
+};
+const lines = (path) => existsSync(path) ? readFileSync(path, "utf8").trim().split("\n").filter(Boolean) : [];
+const waitFor = async (predicate, message) => {
+  for (let i = 0; i < 150 && !predicate(); i += 1) await new Promise((resolve) => setTimeout(resolve, 10));
+  if (!predicate()) throw new Error(message);
+};
+const stopChildren = () => {
+  for (const line of lines(process.env.FM_START_LOG)) {
+    const pid = Number(line.match(/^pid=([0-9]+)/)?.[1]);
+    if (!pid) continue;
+    try { process.kill(-pid, "SIGKILL"); } catch {}
+  }
+};
+writeFileSync(`${process.env.FM_HOME}/state/.lock`, `${process.pid}\n`);
+const mod = await import(pathToFileURL(process.env.PLUGIN).href);
+mod.default(pi);
+await handlers.get("session_start")?.({}, { ui: { setStatus() {} } });
+await waitFor(() => lines(process.env.FM_START_LOG).length === 1, "initial arm did not start");
+
+writeFileSync(`${process.env.FM_HOME}/config/x-mode.env`, "export FM_CHECK_INTERVAL=30\n");
+const cadenceRestart = handlers.get("tool_execution_end")?.({ type: "tool_execution_end", toolName: "bash" }, {});
+await waitFor(() => lines(process.env.FM_STOP_LOG).includes("stopping"), "cadence cleanup did not begin");
+const shutdown = handlers.get("session_shutdown")?.({ reason: "test-shutdown" }, {});
+await Promise.all([cadenceRestart, shutdown]);
+await new Promise((resolve) => setTimeout(resolve, 50));
+
+const startsAfterShutdown = lines(process.env.FM_START_LOG);
+if (startsAfterShutdown.length !== 1) {
+  stopChildren();
+  throw new Error(`shutdown allowed cadence restart: ${startsAfterShutdown}`);
+}
+if (lines(process.env.FM_STOP_LOG).filter((line) => line === "stopped").length !== 1) {
+  stopChildren();
+  throw new Error(`shutdown did not finish cleanup: ${lines(process.env.FM_STOP_LOG)}`);
+}
+EOF
+)
+  status=$?
+  expect_code 0 "$status" "Pi shutdown must cancel a cadence restart while cleanup is in progress"
+  [ -z "$out" ] || fail "Pi shutdown/cadence race test printed output: $out"
+  pass "Pi shutdown cancels cadence restart during cleanup"
+}
+
 test_pi_extension_loads_for_fresh_home_in_primary_checkout() {
   local repo home plugin out status
   repo="$TMP_ROOT/pi-fresh-home-root"
@@ -985,6 +1055,7 @@ test_pi_process_exit_cleanup_listener_lifecycle
 test_pi_process_exit_cleanup_stops_arm_child
 test_pi_watcher_lifecycle_and_status_contract
 test_pi_watcher_restarts_only_for_effective_cadence_changes
+test_pi_shutdown_cancels_cadence_restart_during_cleanup
 test_pi_extension_loads_for_fresh_home_in_primary_checkout
 test_pi_reload_preserves_captured_actionable_wake
 test_pi_live_process_scan_does_not_match_itself
