@@ -138,6 +138,14 @@ function coordinatorForHome(): ArmCoordinator {
     if (existing.clients.size === 0) existing.visibleStatus = "offline";
     existing.shutdownPromise ??= null;
     existing.shutdownToken ??= null;
+    if (existing.pendingWake) {
+      const retained = existing.pendingWake as Partial<PendingWake> & Pick<PendingWake, "message" | "details">;
+      const attempts = retained.failureRetryAttempts;
+      if (typeof attempts !== "number" || !Number.isInteger(attempts) || attempts < 0) {
+        retained.failureRetryAttempts = 0;
+      }
+      retained.failureRetryTimer ??= null;
+    }
     if (!existing.shutdownPromise) {
       existing.shuttingDown = false;
       existing.startCancelled = false;

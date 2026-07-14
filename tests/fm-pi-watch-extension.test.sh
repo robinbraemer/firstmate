@@ -1197,6 +1197,82 @@ EOF
   pass "Pi rejected failure wake retries automatically with a cap"
 }
 
+test_pi_hot_reload_migrates_legacy_failure_retry_state() {
+  local repo home plugin out status
+  repo="$TMP_ROOT/pi-legacy-failure-retry-root"
+  home="$TMP_ROOT/pi-legacy-failure-retry-home"
+  mkdir -p "$repo/bin" "$home/state" "$home/config"
+  install_pi_watch_extension_fixture "$repo"
+  plugin="$repo/.pi/extensions/fm-primary-pi-watch.ts"
+  : > "$repo/bin/fm-watch-arm.sh"
+  chmod +x "$repo/bin/fm-watch-arm.sh"
+  out=$(PLUGIN="$plugin" FM_HOME="$home" FM_ROOT_OVERRIDE="$repo" node --input-type=module 2>&1 <<'EOF'
+import { writeFileSync } from "node:fs";
+import { resolve } from "node:path";
+import { pathToFileURL } from "node:url";
+
+const handlers = new Map();
+let attempts = 0;
+const pi = {
+  on(event, handler) { handlers.set(event, handler); },
+  registerCommand() {},
+  registerTool() {},
+  sendMessage() {
+    attempts += 1;
+    throw new Error("persistent legacy failure-wake delivery rejection");
+  },
+};
+const waitFor = async (predicate, message) => {
+  for (let i = 0; i < 150 && !predicate(); i += 1) await new Promise((resolve) => setTimeout(resolve, 10));
+  if (!predicate()) throw new Error(message);
+};
+
+writeFileSync(`${process.env.FM_HOME}/state/.lock`, `${process.pid}\n`);
+const homeKey = resolve(process.env.FM_HOME);
+globalThis.__firstmatePiWatchCoordinators = new Map([[homeKey, {
+  current: null,
+  generation: 1,
+  sequence: 1,
+  visibleStatus: "attention",
+  startPromise: null,
+  startCancelled: false,
+  shuttingDown: false,
+  shutdownPromise: null,
+  shutdownToken: null,
+  clients: new Map(),
+  pendingWake: {
+    message: "watcher: FAILED - legacy pending failure wake",
+    details: {
+      generation: 1,
+      kind: "failure",
+      reason: "watcher: FAILED - legacy pending failure wake",
+      exitCode: 23,
+      signal: null,
+      truncated: false,
+      stdoutTruncated: false,
+      stderrTruncated: false,
+    },
+  },
+}]]);
+const mod = await import(pathToFileURL(process.env.PLUGIN).href);
+mod.default(pi);
+const retained = globalThis.__firstmatePiWatchCoordinators.get(homeKey)?.pendingWake;
+if (retained?.failureRetryAttempts !== 0 || retained?.failureRetryTimer !== null) {
+  throw new Error(`legacy failure retry state was not migrated: ${JSON.stringify(retained)}`);
+}
+await handlers.get("session_start")?.({}, { ui: { setStatus() {} } });
+await waitFor(() => attempts >= 3, `legacy failure wake was not retried twice: ${attempts}`);
+await new Promise((resolve) => setTimeout(resolve, 250));
+if (attempts !== 3) throw new Error(`legacy failure wake retry was not capped: ${attempts}`);
+await handlers.get("session_shutdown")?.({ reason: "done" }, {});
+EOF
+)
+  status=$?
+  expect_code 0 "$status" "Pi hot reload must migrate legacy failure-wake retry state"
+  [ -z "$out" ] || fail "Pi legacy failure-wake migration test printed output: $out"
+  pass "Pi hot reload migrates legacy failure-wake retry state"
+}
+
 test_pi_settled_failure_retry_defers_during_away_mode() {
   local repo home plugin starts out status
   repo="$TMP_ROOT/pi-failure-retry-away-root"
@@ -1978,6 +2054,7 @@ test_pi_reload_preserves_captured_actionable_wake
 test_pi_pending_wake_delivery_failure_retries
 test_pi_settled_wake_delivery_failure_retries_automatically
 test_pi_settled_failure_delivery_retry_is_bounded
+test_pi_hot_reload_migrates_legacy_failure_retry_state
 test_pi_settled_failure_retry_defers_during_away_mode
 test_pi_settled_failure_retry_stops_on_shutdown
 test_pi_extension_rejects_nonregular_secondmate_markers
