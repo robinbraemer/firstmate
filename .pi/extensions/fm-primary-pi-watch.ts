@@ -1,7 +1,7 @@
 // Firstmate primary watcher bridge for Pi.
 import { spawn, spawnSync, type ChildProcess } from "node:child_process";
 import { createHash } from "node:crypto";
-import { existsSync, mkdirSync, readFileSync, realpathSync, writeFileSync } from "node:fs";
+import { existsSync, lstatSync, mkdirSync, readFileSync, realpathSync, writeFileSync } from "node:fs";
 import { dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
@@ -41,6 +41,8 @@ type StatusClient = WakeSender & {
 type PendingWake = {
   message: string;
   details: WakeDetails;
+  failureRetryAttempts: number;
+  failureRetryTimer: ReturnType<typeof setTimeout> | null;
 };
 
 type ArmRecord = {
@@ -101,12 +103,22 @@ const WATCHER_STATUS_TEXT: Record<WatcherStatus, WatcherStatus> = {
 const requestedStopGrace = Number(process.env.FM_PI_WATCH_STOP_GRACE_MS ?? "1000");
 const STOP_GRACE_MS = Number.isFinite(requestedStopGrace) && requestedStopGrace >= 0 ? requestedStopGrace : 1000;
 const STOP_KILL_GRACE_MS = 500;
+const FAILURE_WAKE_RETRY_LIMIT = 2;
+const FAILURE_WAKE_RETRY_DELAY_MS = 100;
 const AWAY_SUSPENSION_LINE = "watcher: suspended - away mode owns supervision";
 const coordinatorHost = globalThis as CoordinatorHost;
 const coordinators = coordinatorHost.__firstmatePiWatchCoordinators ??= new Map<string, ArmCoordinator>();
 
+function isRegularFile(path: string): boolean {
+  try {
+    return lstatSync(path).isFile();
+  } catch {
+    return false;
+  }
+}
+
 function supervisingHome(): boolean {
-  if (existsSync(`${root}/.fm-secondmate-home`)) return true;
+  if (isRegularFile(`${root}/.fm-secondmate-home`)) return true;
   if (!existsSync(`${root}/AGENTS.md`) || !existsSync(`${root}/bin`)) return false;
   if (process.env.FM_HOME || process.env.FM_ROOT_OVERRIDE) {
     try {
@@ -161,6 +173,52 @@ function publishStatus(coordinator: ArmCoordinator, status: WatcherStatus): void
   if (coordinator.shuttingDown) return;
   coordinator.visibleStatus = status;
   for (const client of coordinator.clients.values()) writeClientStatus(client, status);
+}
+
+function pendingWake(message: string, details: WakeDetails): PendingWake {
+  return {
+    message,
+    details,
+    failureRetryAttempts: 0,
+    failureRetryTimer: null,
+  };
+}
+
+function cancelFailureWakeRetry(coordinator: ArmCoordinator): void {
+  const pending = coordinator.pendingWake;
+  if (!pending?.failureRetryTimer) return;
+  clearTimeout(pending.failureRetryTimer);
+  pending.failureRetryTimer = null;
+}
+
+function scheduleFailureWakeRetry(coordinator: ArmCoordinator, pending: PendingWake): void {
+  if (
+    pending.details.kind !== "failure"
+    || coordinator.pendingWake !== pending
+    || pending.failureRetryTimer
+    || pending.failureRetryAttempts >= FAILURE_WAKE_RETRY_LIMIT
+    || coordinator.shuttingDown
+    || existsSync(`${state}/.afk`)
+  ) return;
+
+  pending.failureRetryTimer = setTimeout(() => {
+    pending.failureRetryTimer = null;
+    if (
+      coordinator.pendingWake !== pending
+      || coordinator.shuttingDown
+      || existsSync(`${state}/.afk`)
+    ) return;
+    const activeClient = [...coordinator.clients.values()].reverse().find((candidate) => candidate.active);
+    if (!activeClient) return;
+    pending.failureRetryAttempts += 1;
+    void activeClient.sendWake(pending.message, pending.details).then(() => {
+      if (coordinator.pendingWake === pending) coordinator.pendingWake = null;
+    }).catch(() => {
+      if (coordinator.pendingWake !== pending || coordinator.shuttingDown) return;
+      publishStatus(coordinator, "attention");
+      scheduleFailureWakeRetry(coordinator, pending);
+    });
+  }, FAILURE_WAKE_RETRY_DELAY_MS);
 }
 
 function parentPid(pid: string): string {
@@ -351,7 +409,7 @@ function settleArm(
     ? awayModeActive || Boolean(record.intentionalStopReason)
     : awayModeActive && !record.intentionalStopReason;
   if (shouldDefer) {
-    coordinator.pendingWake = { message, details };
+    coordinator.pendingWake = pendingWake(message, details);
     return;
   }
   if (ownsGeneration && record.intentionalStopReason === "away-mode") {
@@ -366,10 +424,13 @@ function settleArm(
       await activeClient.sendWake(message, details);
     } catch {
       if (!clientOwnsGeneration(coordinator, activeClient, record.generation)) return;
-      coordinator.pendingWake = { message, details };
+      const pending = pendingWake(message, details);
+      coordinator.pendingWake = pending;
       publishStatus(coordinator, "attention");
       if (kind === "actionable") {
         void activeClient.rearm().catch(() => undefined);
+      } else {
+        scheduleFailureWakeRetry(coordinator, pending);
       }
       return;
     }
@@ -510,6 +571,7 @@ export default function (pi: ExtensionAPI) {
   coordinator.clients.set(client.token, client);
 
   const cleanupOnProcessExit = () => {
+    cancelFailureWakeRetry(coordinator);
     for (const activeClient of coordinator.clients.values()) {
       writeClientStatus(activeClient, undefined);
       activeClient.active = false;
@@ -566,6 +628,7 @@ export default function (pi: ExtensionAPI) {
           await activeClient.sendWake(pendingWake.message, pendingWake.details);
         } catch (error) {
           publishStatus(coordinator, "attention");
+          scheduleFailureWakeRetry(coordinator, pendingWake);
           return {
             ok: false,
             message: error instanceof Error
@@ -688,6 +751,7 @@ export default function (pi: ExtensionAPI) {
 
     coordinator.shuttingDown = true;
     coordinator.startCancelled = true;
+    cancelFailureWakeRetry(coordinator);
     const record = coordinator.current;
     if (record && !record.intentionalStopReason) record.intentionalStopReason = reason;
     coordinator.generation += 1;

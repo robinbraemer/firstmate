@@ -879,6 +879,45 @@ EOF
   pass "Pi extension loads for a fresh FM_HOME in the primary checkout"
 }
 
+test_pi_extension_rejects_nonregular_secondmate_markers() {
+  local repo home plugin marker shape out status
+  repo="$TMP_ROOT/pi-marker-validation-root"
+  home="$TMP_ROOT/pi-marker-validation-home"
+  mkdir -p "$repo/bin" "$home/state" "$home/config"
+  install_pi_watch_extension_fixture "$repo"
+  plugin="$repo/.pi/extensions/fm-primary-pi-watch.ts"
+  marker="$repo/.fm-secondmate-home"
+
+  for shape in directory symlink; do
+    rm -rf "$marker" "$repo/marker-target"
+    if [ "$shape" = directory ]; then
+      mkdir "$marker"
+    else
+      : > "$repo/marker-target"
+      ln -s marker-target "$marker"
+    fi
+    out=$(PLUGIN="$plugin" FM_HOME="$home" FM_ROOT_OVERRIDE="$repo" node --input-type=module 2>&1 <<'EOF'
+import { pathToFileURL } from "node:url";
+
+let tool = null;
+const pi = {
+  on() {},
+  registerCommand() {},
+  registerTool(candidate) { if (candidate.name === "fm_watch_arm_pi") tool = candidate; },
+  sendMessage() {},
+};
+const mod = await import(pathToFileURL(process.env.PLUGIN).href);
+mod.default(pi);
+if (tool) throw new Error("non-regular secondmate marker enabled the watcher extension");
+EOF
+)
+    status=$?
+    expect_code 0 "$status" "Pi extension must reject a $shape secondmate marker"
+    [ -z "$out" ] || fail "Pi $shape marker test printed output: $out"
+  done
+  pass "Pi extension rejects non-regular secondmate markers"
+}
+
 test_pi_reload_preserves_captured_actionable_wake() {
   local repo home plugin ready out status
   repo="$TMP_ROOT/pi-reload-wake-root"
@@ -1108,6 +1147,164 @@ EOF
   expect_code 0 "$status" "Pi settled-wake delivery failure must retry automatically"
   [ -z "$out" ] || fail "Pi settled-wake automatic retry test printed output: $out"
   pass "Pi settled-wake delivery failure retries automatically"
+}
+
+test_pi_settled_failure_delivery_retry_is_bounded() {
+  local repo home plugin out status
+  repo="$TMP_ROOT/pi-failure-retry-root"
+  home="$TMP_ROOT/pi-failure-retry-home"
+  mkdir -p "$repo/bin" "$home/state" "$home/config"
+  install_pi_watch_extension_fixture "$repo"
+  plugin="$repo/.pi/extensions/fm-primary-pi-watch.ts"
+  cat > "$repo/bin/fm-watch-arm.sh" <<'SH'
+#!/usr/bin/env bash
+exit 23
+SH
+  chmod +x "$repo/bin/fm-watch-arm.sh"
+  out=$(PLUGIN="$plugin" FM_HOME="$home" FM_ROOT_OVERRIDE="$repo" node --input-type=module 2>&1 <<'EOF'
+import { writeFileSync } from "node:fs";
+import { pathToFileURL } from "node:url";
+
+const handlers = new Map();
+let attempts = 0;
+const pi = {
+  on(event, handler) { handlers.set(event, handler); },
+  registerCommand() {},
+  registerTool() {},
+  sendMessage() {
+    attempts += 1;
+    throw new Error("persistent failure-wake delivery rejection");
+  },
+};
+const waitFor = async (predicate, message) => {
+  for (let i = 0; i < 150 && !predicate(); i += 1) await new Promise((resolve) => setTimeout(resolve, 10));
+  if (!predicate()) throw new Error(message);
+};
+
+writeFileSync(`${process.env.FM_HOME}/state/.lock`, `${process.pid}\n`);
+const mod = await import(pathToFileURL(process.env.PLUGIN).href);
+mod.default(pi);
+await handlers.get("session_start")?.({}, { ui: { setStatus() {} } });
+await waitFor(() => attempts === 3, `failure wake was not retried twice: ${attempts}`);
+await new Promise((resolve) => setTimeout(resolve, 250));
+if (attempts !== 3) throw new Error(`failure wake retry was not capped: ${attempts}`);
+await handlers.get("session_shutdown")?.({ reason: "done" }, {});
+EOF
+)
+  status=$?
+  expect_code 0 "$status" "Pi rejected failure wake must retry automatically with a cap"
+  [ -z "$out" ] || fail "Pi bounded failure-wake retry test printed output: $out"
+  pass "Pi rejected failure wake retries automatically with a cap"
+}
+
+test_pi_settled_failure_retry_defers_during_away_mode() {
+  local repo home plugin starts out status
+  repo="$TMP_ROOT/pi-failure-retry-away-root"
+  home="$TMP_ROOT/pi-failure-retry-away-home"
+  starts="$TMP_ROOT/pi-failure-retry-away-starts"
+  mkdir -p "$repo/bin" "$home/state" "$home/config"
+  install_pi_watch_extension_fixture "$repo"
+  plugin="$repo/.pi/extensions/fm-primary-pi-watch.ts"
+  cat > "$repo/bin/fm-watch-arm.sh" <<'SH'
+#!/usr/bin/env bash
+printf 'start\n' >> "$FM_START_LOG"
+exit 23
+SH
+  chmod +x "$repo/bin/fm-watch-arm.sh"
+  out=$(PLUGIN="$plugin" FM_HOME="$home" FM_ROOT_OVERRIDE="$repo" FM_START_LOG="$starts" node --input-type=module 2>&1 <<'EOF'
+import { existsSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { pathToFileURL } from "node:url";
+
+const handlers = new Map();
+const wakes = [];
+let attempts = 0;
+const pi = {
+  on(event, handler) { handlers.set(event, handler); },
+  registerCommand() {},
+  registerTool() {},
+  sendMessage(message, options) {
+    attempts += 1;
+    if (attempts === 1) {
+      writeFileSync(`${process.env.FM_HOME}/state/.afk`, "away\n");
+      throw new Error("failure-wake delivery entered away mode");
+    }
+    wakes.push({ message, options });
+  },
+};
+const lines = (path) => existsSync(path) ? readFileSync(path, "utf8").trim().split("\n").filter(Boolean) : [];
+const waitFor = async (predicate, message) => {
+  for (let i = 0; i < 150 && !predicate(); i += 1) await new Promise((resolve) => setTimeout(resolve, 10));
+  if (!predicate()) throw new Error(message);
+};
+
+writeFileSync(`${process.env.FM_HOME}/state/.lock`, `${process.pid}\n`);
+const mod = await import(pathToFileURL(process.env.PLUGIN).href);
+mod.default(pi);
+await handlers.get("session_start")?.({}, { ui: { setStatus() {} } });
+await waitFor(() => attempts === 1, "initial failure wake delivery was not attempted");
+await new Promise((resolve) => setTimeout(resolve, 250));
+if (attempts !== 1) throw new Error(`failure wake retried during away mode: ${attempts}`);
+if (lines(process.env.FM_START_LOG).length !== 1) throw new Error("failure retry armed during away mode");
+
+rmSync(`${process.env.FM_HOME}/state/.afk`);
+await handlers.get("tool_execution_end")?.({ type: "tool_execution_end" }, {});
+await waitFor(() => wakes.length === 1, "post-away reconciliation did not deliver the failure wake");
+if (attempts !== 2) throw new Error(`post-away failure wake attempts: ${attempts}`);
+await handlers.get("session_shutdown")?.({ reason: "done" }, {});
+EOF
+)
+  status=$?
+  expect_code 0 "$status" "Pi failure-wake retry must defer during away mode"
+  [ -z "$out" ] || fail "Pi away-mode failure retry test printed output: $out"
+  pass "Pi failure-wake retry defers during away mode"
+}
+
+test_pi_settled_failure_retry_stops_on_shutdown() {
+  local repo home plugin out status
+  repo="$TMP_ROOT/pi-failure-retry-shutdown-root"
+  home="$TMP_ROOT/pi-failure-retry-shutdown-home"
+  mkdir -p "$repo/bin" "$home/state" "$home/config"
+  install_pi_watch_extension_fixture "$repo"
+  plugin="$repo/.pi/extensions/fm-primary-pi-watch.ts"
+  cat > "$repo/bin/fm-watch-arm.sh" <<'SH'
+#!/usr/bin/env bash
+exit 23
+SH
+  chmod +x "$repo/bin/fm-watch-arm.sh"
+  out=$(PLUGIN="$plugin" FM_HOME="$home" FM_ROOT_OVERRIDE="$repo" node --input-type=module 2>&1 <<'EOF'
+import { writeFileSync } from "node:fs";
+import { pathToFileURL } from "node:url";
+
+const handlers = new Map();
+let attempts = 0;
+const pi = {
+  on(event, handler) { handlers.set(event, handler); },
+  registerCommand() {},
+  registerTool() {},
+  sendMessage() {
+    attempts += 1;
+    throw new Error("failure-wake delivery rejected before shutdown");
+  },
+};
+const waitFor = async (predicate, message) => {
+  for (let i = 0; i < 150 && !predicate(); i += 1) await new Promise((resolve) => setTimeout(resolve, 10));
+  if (!predicate()) throw new Error(message);
+};
+
+writeFileSync(`${process.env.FM_HOME}/state/.lock`, `${process.pid}\n`);
+const mod = await import(pathToFileURL(process.env.PLUGIN).href);
+mod.default(pi);
+await handlers.get("session_start")?.({}, { ui: { setStatus() {} } });
+await waitFor(() => attempts === 1, "initial failure wake delivery was not attempted");
+await handlers.get("session_shutdown")?.({ reason: "done" }, {});
+await new Promise((resolve) => setTimeout(resolve, 250));
+if (attempts !== 1) throw new Error(`failure wake retried after shutdown: ${attempts}`);
+EOF
+)
+  status=$?
+  expect_code 0 "$status" "Pi failure-wake retry must stop on shutdown"
+  [ -z "$out" ] || fail "Pi shutdown failure retry test printed output: $out"
+  pass "Pi failure-wake retry stops on shutdown"
 }
 
 test_pi_settled_failure_delivery_survives_reload() {
@@ -1780,6 +1977,10 @@ test_pi_extension_loads_for_fresh_home_in_primary_checkout
 test_pi_reload_preserves_captured_actionable_wake
 test_pi_pending_wake_delivery_failure_retries
 test_pi_settled_wake_delivery_failure_retries_automatically
+test_pi_settled_failure_delivery_retry_is_bounded
+test_pi_settled_failure_retry_defers_during_away_mode
+test_pi_settled_failure_retry_stops_on_shutdown
+test_pi_extension_rejects_nonregular_secondmate_markers
 test_pi_settled_failure_delivery_survives_reload
 test_pi_rearm_failure_does_not_redeliver_wake
 test_pi_reload_defers_pending_wake_during_away_mode
