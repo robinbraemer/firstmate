@@ -1,6 +1,6 @@
 // Firstmate primary watcher bridge for Pi.
 import { spawn, spawnSync, type ChildProcess } from "node:child_process";
-import { createHash } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { existsSync, lstatSync, mkdirSync, readFileSync, realpathSync, writeFileSync } from "node:fs";
 import { dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -26,6 +26,15 @@ type WakeDetails = {
   truncated: boolean;
   stdoutTruncated: boolean;
   stderrTruncated: boolean;
+};
+
+type WakeDeliveryDetails = WakeDetails & {
+  deliveryId: string;
+};
+
+type WakeDeliveryAttempt = {
+  resolve: () => void;
+  reject: (error: Error) => void;
 };
 
 type WakeSender = (message: string, details: WakeDetails) => Promise<void>;
@@ -109,16 +118,19 @@ const AWAY_SUSPENSION_LINE = "watcher: suspended - away mode owns supervision";
 const coordinatorHost = globalThis as CoordinatorHost;
 const coordinators = coordinatorHost.__firstmatePiWatchCoordinators ??= new Map<string, ArmCoordinator>();
 
-function isRegularFile(path: string): boolean {
+function canonicalSecondmateMarker(path: string): boolean | null {
   try {
-    return lstatSync(path).isFile();
-  } catch {
-    return false;
+    if (!lstatSync(path).isFile()) return false;
+    const [firstLine = ""] = readFileSync(path, "utf8").split("\n", 1);
+    return /^[A-Za-z0-9._-]+$/.test(firstLine.replace(/[ \t\v\f\r]/g, ""));
+  } catch (error) {
+    return (error as NodeJS.ErrnoException).code === "ENOENT" ? null : false;
   }
 }
 
 function supervisingHome(): boolean {
-  if (isRegularFile(`${root}/.fm-secondmate-home`)) return true;
+  const secondmateMarker = canonicalSecondmateMarker(`${root}/.fm-secondmate-home`);
+  if (secondmateMarker !== null) return secondmateMarker;
   if (!existsSync(`${root}/AGENTS.md`) || !existsSync(`${root}/bin`)) return false;
   if (process.env.FM_HOME || process.env.FM_ROOT_OVERRIDE) {
     try {
@@ -425,6 +437,8 @@ function settleArm(
   }
   if (!ownsGeneration || coordinator.shuttingDown || record.intentionalStopReason) return;
   if (kind === "failure") publishStatus(coordinator, "attention");
+  const pending = pendingWake(message, details);
+  coordinator.pendingWake = pending;
   const activeClient = [...coordinator.clients.values()].reverse().find((candidate) => candidate.active);
   if (!activeClient) return;
   void (async () => {
@@ -432,8 +446,6 @@ function settleArm(
       await activeClient.sendWake(message, details);
     } catch {
       if (!clientOwnsGeneration(coordinator, activeClient, record.generation)) return;
-      const pending = pendingWake(message, details);
-      coordinator.pendingWake = pending;
       publishStatus(coordinator, "attention");
       if (kind === "actionable") {
         void activeClient.rearm().catch(() => undefined);
@@ -442,7 +454,9 @@ function settleArm(
       }
       return;
     }
-    if (kind !== "actionable" || !clientOwnsGeneration(coordinator, activeClient, record.generation)) return;
+    if (!clientOwnsGeneration(coordinator, activeClient, record.generation)) return;
+    if (coordinator.pendingWake === pending) coordinator.pendingWake = null;
+    if (kind !== "actionable") return;
     publishStatus(coordinator, "handling wake");
     void activeClient.rearm().catch(() => {
       if (clientOwnsGeneration(coordinator, activeClient, record.generation)) {
@@ -556,17 +570,34 @@ function runCdCheck(command: string): Promise<{ code: number; stderr: string }> 
 export default function (pi: ExtensionAPI) {
   if (!supervisingHome()) return;
   const coordinator = coordinatorForHome();
+  const wakeDeliveries = new Map<string, WakeDeliveryAttempt>();
+
+  function rejectWakeDeliveries(error: Error): void {
+    for (const [deliveryId, delivery] of wakeDeliveries) {
+      wakeDeliveries.delete(deliveryId);
+      delivery.reject(error);
+    }
+  }
 
   async function sendWake(message: string, details: WakeDetails): Promise<void> {
-    pi.sendMessage(
-      {
-        customType: "firstmate-watcher-wake",
-        content: `FIRSTMATE WATCHER WAKE: ${message}\n\nRun bin/fm-wake-drain.sh first, handle the queued wake, then resume Pi supervision.`,
-        display: true,
-        details,
-      },
-      { deliverAs: "followUp", triggerTurn: true },
-    );
+    const deliveryId = randomUUID();
+    return new Promise<void>((resolveDelivery, rejectDelivery) => {
+      wakeDeliveries.set(deliveryId, { resolve: resolveDelivery, reject: rejectDelivery });
+      try {
+        pi.sendMessage(
+          {
+            customType: "firstmate-watcher-wake",
+            content: `FIRSTMATE WATCHER WAKE: ${message}\n\nRun bin/fm-wake-drain.sh first, handle the queued wake, then resume Pi supervision.`,
+            display: true,
+            details: { ...details, deliveryId },
+          },
+          { deliverAs: "followUp", triggerTurn: true },
+        );
+      } catch (error) {
+        wakeDeliveries.delete(deliveryId);
+        rejectDelivery(error instanceof Error ? error : new Error("Pi watcher wake submission failed"));
+      }
+    });
   }
 
   const client: StatusClient = Object.assign(sendWake, {
@@ -579,6 +610,7 @@ export default function (pi: ExtensionAPI) {
   coordinator.clients.set(client.token, client);
 
   const cleanupOnProcessExit = () => {
+    rejectWakeDeliveries(new Error("Pi watcher session exited before wake delivery acknowledgment"));
     cancelFailureWakeRetry(coordinator);
     for (const activeClient of coordinator.clients.values()) {
       writeClientStatus(activeClient, undefined);
@@ -746,8 +778,25 @@ export default function (pi: ExtensionAPI) {
     await startArm();
   });
 
+  pi.on("context", (event) => {
+    for (const message of event.messages) {
+      if (message.role !== "custom" || message.customType !== "firstmate-watcher-wake") continue;
+      const deliveryId = (message.details as Partial<WakeDeliveryDetails> | undefined)?.deliveryId;
+      if (!deliveryId) continue;
+      const delivery = wakeDeliveries.get(deliveryId);
+      if (!delivery) continue;
+      wakeDeliveries.delete(deliveryId);
+      delivery.resolve();
+    }
+  });
+
+  pi.on("agent_settled", () => {
+    rejectWakeDeliveries(new Error("Pi settled without acknowledging watcher wake delivery"));
+  });
+
   async function shutdownClient(reason: string): Promise<void> {
     if (!client.active) return;
+    rejectWakeDeliveries(new Error(`Pi watcher session shut down before wake delivery acknowledgment: ${reason}`));
     writeClientStatus(client, undefined);
     client.active = false;
     coordinator.clients.delete(client.token);

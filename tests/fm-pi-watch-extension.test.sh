@@ -11,7 +11,7 @@ EXT="$ROOT/.pi/extensions/fm-primary-pi-watch.ts"
 install_pi_watch_extension_fixture() {
   local repo=$1
   mkdir -p "$repo/.pi/extensions" "$repo/node_modules/typebox"
-  : > "$repo/.fm-secondmate-home"
+  printf 'pi-watch-test\n' > "$repo/.fm-secondmate-home"
   cp "$EXT" "$repo/.pi/extensions/fm-primary-pi-watch.ts"
   cat > "$repo/node_modules/typebox/package.json" <<'JSON'
 {"name":"typebox","type":"module","exports":"./index.js"}
@@ -63,7 +63,7 @@ test_tracked_extension_present_and_self_hashing() {
   assert_contains "$text" 'ctx.ui.notify' "tracked extension command does not notify through Pi's UI"
   assert_contains "$text" 'process.once("exit", cleanupOnProcessExit)' "tracked extension lacks clean-process-exit cleanup"
   assert_contains "$text" 'pi.on?.("session_shutdown"' "tracked extension lacks awaited session shutdown cleanup"
-  assert_not_contains "$text" 'agent_settled' "tracked watcher-only extension still listens for turn-end events"
+  assert_not_contains "$text" 'pi.on("turn_end"' "tracked watcher-only extension still listens for turn-end events"
   assert_not_contains "$text" 'sendUserMessage' "tracked watcher-only extension still injects fake human input"
   assert_not_contains "$text" 'runTurnendGuard' "tracked watcher-only extension still runs the turn-end guard"
   assert_not_contains "$text" "[ -f config/x-mode.env ]" "tracked extension kept a repo-relative x-mode config path"
@@ -100,14 +100,16 @@ import { pathToFileURL } from "node:url";
 let handler = null;
 let notification = "";
 let wake = null;
+const handlers = new Map();
 const pi = {
-  on() {},
+  on(event, eventHandler) { handlers.set(event, eventHandler); },
   registerCommand(name, options) {
     if (name === "fm-watch-arm-pi") handler = options.handler;
   },
   registerTool() {},
   sendMessage(message, options) {
     wake = { message, options };
+    handlers.get("context")?.({ type: "context", messages: [{ role: "custom", ...message }] }, {});
   },
 };
 writeFileSync(`${process.env.FM_HOME}/state/.lock`, `${process.pid}\n`);
@@ -330,7 +332,10 @@ const pi = {
   on(event, handler) { handlers.set(event, handler); },
   registerCommand() {},
   registerTool(candidate) { if (candidate.name === "fm_watch_arm_pi") tool = candidate; },
-  sendMessage(message, options) { wakes.push({ message, options }); },
+  sendMessage(message, options) {
+    wakes.push({ message, options });
+    handlers.get("context")?.({ type: "context", messages: [{ role: "custom", ...message }] }, {});
+  },
 };
 writeFileSync(`${process.env.FM_HOME}/state/.lock`, `${process.pid}\n`);
 const mod = await import(pathToFileURL(process.env.PLUGIN).href);
@@ -400,7 +405,10 @@ const pi = {
   on(event, handler) { handlers.set(event, handler); },
   registerCommand() {},
   registerTool(candidate) { if (candidate.name === "fm_watch_arm_pi") tool = candidate; },
-  sendMessage(message, options) { wakes.push({ message, options }); },
+  sendMessage(message, options) {
+    wakes.push({ message, options });
+    handlers.get("context")?.({ type: "context", messages: [{ role: "custom", ...message }] }, {});
+  },
 };
 const lines = (path) => existsSync(path) ? readFileSync(path, "utf8").trim().split("\n").filter(Boolean) : [];
 const waitFor = async (predicate, message) => {
@@ -477,7 +485,10 @@ const pi = {
   on(event, handler) { handlers.set(event, handler); },
   registerCommand() {},
   registerTool() {},
-  sendMessage(message, options) { wakes.push({ message, options }); },
+  sendMessage(message, options) {
+    wakes.push({ message, options });
+    handlers.get("context")?.({ type: "context", messages: [{ role: "custom", ...message }] }, {});
+  },
 };
 const lines = (path) => existsSync(path) ? readFileSync(path, "utf8").trim().split("\n").filter(Boolean) : [];
 const waitFor = async (predicate, message) => {
@@ -541,7 +552,10 @@ const pi = {
   on(event, handler) { handlers.set(event, handler); },
   registerCommand() {},
   registerTool() {},
-  sendMessage(message, options) { wakes.push({ message, options }); },
+  sendMessage(message, options) {
+    wakes.push({ message, options });
+    handlers.get("context")?.({ type: "context", messages: [{ role: "custom", ...message }] }, {});
+  },
 };
 const lines = (path) => existsSync(path) ? readFileSync(path, "utf8").trim().split("\n").filter(Boolean) : [];
 const waitFor = async (predicate, message) => {
@@ -879,23 +893,29 @@ EOF
   pass "Pi extension loads for a fresh FM_HOME in the primary checkout"
 }
 
-test_pi_extension_rejects_nonregular_secondmate_markers() {
+test_pi_extension_rejects_invalid_secondmate_markers() {
   local repo home plugin marker shape out status
   repo="$TMP_ROOT/pi-marker-validation-root"
   home="$TMP_ROOT/pi-marker-validation-home"
   mkdir -p "$repo/bin" "$home/state" "$home/config"
   install_pi_watch_extension_fixture "$repo"
+  git init -q "$repo"
+  : > "$repo/AGENTS.md"
   plugin="$repo/.pi/extensions/fm-primary-pi-watch.ts"
   marker="$repo/.fm-secondmate-home"
 
-  for shape in directory symlink; do
+  for shape in directory symlink empty whitespace malformed; do
     rm -rf "$marker" "$repo/marker-target"
-    if [ "$shape" = directory ]; then
-      mkdir "$marker"
-    else
-      : > "$repo/marker-target"
-      ln -s marker-target "$marker"
-    fi
+    case "$shape" in
+      directory) mkdir "$marker" ;;
+      symlink)
+        printf 'pi-marker-target\n' > "$repo/marker-target"
+        ln -s marker-target "$marker"
+        ;;
+      empty) : > "$marker" ;;
+      whitespace) printf ' \t\n' > "$marker" ;;
+      malformed) printf 'not/an-id\n' > "$marker" ;;
+    esac
     out=$(PLUGIN="$plugin" FM_HOME="$home" FM_ROOT_OVERRIDE="$repo" node --input-type=module 2>&1 <<'EOF'
 import { pathToFileURL } from "node:url";
 
@@ -908,14 +928,14 @@ const pi = {
 };
 const mod = await import(pathToFileURL(process.env.PLUGIN).href);
 mod.default(pi);
-if (tool) throw new Error("non-regular secondmate marker enabled the watcher extension");
+if (tool) throw new Error("invalid secondmate marker enabled the watcher extension");
 EOF
 )
     status=$?
     expect_code 0 "$status" "Pi extension must reject a $shape secondmate marker"
     [ -z "$out" ] || fail "Pi $shape marker test printed output: $out"
   done
-  pass "Pi extension rejects non-regular secondmate markers"
+  pass "Pi extension rejects invalid secondmate markers"
 }
 
 test_pi_reload_preserves_captured_actionable_wake() {
@@ -956,6 +976,7 @@ function client(wakes, initiallyBound = true) {
         attempts += 1;
         if (!bound) throw new Error("sendMessage called before bindCore");
         wakes.push({ message, options });
+        handlers.get("context")?.({ type: "context", messages: [{ role: "custom", ...message }] }, {});
       },
     },
   };
@@ -1032,6 +1053,7 @@ function client(wakes, failures = 0) {
         attempts += 1;
         if (attempts <= failures) throw new Error("transient pending-wake delivery failure");
         wakes.push({ message, options });
+        handlers.get("context")?.({ type: "context", messages: [{ role: "custom", ...message }] }, {});
       },
     },
   };
@@ -1083,6 +1105,77 @@ EOF
   pass "Pi pending-wake delivery failure remains retryable"
 }
 
+test_pi_fire_and_forget_delivery_waits_for_context_ack() {
+  local repo home plugin starts first_exit out status
+  repo="$TMP_ROOT/pi-fire-and-forget-root"
+  home="$TMP_ROOT/pi-fire-and-forget-home"
+  starts="$TMP_ROOT/pi-fire-and-forget-starts"
+  first_exit="$TMP_ROOT/pi-fire-and-forget-first-exit"
+  mkdir -p "$repo/bin" "$home/state" "$home/config"
+  install_pi_watch_extension_fixture "$repo"
+  plugin="$repo/.pi/extensions/fm-primary-pi-watch.ts"
+  cat > "$repo/bin/fm-watch-arm.sh" <<'SH'
+#!/usr/bin/env bash
+printf 'start\n' >> "$FM_START_LOG"
+if [ ! -e "$FM_FIRST_EXIT_FILE" ]; then
+  : > "$FM_FIRST_EXIT_FILE"
+  printf 'signal: fire-and-forget wake awaiting acknowledgment\n'
+  exit 0
+fi
+trap 'exit 0' TERM
+while :; do sleep 1; done
+SH
+  chmod +x "$repo/bin/fm-watch-arm.sh"
+  out=$(PLUGIN="$plugin" FM_HOME="$home" FM_ROOT_OVERRIDE="$repo" FM_START_LOG="$starts" \
+    FM_FIRST_EXIT_FILE="$first_exit" node --input-type=module 2>&1 <<'EOF'
+import { existsSync, readFileSync, writeFileSync } from "node:fs";
+import { pathToFileURL } from "node:url";
+
+const handlers = new Map();
+const wakes = [];
+let attempts = 0;
+const pi = {
+  on(event, handler) { handlers.set(event, handler); },
+  registerCommand() {},
+  registerTool() {},
+  sendMessage(message, options) {
+    attempts += 1;
+    if (attempts === 1) return;
+    wakes.push({ message, options });
+    handlers.get("context")?.({ type: "context", messages: [{ role: "custom", ...message }] }, {});
+  },
+};
+const lines = (path) => existsSync(path) ? readFileSync(path, "utf8").trim().split("\n").filter(Boolean) : [];
+const waitFor = async (predicate, message) => {
+  for (let i = 0; i < 150 && !predicate(); i += 1) await new Promise((resolve) => setTimeout(resolve, 10));
+  if (!predicate()) throw new Error(message);
+};
+
+writeFileSync(`${process.env.FM_HOME}/state/.lock`, `${process.pid}\n`);
+const mod = await import(pathToFileURL(process.env.PLUGIN).href);
+mod.default(pi);
+await handlers.get("session_start")?.({}, { ui: { setStatus() {} } });
+await waitFor(() => attempts === 1, "initial fire-and-forget delivery was not attempted");
+const coordinator = [...globalThis.__firstmatePiWatchCoordinators.values()][0];
+if (!coordinator.pendingWake) throw new Error("unacknowledged delivery cleared the pending wake");
+await new Promise((resolve) => setTimeout(resolve, 50));
+if (lines(process.env.FM_START_LOG).length !== 1) throw new Error("unacknowledged delivery rearmed the watcher");
+
+await handlers.get("agent_settled")?.({ type: "agent_settled" }, {});
+await waitFor(() => attempts === 2, `unacknowledged delivery was not retried: ${attempts}`);
+await waitFor(() => wakes.length === 1, "retried delivery did not reach Pi context");
+await waitFor(() => lines(process.env.FM_START_LOG).length === 2, "acknowledged retry did not rearm the watcher");
+if (coordinator.pendingWake) throw new Error("acknowledged retry left a pending wake");
+if (!wakes[0].message.content.includes("fire-and-forget wake awaiting acknowledgment")) throw new Error("wrong retried wake");
+await handlers.get("session_shutdown")?.({ reason: "done" }, {});
+EOF
+)
+  status=$?
+  expect_code 0 "$status" "Pi fire-and-forget wake delivery must wait for model-context acknowledgment"
+  [ -z "$out" ] || fail "Pi fire-and-forget acknowledgment test printed output: $out"
+  pass "Pi fire-and-forget wake delivery waits for model-context acknowledgment"
+}
+
 test_pi_settled_wake_delivery_failure_retries_automatically() {
   local repo home plugin starts first_exit out status
   repo="$TMP_ROOT/pi-settled-retry-root"
@@ -1121,6 +1214,7 @@ const pi = {
     attempts += 1;
     if (attempts === 1) throw new Error("transient settled-wake delivery failure");
     wakes.push({ message, options });
+    handlers.get("context")?.({ type: "context", messages: [{ role: "custom", ...message }] }, {});
   },
 };
 const lines = (path) => existsSync(path) ? readFileSync(path, "utf8").trim().split("\n").filter(Boolean) : [];
@@ -1305,6 +1399,7 @@ const pi = {
       throw new Error("failure-wake delivery entered away mode");
     }
     wakes.push({ message, options });
+    handlers.get("context")?.({ type: "context", messages: [{ role: "custom", ...message }] }, {});
   },
 };
 const lines = (path) => existsSync(path) ? readFileSync(path, "utf8").trim().split("\n").filter(Boolean) : [];
@@ -1422,6 +1517,7 @@ function client(wakes, rejectDelivery = false) {
         attempts += 1;
         if (rejectDelivery) throw new Error("synthetic failure-wake delivery rejection");
         wakes.push({ message, options });
+        handlers.get("context")?.({ type: "context", messages: [{ role: "custom", ...message }] }, {});
       },
     },
   };
@@ -1491,7 +1587,10 @@ const pi = {
   on(event, handler) { handlers.set(event, handler); },
   registerCommand() {},
   registerTool(candidate) { if (candidate.name === "fm_watch_arm_pi") tool = candidate; },
-  sendMessage(message, options) { wakes.push({ message, options }); },
+  sendMessage(message, options) {
+    wakes.push({ message, options });
+    handlers.get("context")?.({ type: "context", messages: [{ role: "custom", ...message }] }, {});
+  },
 };
 const lines = (path) => existsSync(path) ? readFileSync(path, "utf8").trim().split("\n").filter(Boolean) : [];
 const waitFor = async (predicate, message) => {
@@ -1566,6 +1665,7 @@ function client(wakes, initiallyBound = true) {
       sendMessage(message, options) {
         if (!bound) throw new Error("sendMessage called before bindCore");
         wakes.push({ message, options });
+        handlers.get("context")?.({ type: "context", messages: [{ role: "custom", ...message }] }, {});
       },
     },
   };
@@ -2052,12 +2152,13 @@ test_pi_spawned_restart_yields_to_away_mode
 test_pi_extension_loads_for_fresh_home_in_primary_checkout
 test_pi_reload_preserves_captured_actionable_wake
 test_pi_pending_wake_delivery_failure_retries
+test_pi_fire_and_forget_delivery_waits_for_context_ack
 test_pi_settled_wake_delivery_failure_retries_automatically
 test_pi_settled_failure_delivery_retry_is_bounded
 test_pi_hot_reload_migrates_legacy_failure_retry_state
 test_pi_settled_failure_retry_defers_during_away_mode
 test_pi_settled_failure_retry_stops_on_shutdown
-test_pi_extension_rejects_nonregular_secondmate_markers
+test_pi_extension_rejects_invalid_secondmate_markers
 test_pi_settled_failure_delivery_survives_reload
 test_pi_rearm_failure_does_not_redeliver_wake
 test_pi_reload_defers_pending_wake_during_away_mode

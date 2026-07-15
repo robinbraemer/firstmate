@@ -569,7 +569,7 @@ git clone -q "$ROOT" "$PROJECT"
 if ! git -C "$ROOT" diff --quiet HEAD -- .pi bin; then
   git -C "$ROOT" diff --binary HEAD -- .pi bin | git -C "$PROJECT" apply
 fi
-[ "$ROLE" != secondmate ] || : > "$PROJECT/.fm-secondmate-home"
+[ "$ROLE" != secondmate ] || printf 'pi-live-secondmate\n' > "$PROJECT/.fm-secondmate-home"
 mkdir -p "$PROJECT/state" "$PROJECT/config" "$PI_DIR"
 chmod 700 "$LAB" "$PI_DIR"
 cp "$AUTH_FILE" "$PI_DIR/auth.json"
